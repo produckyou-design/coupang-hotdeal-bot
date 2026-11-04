@@ -100,7 +100,7 @@ def extract_ocr_text(img_url: Optional[str]) -> str:
 
 def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str, Any]:
     """
-    제목, 본문, 이미지 OCR 텍스트에서 가격 메리트(정상가, 할인율, 체감가, 와우혜택, 가성비 단가)를 종합 분석.
+    제목, 본문, 이미지 OCR 텍스트에서 가격 메리트(정상가, 할인율, 최종특가, 가성비 단가, 핫딜 포인트)를 분석.
     """
     full_text = f"{title}\n{body}\n{ocr_text}"
 
@@ -135,7 +135,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
             if m_body_price:
                 sale_price = int(m_body_price.group(1).replace(",", ""))
 
-    # 2. 할인율(%) 계산 또는 추출 (본문 및 이미지 OCR 포함)
+    # 2. 할인율(%) 계산 또는 추출
     discount_rate = 0
     disc_match = re.search(r"(\d+)%\s*(?:할인|dc|DC)?", full_text, re.IGNORECASE)
     if disc_match:
@@ -148,35 +148,19 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     elif orig_price > 0 and sale_price > 0 and orig_price > sale_price and discount_rate == 0:
         discount_rate = round((orig_price - sale_price) / orig_price * 100)
 
-    # 3. 체감가 / 쿠폰할인 정밀 분기
-    coupon_desc = ""
+    # 3. 체감 최종가 계산 (쿠폰/할인 적용 시 최종 도달 금액만 추출, 긴 설명문 배제)
     final_price = sale_price
-
-    # A. '~원까지 떨어집니다/내려갑니다/나옵니다' 또는 '체감가/최종가 ~원' (최종 금액 명시)
     final_matches = re.finditer(r"(?:체감가|최종가|실구매가|적용가)?\s*[:~약]?\s*([\d,]+)\s*원(?:까지)?\s*(?:떨어|내려|나옵|가능)", body)
-    found_final = None
     for fm in final_matches:
         val = int(fm.group(1).replace(",", ""))
         if 0 < val < sale_price:
-            found_final = val
+            final_price = val
             break
 
-    if not found_final:
-        direct_match = re.search(r"(?:체감가|최종가|실구매가|적용가)\s*[:~약]?\s*([\d,]+)\s*원", body)
-        if direct_match:
-            val = int(direct_match.group(1).replace(",", ""))
-            if 0 < val < sale_price:
-                found_final = val
-
-    if found_final and sale_price > 0:
-        final_price = found_final
-        diff = sale_price - final_price
-        coupon_desc = f"쿠폰/할인 적용 시 ➡️ <b>최대 {final_price:,}원까지 인하!</b> ({diff:,}원 추가 할인)"
-    else:
-        # B. '쿠폰 받으면 천원 할인', '3,000원 쿠폰' (할인 금액 명시)
-        coupon_match = re.search(r"((?:[가-힣a-zA-Z0-9]+\s+){0,2}쿠폰\s*[\w\s]*(?:받으면|적용|다운|먹이면)?\s*([\d,]+|천|만)\s*원?\s*(?:할인|추가할인)?)", body)
+    if final_price == sale_price:
+        coupon_match = re.search(r"쿠폰\s*[\w\s]*(?:받으면|적용|다운|먹이면)?\s*([\d,]+|천|만)\s*원?\s*(?:할인|추가할인)?", body)
         if coupon_match:
-            c_raw = coupon_match.group(1).strip()
+            c_raw = coupon_match.group(0).strip()
             c_amt = 0
             if "천원" in c_raw or "천 원" in c_raw:
                 c_amt = 1000
@@ -186,79 +170,59 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
                 m_num = re.search(r"([\d,]+)\s*원", c_raw)
                 if m_num:
                     c_amt = int(m_num.group(1).replace(",", ""))
-
             if c_amt > 0 and sale_price > 0:
                 final_price = max(0, sale_price - c_amt)
-                coupon_desc = f"{esc(c_raw)} ➡️ <b>최대 {final_price:,}원까지 추가 할인!</b>"
-            else:
-                coupon_desc = f"{esc(c_raw)}"
 
-    # 4. 와우회원 혜택
-    wow_info = ""
-    has_wow = any(k in full_text for k in ["와우", "로켓와우", "WOW"])
-    wow_price_match = re.search(r"와우\s*(?:할인가|회원가|전용가)?\s*[:~약]?\s*([\d,]+)\s*원", full_text)
-    if wow_price_match:
-        w_price = int(wow_price_match.group(1).replace(",", ""))
-        wow_info = f"와우회원 전용가 <b>{w_price:,}원</b>"
-        if sale_price > w_price:
-            final_price = min(final_price, w_price)
-    elif has_wow:
-        wow_info = "와우회원 전용 특가 + 로켓 무료배송/무료반품"
-    else:
-        wow_info = "와우회원 무료배송 및 최대 5% 추가 적립 혜택"
-
-    # 5. 가성비 단가 계산 (개당/봉당/팩당/100g당 등)
-    unit_line = ""
-    calc_target_price = final_price if final_price > 0 else sale_price
-    if calc_target_price > 0:
+    # 4. 가성비 단가 계산
+    unit_info = ""
+    eff_p = final_price if 0 < final_price < sale_price else sale_price
+    if eff_p > 0:
         units = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매)", title)
         if units:
             count = int(units[-1][0])
             unit_name = units[-1][1]
             if count > 1:
-                u_price = round(calc_target_price / count)
-                unit_line = f"💰 <b>가성비 단가</b>: <b>{unit_name}당 약 {u_price:,}원 꼴!</b>"
+                u_price = round(eff_p / count)
+                unit_info = f"{unit_name}당 약 {u_price:,}원 꼴!"
 
-        if not unit_line:
+        if not unit_info:
             weight_match = re.search(r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로)", title, re.IGNORECASE)
             if weight_match:
                 val = float(weight_match.group(1))
                 if val > 0:
-                    unit_p = round(calc_target_price / (val * 10))
-                    unit_line = f"💰 <b>가성비 단가</b>: <b>100g/ml당 약 {unit_p:,}원 꼴!</b>"
+                    unit_p = round(eff_p / (val * 10))
+                    unit_info = f"100g/ml당 약 {unit_p:,}원 꼴!"
             else:
                 gram_match = re.search(r"(\d+)\s*(g|ml|그램)", title, re.IGNORECASE)
                 if gram_match:
                     val = int(gram_match.group(1))
                     if val >= 100:
-                        unit_p = round(calc_target_price / (val / 100))
-                        unit_line = f"💰 <b>가성비 단가</b>: <b>100g당 약 {unit_p:,}원 꼴!</b>"
+                        unit_p = round(eff_p / (val / 100))
+                        unit_info = f"100g당 약 {unit_p:,}원 꼴!"
 
-    # 6. 가격 팩트 (단순 리뷰 배제)
-    price_reason = ""
-    valid_reasons = []
+    # 5. 핫딜 포인트 (핵심 메리트 문장만 간결하게 추출)
+    hotdeal_points = []
     lines = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("http")]
     for line in lines:
         if any(bad in line for bad in ["맛있", "맛나", "좋네", "샀습", "추천합", "감사", "양도 많고"]):
             continue
         if any(kw in line for kw in ["최저가", "역대", "마트", "당근", "가성비", "단가", "무배", "품절", "싼듯", "저렴"]):
-            valid_reasons.append(line)
+            hotdeal_points.append(line)
 
-    if valid_reasons:
-        combined = " / ".join(valid_reasons[:2])
-        if len(combined) > 80:
-            combined = combined[:77] + "..."
-        price_reason = combined
+    point_text = ""
+    if hotdeal_points:
+        combined = " / ".join(hotdeal_points[:2])
+        if len(combined) > 70:
+            combined = combined[:67] + "..."
+        point_text = combined
 
     return {
         "orig_price": orig_price,
         "sale_price": sale_price,
         "final_price": final_price,
         "discount_rate": discount_rate,
-        "coupon_desc": coupon_desc,
-        "wow_info": wow_info,
-        "unit_line": unit_line,
-        "price_reason": price_reason,
+        "unit_info": unit_info,
+        "point_text": point_text,
     }
 
 
@@ -334,7 +298,6 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
             return None
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 쿠팡 URL 추출
         cp_url = None
         src = soup.select_one("div.source_url a")
         if src and "coupang.com" in src.get("href", ""):
@@ -352,7 +315,6 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
         if not cp_url:
             return None
 
-        # 본문 및 이미지
         body_text = ""
         img_url = None
         vc = soup.select_one("div.view_content")
@@ -451,23 +413,22 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     img_url = detail.get("img_url")
     title = d["title"]
 
-    # 1. 첨부 이미지 OCR 추출 (본문 이미지 속 정상가, 29% 등 핵심 핫딜 팩트 수집)
+    # 1. 본문 이미지 OCR 텍스트 추출 (정상가, 할인율 팩트 확인)
     ocr_text = extract_ocr_text(img_url)
 
-    # 2. 가격 및 할인 혜택 종합 분석 (정상가, 할인율, 쿠폰체감가, 와우혜택, 단가)
+    # 2. 가격 및 메리트 종합 분석
     p_info = parse_pricing_details(title, body_text, ocr_text)
 
-    # 3. 엄격한 가격 메리트 필터링 (알맹이 없는 단순 잡담 글 원천 배제)
+    # 3. 가격 메리트 필터링 (정상가/할인율/단가/핫딜포인트 없는 글 제외)
     has_merit = any([
         p_info["orig_price"] > 0,
         p_info["discount_rate"] > 0,
-        bool(p_info["coupon_desc"]),
-        bool(p_info["unit_line"]),
-        bool(p_info["price_reason"]),
+        bool(p_info["unit_info"]),
+        bool(p_info["point_text"]),
     ])
 
     if not has_merit:
-        logger.info(f"⏭️ [스킵] 가격 메리트(정상가/할인율/쿠폰/단가) 불충분: {title}")
+        logger.info(f"⏭️ [스킵] 가격 메리트 불충분: {title}")
         seen.add(deal_id)
         save_seen(seen)
         return False
@@ -489,54 +450,49 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     clean_title = re.sub(r"^\[.*?\]\s*", "", title)
     clean_title = re.sub(r"\s*\(\d+\)$", "", clean_title)
 
-    # 4. 가격 블록 정밀 구성
+    # 4. 가격 블록 정밀 구성 (쿠폰/와우 등 불필요한 줄 전부 삭제, 핵심 3~4줄로 초간결화!)
     price_lines = []
     orig_p = p_info["orig_price"]
     sale_p = p_info["sale_price"]
+    final_p = p_info["final_price"]
     disc_rate = p_info["discount_rate"]
 
-    # 1) 헤드라인 구성: 할인율이 높고 정상가가 있으면 파격할인 강조
+    # 최종 판매가 결정
+    best_price = final_p if 0 < final_p < sale_p else sale_p
+
+    # 1) 상단 헤드라인: 할인율이 명확한 경우
     header_line = "🔥 <b>[실시간 검증 특가]</b>"
-    if disc_rate >= 15 and orig_p > 0 and sale_p > 0:
-        header_line = f"🔥 <b>[{disc_rate}% 파격할인] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {sale_p:,}원!</b>"
+    if disc_rate >= 15 and orig_p > 0 and best_price > 0:
+        header_line = f"🔥 <b>[{disc_rate}% 파격할인] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {best_price:,}원!</b>"
 
-    # 2) 원래 정상가 & 할인율
-    if orig_p > 0 and orig_p > sale_p:
-        save_amt = orig_p - (p_info["final_price"] or sale_p)
-        price_lines.append(f"• <b>원래 정상가</b>: <s>{orig_p:,}원</s> (🔥 <b>{disc_rate}% 파격할인</b> / {save_amt:,}원 절약!)")
-    elif disc_rate > 0:
-        price_lines.append(f"• <b>할인율</b>: 🔥 <b>{disc_rate}% 파격할인 적용!</b>")
+    # 2) 정상가격
+    if orig_p > 0 and orig_p > best_price:
+        save_amt = orig_p - best_price
+        price_lines.append(f"• <b>정상가격</b>: <s>{orig_p:,}원</s> (<b>{save_amt:,}원 절약!</b>)")
 
-    # 3) 현재 표시가 (화면상 보이는 가격)
-    if sale_p > 0:
-        price_lines.append(f"• <b>현재 표시가</b>: <b>{sale_p:,}원</b>")
+    # 3) 최종특가
+    if best_price > 0:
+        disc_text = f" (🔥 <b>{disc_rate}% 할인</b>)" if disc_rate > 0 else ""
+        price_lines.append(f"• <b>최종특가</b>: <b>{best_price:,}원</b>{disc_text}")
     else:
-        price_lines.append(f"• <b>현재 표시가</b>: <b>한정수량 최저가</b>")
+        price_lines.append(f"• <b>최종특가</b>: <b>한정수량 최저가</b>")
 
-    # 4) 추가 쿠폰 적용 시 (체감가)
-    if p_info["coupon_desc"]:
-        price_lines.append(f"• <b>추가 쿠폰 혜택</b>: {p_info['coupon_desc']}")
-
-    # 5) 와우회원 혜택 (쿠팡와우면 얼마다)
-    if p_info["wow_info"]:
-        price_lines.append(f"• <b>와우 혜택</b>: {p_info['wow_info']}")
+    # 4) 가성비 단가
+    if p_info["unit_info"]:
+        price_lines.append(f"• <b>단가계산</b>: <b>{p_info['unit_info']}</b>")
 
     price_block = "\n".join(price_lines)
 
-    # 6) 가성비 단가 (봉당/개당/100g당)
-    unit_block = f"{p_info['unit_line']}\n" if p_info["unit_line"] else ""
-
-    # 7) 검증 사유 (최저가, 역대가 등 가격 팩트만 표기, 단순 감상평 절대 배제)
-    reason_block = f"💡 <b>가격 팩트</b>: <code>{esc(p_info['price_reason'])}</code>\n\n" if p_info["price_reason"] else ""
+    # 5) 핫딜 포인트 (기존 '가격 팩트' 대신 직관적인 문구로 변경)
+    point_block = f"💡 <b>핫딜 포인트</b>: <code>{esc(p_info['point_text'])}</code>\n\n" if p_info["point_text"] else ""
 
     msg = (
         f"{header_line}\n\n"
         f"📌 <b>{esc(clean_title)}</b>\n\n"
-        f"💵 <b>가격 및 할인 혜택</b>\n"
+        f"💵 <b>특가 정보</b>\n"
         f"{price_block}\n\n"
-        f"{unit_block}"
-        f"{reason_block}"
-        f"🚚 <b>배송정보</b>: 🚀 쿠팡 로켓배송 / 무료배송\n"
+        f"{point_block}"
+        f"🚚 🚀 <b>로켓배송 / 무료배송</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <i>핫딜 특성상 가격 변동 및 조기 품절될 수 있습니다.</i>\n"
         f"※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
@@ -546,7 +502,7 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         chat_id=CHANNEL_ID,
         text=msg,
         photo_url=img_url,
-        button_text="👉 쿠폰 받기 & 실시간 최저가 확인",
+        button_text="👉 실시간 특가 및 수량 확인하기",
         button_url=deeplink,
     )
 
@@ -588,34 +544,30 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
         img_url = it.get("productImage")
         cat = it.get("categoryName", "")
 
-        # 단가 분석
-        unit_line = ""
+        unit_str = ""
         units = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매)", p_name)
         if units and p_price > 0:
             count = int(units[-1][0])
             unit_name = units[-1][1]
             if count > 1:
                 u_p = round(p_price / count)
-                unit_line = f"💰 <b>가성비 단가</b>: <b>{unit_name}당 약 {u_p:,}원 꼴!</b>\n"
-
-        unit_block = f"{unit_line}" if unit_line else ""
+                unit_str = f"• <b>단가계산</b>: <b>{unit_name}당 약 {u_p:,}원 꼴!</b>\n"
 
         msg = (
             f"🍯 <b>[오늘의 골드박스 특가] | 🏆 인기 {i+1}위</b>\n\n"
             f"📌 <b>{esc(p_name)}</b>\n\n"
-            f"💵 <b>가격 및 와우 혜택</b>\n"
-            f"• <b>골드박스 특가가격</b>: <b>{p_price:,}원</b>\n"
-            f"• <b>와우 혜택</b>: 👑 와우회원 단독 하루 특가 (로켓배송/무료반품)\n"
+            f"💵 <b>특가 정보</b>\n"
+            f"• <b>골드특가</b>: <b>{p_price:,}원</b>\n"
+            f"{unit_str}"
             f"• <b>카테고리</b>: {esc(cat)}\n\n"
-            f"{unit_block}"
-            f"🚚 <b>배송정보</b>: 🚀 로켓배송 (내일 도착 보장)\n"
-            f"⏰ <b>특가시간</b>: 오늘 자정(24:00)까지 또는 한정수량 마감\n"
+            f"💡 <b>핫딜 포인트</b>: 오늘 자정(24:00)까지 한정 수량 하루 특가\n\n"
+            f"🚚 🚀 <b>로켓배송 (내일 도착 보장)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ <i>핫딜 특성상 실시간 잔여수량에 따라 조기 마감될 수 있습니다.</i>\n"
             f"※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
         )
 
-        if send_telegram(CHANNEL_ID, msg, img_url, "👉 수량/옵션 및 최저가 확인하기", p_url):
+        if send_telegram(CHANNEL_ID, msg, img_url, "👉 실시간 수량 및 최저가 확인", p_url):
             sent += 1
             import time
             time.sleep(2)
@@ -663,7 +615,7 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN이 없습니다.")
         sys.exit(1)
 
-    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (이미지 OCR + 가격 메리트 엄격 검증)...")
+    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (초경량 고임팩트 템플릿)...")
     seen = load_seen()
     total_sent = 0
 
