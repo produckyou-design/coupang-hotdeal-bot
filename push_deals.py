@@ -297,27 +297,29 @@ def send_telegram(
 # ==========================================
 # 1. 루리웹 핫딜 수집기
 # ==========================================
-def collect_ruliweb_deals() -> List[Dict[str, Any]]:
+def collect_ruliweb_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
+    """루리웹 핫딜 게시판 최근 N페이지를 광범위 스캔하여 신규 핫딜 누락 없이 수집"""
     deals = []
-    url = "https://bbs.ruliweb.com/market/board/1020"
     try:
-        res = requests.get(url, headers=HEADERS, timeout=8)
-        if res.status_code != 200:
-            return deals
-
-        soup = BeautifulSoup(res.text, "html.parser")
-        for row in soup.select("tr.table_body"):
-            s = row.select_one("a.subject_link")
-            if not s:
-                continue
-            title = " ".join(s.text.split())
-            if "쿠팡" not in title and "coupang" not in title.lower():
+        for page in range(1, max_pages + 1):
+            url = f"https://bbs.ruliweb.com/market/board/1020?page={page}"
+            res = requests.get(url, headers=HEADERS, timeout=8)
+            if res.status_code != 200:
                 continue
 
-            link = s.get("href", "")
-            m = re.search(r"/read/(\d+)", link)
-            pid = f"ruliweb_{m.group(1)}" if m else link
-            deals.append({"id": pid, "title": title, "link": link})
+            soup = BeautifulSoup(res.text, "html.parser")
+            for row in soup.select("tr.table_body"):
+                s = row.select_one("a.subject_link")
+                if not s:
+                    continue
+                title = " ".join(s.text.split())
+                if "쿠팡" not in title and "coupang" not in title.lower():
+                    continue
+
+                link = s.get("href", "")
+                m = re.search(r"/read/(\d+)", link)
+                pid = f"ruliweb_{m.group(1)}" if m else link
+                deals.append({"id": pid, "title": title, "link": link})
     except Exception as e:
         logger.error(f"루리웹 수집 오류: {e}")
 
