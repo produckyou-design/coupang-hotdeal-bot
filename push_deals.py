@@ -100,6 +100,182 @@ def extract_ocr_text(img_url: Optional[str]) -> str:
     return ""
 
 
+
+def clean_spec_title(t: str) -> str:
+    """네이버 검색 및 커뮤니티 SKU 결과에서 군더더기 태그를 제거하고 상품 스펙명만 정제"""
+    t = re.sub(r"^.*?›\s*", "", t)
+    t = re.sub(r"^\d+일\s*전\s*", "", t)
+    t = re.sub(r"^[\d\.]+\s*", "", t)
+    t = re.sub(r"새\s*창\s*열림", "", t)
+    t = re.sub(r"\[쿠팡.*?\]", "", t)
+    t = re.sub(r"더쿠\s*-\s*", "", t)
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"●.*", "", t)
+    t = re.sub(r"\([^\)]*?(?:무료|무배|와우|역대가|원|\d+)[^\)]*?\)", "", t)
+    t = re.sub(r"(?:최저가|가격\s*비교|가격변동|와우할인).*$", "", t)
+    t = re.sub(r"[\d,]+원.*", "", t)
+    t = re.sub(r"/\s*[\d,]+.*", "", t)
+    t = re.sub(r"\|\s*핫딜.*", "", t)
+    t = re.sub(r">\s*국내핫딜.*", "", t)
+    t = re.sub(r"-\s*(?:도시락김|기타|핫딜|마이너|dc|채널|1개).*", "", t)
+    t = re.sub(r"[·•].*$", "", t)
+    t = re.sub(r"\.{2,}", "", t)
+    t = re.sub(r"-", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip(" ,.-")
+
+
+def enrich_product_spec(p_name: str, p_url: str, img_url: Optional[str] = None) -> str:
+    """
+    쿠팡 API의 축약된 상품명(예: '가그린 제로 구강청결제')에
+    실제 상세 규격/용량/수량(예: '1.2L 2개')을 결합 복원.
+    네이버 SKU 검색 -> 어미새 검색 -> 썸네일 OCR 순으로 정밀 추적.
+    """
+    if not p_url:
+        return p_name
+
+    # 1. 이미 용량과 수량이 둘 다 명확히 있는 경우 원본 유지
+    has_count = re.search(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p|인분)", p_name)
+    has_weight = re.search(r"(\d+(?:\.\d+)?)\s*(ml|l|리터|g|kg|그램|킬로|cm|mm)", p_name, re.IGNORECASE)
+    if has_count and has_weight:
+        return p_name
+
+    # 2. Coupang ID 추출 (vendorItemId, itemId)
+    m_v = re.search(r"vendorItemId=(\d+)", p_url)
+    m_i = re.search(r"itemId=(\d+)", p_url)
+    vid = m_v.group(1) if m_v else ""
+    iid = m_i.group(1) if m_i else ""
+
+    keywords = [w for w in p_name.split() if len(w) >= 2][:2]
+    first_word = keywords[0].lower() if keywords else ""
+
+    best_candidate = ""
+    best_score = 0
+
+    search_ids = []
+    if vid:
+        search_ids.append(vid)
+    if iid and iid != vid:
+        search_ids.append(iid)
+
+    for target_id in search_ids:
+        try:
+            u = "https://search.naver.com/search.naver?query=" + requests.utils.quote(f"쿠팡 {target_id}")
+            r = requests.get(u, headers=HEADERS, timeout=3)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for el in soup.select("a, span"):
+                txt = el.text.strip()
+                if first_word and first_word not in txt.lower():
+                    continue
+                if any(k in txt for k in keywords):
+                    c_txt = clean_spec_title(txt)
+                    if len(c_txt) <= len(p_name) or c_txt.startswith("http") or "baradur" in c_txt:
+                        continue
+                    c_cnt = bool(re.search(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p)", c_txt))
+                    c_wt = bool(re.search(r"(\d+(?:\.\d+)?)\s*(ml|l|리터|g|kg|cm)", c_txt, re.IGNORECASE))
+                    score = 0
+                    if c_cnt and c_wt:
+                        score = 100
+                    elif c_cnt or c_wt:
+                        score = 50
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = c_txt
+                        if score == 100:
+                            break
+        except Exception:
+            pass
+        if best_score == 100:
+            break
+
+    # 3. 어미새 SKU 검색
+    if best_score < 100 and iid:
+        try:
+            u = f"https://eomisae.co.kr/index.php?mid=fs&act=IS&is_keyword={iid}"
+            r = requests.get(u, headers=HEADERS, timeout=3)
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a"):
+                txt = a.text.strip()
+                if any(k in txt for k in keywords) and re.search(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p|ml|l|리터|g|kg)", txt, re.IGNORECASE):
+                    c_txt = clean_spec_title(txt)
+                    if len(c_txt) > len(p_name):
+                        best_candidate = c_txt
+                        best_score = 100
+                        break
+        except Exception:
+            pass
+
+    # 4. 이미지 OCR 보강 (용량 및 반복 개수)
+    if best_score == 0 and img_url:
+        try:
+            ocr = extract_ocr_text(img_url)
+            m_cap = re.search(r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg)", ocr, re.IGNORECASE)
+            if m_cap:
+                cap_str = m_cap.group(0).strip()
+                occ = len(re.findall(re.escape(cap_str), ocr, re.IGNORECASE))
+                if occ >= 2:
+                    best_candidate = f"{p_name} {cap_str} {occ}개"
+                else:
+                    best_candidate = f"{p_name} {cap_str}"
+                best_score = 50
+        except Exception:
+            pass
+
+    if best_score > 0 and best_candidate:
+        logger.info(f"✨ 상품 상세 규격 복원 완료: {p_name} ➡️ {best_candidate}")
+        return best_candidate
+
+    return p_name
+
+
+def compute_unit_pricing(name: str, price: int) -> str:
+    """상품명과 가격에서 개당 단가 및 100g/100ml당 단가를 계산하여 텔레그램 포맷으로 반환"""
+    if price <= 0:
+        return ""
+
+    counts = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p)", name)
+    weights = re.findall(r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)", name, re.IGNORECASE)
+
+    count_val = int(counts[-1][0]) if counts else 0
+    count_unit = counts[-1][1] if counts else ""
+
+    total_amount = 0.0
+    amount_unit = "g"
+    if weights:
+        w_val = float(weights[0][0])
+        w_u = weights[0][1].lower()
+        if w_u in ["kg", "킬로"]:
+            single_amount = w_val * 1000
+            amount_unit = "g"
+        elif w_u in ["l", "리터"]:
+            single_amount = w_val * 1000
+            amount_unit = "ml"
+        elif w_u in ["ml"]:
+            single_amount = w_val
+            amount_unit = "ml"
+        else:
+            single_amount = w_val
+            amount_unit = "g"
+
+        if count_val > 1 and len(weights) == 1:
+            total_amount = single_amount * count_val
+        else:
+            total_amount = single_amount
+
+    parts = []
+    if count_val > 1:
+        u_p = round(price / count_val)
+        parts.append(f"<b>{count_unit}당 약 {u_p:,}원</b>")
+
+    if total_amount >= 50:
+        unit_100 = round(price / (total_amount / 100))
+        parts.append(f"100{amount_unit}당 약 {unit_100:,}원")
+
+    if parts:
+        return "• <b>단가계산</b>: " + " (".join(parts) + (")" if len(parts) > 1 else "") + " 꼴!\n"
+    return ""
+
+
 def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str, Any]:
     """
     제목, 본문, 이미지 OCR 텍스트에서 가격 메리트(정상가, 할인율, 최종특가, 단가, 커뮤니티 반응)를 종합 분석.
@@ -206,32 +382,13 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
             if c_amt > 0 and sale_price > 0:
                 final_price = max(0, sale_price - c_amt)
 
-    # 5. 가성비 단가 계산
+    # 5. 가성비 단가 계산 (개당 및 100g/100ml 복합 단가 지원)
     unit_info = ""
     eff_p = final_price if 0 < final_price < sale_price else sale_price
     if eff_p > 0:
-        units = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매)", title)
-        if units:
-            count = int(units[-1][0])
-            unit_name = units[-1][1]
-            if count > 1:
-                u_price = round(eff_p / count)
-                unit_info = f"{unit_name}당 약 {u_price:,}원 꼴!"
-
-        if not unit_info:
-            weight_match = re.search(r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로)", title, re.IGNORECASE)
-            if weight_match:
-                val = float(weight_match.group(1))
-                if val > 0:
-                    unit_p = round(eff_p / (val * 10))
-                    unit_info = f"100g/ml당 약 {unit_p:,}원 꼴!"
-            else:
-                gram_match = re.search(r"(\d+)\s*(g|ml|그램)", title, re.IGNORECASE)
-                if gram_match:
-                    val = int(gram_match.group(1))
-                    if val >= 100:
-                        unit_p = round(eff_p / (val / 100))
-                        unit_info = f"100g당 약 {unit_p:,}원 꼴!"
+        raw_unit = compute_unit_pricing(title, eff_p)
+        if raw_unit:
+            unit_info = raw_unit.replace("• <b>단가계산</b>: ", "").replace("\n", "").strip()
 
     # 6. 커뮤니티 반응 (단순 감상평 배제, 팩트 문장만 채택)
     community_reactions = []
@@ -481,9 +638,10 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         logger.error(f"딥링크 생성 실패: {e}")
         return False
 
-    # 제목 정리 (태그 및 댓글수 제거)
+    # 제목 정리 및 실제 상품 상세 규격(용량/수량) 보강
     clean_title = re.sub(r"^\[.*?\]\s*", "", title)
     clean_title = re.sub(r"\s*\(\d+\)$", "", clean_title)
+    clean_title = enrich_product_spec(clean_title, raw_url, img_url)
 
     # 4. 가격 블록 정밀 구성
     price_lines = []
@@ -559,33 +717,29 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
     now = datetime.now(kst)
     today_key = f"gb_{now.strftime('%Y%m%d')}"
 
-    if today_key in seen:
-        return 0
-    if now.hour != 7 and "--force-goldbox" not in sys.argv:
-        return 0
+    if "--force-goldbox" not in sys.argv:
+        if today_key in seen:
+            return 0
+        if now.hour != 7:
+            return 0
 
-    logger.info("🍯 아침 골드박스 상위 3개 자동 송출 시작...")
+    logger.info("🍯 아침 골드박스 상위 5개 자동 송출 시작...")
     res = coupang_api.get_goldbox_products(sub_id="auto_goldbox")
     items = res.get("data", [])
     if not items:
         return 0
 
     sent = 0
-    for i, it in enumerate(items[:3]):
-        p_name = it.get("productName", "")
-        p_price = int(it.get("productPrice", 0))
+    for i, it in enumerate(items[:5]):
+        raw_name = it.get("productName", "")
+        p_price = int(float(it.get("productPrice", 0)))
         p_url = it.get("productUrl", "")
         img_url = it.get("productImage")
         cat = it.get("categoryName", "")
 
-        unit_str = ""
-        units = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매)", p_name)
-        if units and p_price > 0:
-            count = int(units[-1][0])
-            unit_name = units[-1][1]
-            if count > 1:
-                u_p = round(p_price / count)
-                unit_str = f"• <b>단가계산</b>: <b>{unit_name}당 약 {u_p:,}원 꼴!</b>\n"
+        # 상품 풀네임 및 실제 규격/수량/용량 복원 (1.2L 2개 등)
+        p_name = enrich_product_spec(raw_name, p_url, img_url)
+        unit_str = compute_unit_pricing(p_name, p_price)
 
         msg = (
             f"🍯 <b>[쿠팡 공식 골드박스] 👑 와우회원 단독 하루 특가</b>\n"
