@@ -55,12 +55,14 @@ try:
 except ValueError:
     ADMIN_CHAT_ID = 0
 PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID", "@HOTpang911")
+REPORT_CHANNEL_ID = os.getenv("TELEGRAM_REPORT_CHANNEL_ID", "-1003981511629")
 
 # 리모콘 상태
 START_TIME = datetime.now()
 AUTO_ENABLED = True
 SEARCH_WAIT: Dict[int, bool] = {}
 AUTO_GOLDBOX_LIMIT = 5  # 자동 송출은 상위 N개만 (스팸 방지, 수동 전체송출은 제한 없음)
+COMMUNITY_MAX_PER_RUN = 3  # 커뮤니티 자동송출 1회당 상한 (채널 도배 방지)
 CACHE_TTL_SEC = 30 * 60  # 송출 캐시 유효시간 30분
 _SINGLETON_SOCK = None
 
@@ -827,7 +829,9 @@ async def post_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_morning_goldbox(bot):
-    """아침 자동 송출 — 스팸 방지 위해 상위 N개만 (수동 전체송출은 제한 없음)"""
+    """아침 자동 송출 — 상위 N개만, 당일 중복제외 (수동 전체송출은 제한 없음)
+    NOTE: goldbox/search의 productUrl은 이미 추적링크(link.coupang.com/re/AFFSDP?lptag=...)라
+    deeplink 변환이 불필요함. 원본 coupang.com URL(커뮤니티/수동붙여넣기)만 변환하면 됨."""
     clean_cache()
     if not AUTO_ENABLED:
         logger.info("자동송출 OFF — 스케줄 스킵")
@@ -835,15 +839,28 @@ async def scheduled_morning_goldbox(bot):
     logger.info(f"아침 골드박스 자동 송출 시작 (상위 {AUTO_GOLDBOX_LIMIT}개)")
     try:
         res = coupang_api.get_goldbox_products(sub_id="tg_auto_all")
+        if str(res.get("rCode", "0")) != "0":
+            logger.error(f"골드박스 API 오류: {res.get('rCode')} {res.get('rMessage')}")
+            if ADMIN_CHAT_ID:
+                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ 골드박스 API 오류: {esc(res.get('rCode'))} {esc(res.get('rMessage'))}")
+            return
         items = res.get("data", [])
         if not items:
             return
 
+        today = datetime.now().strftime("%Y%m%d")
+        seen = load_seen_deals()
         success_count = 0
+        skipped_dup = 0
         for i, item in enumerate(items[:AUTO_GOLDBOX_LIMIT]):
+            p_id = item.get("productId")
+            dup_key = f"goldbox_{p_id}_{today}"
+            if dup_key in seen:
+                skipped_dup += 1
+                continue
             p_name = item.get("productName")
-            p_price = int(item.get("productPrice", 0))
-            p_url = item.get("productUrl")
+            p_price = int(float(item.get("productPrice", 0)))
+            p_url = item.get("productUrl")  # 이미 추적링크이므로 그대로 사용 (수익 직결)
             img_url = item.get("productImage")
 
             deal_msg = format_deal_message(
@@ -875,15 +892,17 @@ async def scheduled_morning_goldbox(bot):
                         parse_mode=ParseMode.HTML,
                     )
                 success_count += 1
+                seen.add(dup_key)
             except Exception as e:
                 logger.error(f"자동 송출 오류: {e}")
 
             await asyncio.sleep(1.5)
 
+        save_seen_deals(seen)
         if ADMIN_CHAT_ID:
             await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"📢 <b>[골드박스 자동 송출 완료]</b> 오늘자 상위 <b>{success_count}개</b>가 <code>{esc(PUBLIC_CHANNEL_ID)}</code> 채널에 등록되었습니다.",
+                text=f"📢 <b>[골드박스 자동 송출 완료]</b> 오늘자 상위 <b>{success_count}개</b> 송출, 중복스킵 {skipped_dup}개 → <code>{esc(PUBLIC_CHANNEL_ID)}</code>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -1006,12 +1025,18 @@ async def post_init(application: Application):
         scheduled_morning_goldbox,
         trigger=CronTrigger(hour=7, minute=5),
         args=[application.bot],
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
-    # 2) 60분마다 커뮤니티 검증 핫딜 자동 수집 및 송출 (10분→60분, 채널 도배 방지)
+    # 2) 60분마다 커뮤니티 검증 핫딜 자동 수집 및 송출 (회당 상한 COMMUNITY_MAX_PER_RUN건)
     scheduler.add_job(
         check_and_publish_community_deals,
         trigger=IntervalTrigger(minutes=60),
         args=[application.bot],
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
     # 3) 30분마다 만료 캐시 청소
     scheduler.add_job(clean_cache, trigger=IntervalTrigger(minutes=30))

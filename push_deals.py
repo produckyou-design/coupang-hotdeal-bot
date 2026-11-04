@@ -27,9 +27,11 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID", "@HOTpang911")
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "7525598874")
+REPORT_CHANNEL_ID = os.getenv("TELEGRAM_REPORT_CHANNEL_ID", "-1003981511629")
 
 coupang_api = CoupangPartnersAPI()
 SEEN_FILE = os.path.join(os.path.dirname(__file__), "seen_deals.json")
+TRACKER_FILE = os.path.join(os.path.dirname(__file__), "sales_tracker.json")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -608,6 +610,84 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
     return sent
 
 
+def load_sales_tracker() -> Dict[str, Any]:
+    if os.path.exists(TRACKER_FILE):
+        try:
+            with open(TRACKER_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"date": "", "last_orders": 0, "last_gmv": 0, "last_milestone_step": 0}
+
+
+def save_sales_tracker(data: Dict[str, Any]):
+    try:
+        with open(TRACKER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"sales_tracker 저장 오류: {e}")
+
+
+def check_and_notify_sales():
+    """실시간 새 주문 감지 및 누적 판매액 10만원 단위 마일스톤 알림"""
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+    today_str = now.strftime("%Y%m%d")
+    target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
+
+    try:
+        res = coupang_api.get_order_report(start_date=today_str, end_date=today_str)
+        items = res.get("data", [])
+        cur_orders = len(items)
+        cur_gmv = sum(int(it.get("gmv", 0)) for it in items)
+        est_comm = round(cur_gmv * 0.03)
+
+        tracker = load_sales_tracker()
+        if tracker.get("date") != today_str:
+            tracker = {"date": today_str, "last_orders": 0, "last_gmv": 0, "last_milestone_step": 0}
+
+        last_orders = tracker.get("last_orders", 0)
+        last_step = tracker.get("last_milestone_step", 0)
+
+        # 1. 새 주문 체결 감지 알림
+        if cur_orders > last_orders:
+            new_count = cur_orders - last_orders
+            diff_gmv = cur_gmv - tracker.get("last_gmv", 0)
+            msg = (
+                f"🔔 <b>[새 주문 체결 알림!]</b>\n\n"
+                f"📦 오늘 <b>{cur_orders}번째 주문</b>이 발생했습니다! (+{new_count}건)\n"
+                f"• 신규 체결액: <b>약 {diff_gmv:,}원</b>\n"
+                f"• 오늘 누적 판매액: <b>{cur_gmv:,}원</b>\n"
+                f"• 오늘 예상 수익: <b>약 {est_comm:,}원</b> (3%)\n\n"
+                f"🎉 축하합니다! 실시간 주문이 계속 늘어나고 있습니다. 🚀"
+            )
+            send_telegram(chat_id=target_channel, text=msg)
+            logger.info(f"📢 새 주문 알림 발송: {cur_orders}건 누적")
+
+        # 2. 판매액 마일스톤 (10만 원 단위 돌파 알림)
+        cur_step = cur_gmv // 100000
+        if cur_step > last_step and cur_step > 0:
+            target_amount = cur_step * 100000
+            milestone_msg = (
+                f"🏆 <b>[판매액 마일스톤 달성!]</b>\n\n"
+                f"💰 오늘 누적 판매액 <b>{target_amount:,}원</b>을 돌파했습니다!\n"
+                f"• 현재 누적 판매액: <b>{cur_gmv:,}원</b>\n"
+                f"• 현재 예상 수익: <b>약 {est_comm:,}원</b>\n"
+                f"• 총 체결 건수: <b>{cur_orders}건</b>\n\n"
+                f"📈 대박 행진 중! 다음 목표({(cur_step+1)*10:,}만원)를 향해 달립니다! 🔥"
+            )
+            send_telegram(chat_id=target_channel, text=milestone_msg)
+            logger.info(f"🏆 마일스톤 알림 발송: {target_amount:,}원 돌파")
+            tracker["last_milestone_step"] = cur_step
+
+        tracker["last_orders"] = cur_orders
+        tracker["last_gmv"] = cur_gmv
+        save_sales_tracker(tracker)
+
+    except Exception as e:
+        logger.error(f"판매 모니터링 오류: {e}")
+
+
 def run_daily_report_if_night():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
@@ -634,7 +714,8 @@ def run_daily_report_if_night():
             f"오늘 하루도 고생 많으셨습니다! 내일도 알짜 핫딜이 자동으로 배달됩니다. 🚀"
         )
 
-        send_telegram(chat_id=ADMIN_CHAT_ID, text=report_msg)
+        target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
+        send_telegram(chat_id=target_channel, text=report_msg)
         logger.info("✅ 일일 결산 리포트 관리자 전송 완료")
     except Exception as e:
         logger.error(f"결산 리포트 조회 오류: {e}")
@@ -665,7 +746,10 @@ def main():
     gb_sent = run_goldbox_if_morning(seen)
     total_sent += gb_sent
 
-    # 4. 밤 23시 결산 리포트
+    # 4. 실시간 판매액 및 마일스톤 모니터링 (새 주문 & 10만원 단위 돌파)
+    check_and_notify_sales()
+
+    # 5. 밤 23시 결산 리포트
     run_daily_report_if_night()
 
     logger.info(f"🎉 모든 작업 완료! (새로 송출된 핫딜 총 {total_sent}건)")
