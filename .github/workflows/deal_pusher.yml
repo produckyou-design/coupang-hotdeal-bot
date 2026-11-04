@@ -1,0 +1,45 @@
+name: Coupang Deal Pusher
+
+on:
+  schedule:
+    # 30분마다 자동 실행 (UTC 기준)
+    - cron: '*/30 * * * *'
+  # 깃허브 웹 화면에서 [Run workflow] 버튼으로 수동 테스트 가능
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  push-deals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Deal Pusher
+        env:
+          COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY: ${{ secrets.COUPANG_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_PUBLIC_CHANNEL_ID: ${{ secrets.TELEGRAM_PUBLIC_CHANNEL_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        run: |
+          python push_deals.py
+
+      - name: Commit and push updated seen deals
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_deals.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update seen deals [skip ci]" && git push)
