@@ -2,8 +2,8 @@ name: Coupang Deal Pusher
 
 on:
   schedule:
-    # 30분마다 자동 실행 (UTC 기준)
-    - cron: '*/30 * * * *'
+    # 15분마다 자동 실행 (정각/30분 트래픽 몰림 회피)
+    - cron: '10,25,40,55 * * * *'
   # 깃허브 웹 화면에서 [Run workflow] 버튼으로 수동 테스트 가능
   workflow_dispatch:
 
