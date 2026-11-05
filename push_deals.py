@@ -527,39 +527,83 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
 
 
 # ==========================================
-# 2. 뽐뿌 RSS 핫딜 수집기
+# 2. 뽐뿌 핫딜 수집기 (게시판 1~5페이지 직접 스캔)
 # ==========================================
-def collect_ppomppu_deals() -> List[Dict[str, Any]]:
+def collect_ppomppu_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
     deals = []
-    url = "https://www.ppomppu.co.kr/rss.php?id=ppomppu"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=8)
-        if res.status_code != 200:
-            return deals
-
-        res.encoding = "utf-8"
-        root = ET.fromstring(res.text)
-
-        for it in root.findall(".//item"):
-            title = it.find("title").text if it.find("title") is not None else ""
-            link = it.find("link").text if it.find("link") is not None else ""
-            if "쿠팡" not in title and "coupang" not in title.lower():
+    for page in range(1, max_pages + 1):
+        url = f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=6)
+            if r.status_code != 200:
                 continue
-
-            m = re.search(r"no=(\d+)", link)
-            pid = f"ppomppu_{m.group(1)}" if m else link
-            deals.append({"id": pid, "title": title, "link": link})
-    except Exception as e:
-        logger.error(f"뽐뿌 RSS 수집 오류: {e}")
-
+            r.encoding = "euc-kr"
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a"):
+                href = a.get("href", "")
+                if "view.php?id=ppomppu&" in href and a.text.strip():
+                    title = a.text.strip()
+                    if "쿠팡" in title or "coupang" in title.lower():
+                        m = re.search(r"no=(\d+)", href)
+                        if not m:
+                            continue
+                        deal_id = f"ppomppu_{m.group(1)}"
+                        full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
+                        if not any(d["id"] == deal_id for d in deals):
+                            deals.append({"id": deal_id, "title": title, "link": full_url})
+        except Exception as e:
+            logger.error(f"뽐뿌 페이지({page}) 수집 오류: {e}")
     return deals
 
 
 def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
-        res = requests.get(url, headers=HEADERS, timeout=8)
+        res = requests.get(url, headers=HEADERS, timeout=6)
         if res.status_code != 200:
             return None
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # 1. 쿠팡 URL 추출 (일반 URL 또는 link.coupang 단축링크)
+        all_cp = re.findall(r"https?://(?:www\.|m\.)?coupang\.com/vp/products/\d+[^\s\"\'<>]*", res.text)
+        if not all_cp:
+            all_cp = re.findall(r"https?://link\.coupang\.com/[a-zA-Z0-9/_\-\?=&]+", res.text)
+
+        if not all_cp:
+            return None
+        cp_url = all_cp[0]
+
+        # 단축링크인 경우 실상품 URL로 리다이렉트 추적
+        if "link.coupang.com" in cp_url:
+            try:
+                head_res = requests.head(cp_url, headers=HEADERS, allow_redirects=True, timeout=4)
+                if "coupang.com" in head_res.url:
+                    cp_url = head_res.url
+            except Exception:
+                pass
+
+        # 2. 본문 텍스트 추출 (Ppomppu는 td.han)
+        body_text = ""
+        content_el = soup.select_one("td.han, td.board-contents, div.sub-top-text-box")
+        if content_el:
+            body_text = content_el.text.strip()
+
+        # 3. 이미지 URL 추출
+        img_url = None
+        img_candidates = re.findall(r"https?://[^\s\"\'<>]*(?:coupangcdn|thumbnail)[^\s\"\'<>]*\.(?:jpg|jpeg|png|webp)", res.text)
+        if img_candidates:
+            img_url = img_candidates[0]
+        elif content_el:
+            img = content_el.select_one("img")
+            if img:
+                src = img.get("src")
+                if src:
+                    img_url = ("https:" + src) if src.startswith("//") else src
+
+        return {"coupang_url": cp_url, "body_text": body_text, "img_url": img_url}
+    except Exception as e:
+        logger.error(f"뽐뿌 상세 파싱 오류 ({url}): {e}")
+        return None
         res.encoding = "euc-kr"
         soup = BeautifulSoup(res.text, "html.parser")
 
