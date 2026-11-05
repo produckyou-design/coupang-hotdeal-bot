@@ -2,8 +2,8 @@ name: Coupang Deal Pusher
 
 on:
   schedule:
-    # 15분마다 자동 실행 (정각/30분 트래픽 몰림 회피)
-    - cron: '10,25,40,55 * * * *'
+    # 깃허브 공식 최단 주기: 5분마다 자동 실행
+    - cron: '*/5 * * * *'
   # 깃허브 웹 화면에서 [Run workflow] 버튼으로 수동 테스트 가능
   workflow_dispatch:
 
@@ -14,25 +14,48 @@ jobs:
   push-deals:
     runs-on: ubuntu-latest
     steps:
+      - name: Check if Local PC is Active (Heartbeat Check)
+        id: check_pc
+        env:
+          PC_HEARTBEAT: ${{ vars.PC_HEARTBEAT }}
+        run: |
+          NOW=$(date +%s)
+          HEARTBEAT=${PC_HEARTBEAT:-0}
+          DIFF=$((NOW - HEARTBEAT))
+          echo "Current time: $NOW, Last PC Heartbeat: $HEARTBEAT (Diff: ${DIFF}s)"
+          # 수동 실행(workflow_dispatch)이 아니고, 로컬 PC가 최근 10분(600초) 이내에 작동했으면 스킵
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ $DIFF -lt 600 ] && [ "$HEARTBEAT" -ne 0 ]; then
+            echo "pc_active=true" >> $GITHUB_OUTPUT
+            echo "🟢 로컬 PC가 현재 켜져서 3분마다 작동 중입니다. 중복 송출 방지를 위해 깃허브 액션은 스킵합니다."
+          else
+            echo "pc_active=false" >> $GITHUB_OUTPUT
+            echo "🔴 로컬 PC가 꺼져 있거나 10분 이상 신호가 없습니다. 깃허브 액션이 클라우드 백업으로 자동 송출을 가동합니다!"
+          fi
+
       - name: Checkout Repository
+        if: steps.check_pc.outputs.pc_active != 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.check_pc.outputs.pc_active != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install System OCR Dependencies
+        if: steps.check_pc.outputs.pc_active != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-kor
 
       - name: Install Dependencies
+        if: steps.check_pc.outputs.pc_active != 'true'
         run: |
           pip install -r requirements.txt
 
       - name: Run Deal Pusher
+        if: steps.check_pc.outputs.pc_active != 'true'
         env:
           COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY: ${{ secrets.COUPANG_SECRET_KEY }}
@@ -44,6 +67,7 @@ jobs:
           python push_deals.py
 
       - name: Commit and push updated seen deals & sales tracker
+        if: steps.check_pc.outputs.pc_active != 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"

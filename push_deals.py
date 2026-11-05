@@ -924,10 +924,50 @@ def run_daily_report_if_night():
         logger.error(f"결산 리포트 조회 오류: {e}")
 
 
+def update_pc_heartbeat():
+    """로컬 PC 실행 시 깃허브에 생존신고 타임스탬프 전송 (깃허브 액션 중복 실행 방지용)"""
+    if os.getenv("GITHUB_ACTIONS"):
+        return
+    try:
+        import subprocess, time
+        now_ts = str(int(time.time()))
+        subprocess.run(["gh", "variable", "set", "PC_HEARTBEAT", "--body", now_ts], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def sync_git_state():
+    """로컬 실행 시 깃허브 액션이 올렸을 수 있는 최신 seen_deals를 pull 동기화"""
+    if os.getenv("GITHUB_ACTIONS"):
+        return
+    try:
+        import subprocess
+        subprocess.run(["git", "pull", "--rebase"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def sync_git_push():
+    """로컬에서 신규 딜 송출 완료 시 깃허브로 즉시 push 동기화"""
+    if os.getenv("GITHUB_ACTIONS"):
+        return
+    try:
+        import subprocess
+        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json"], capture_output=True, timeout=5)
+        subprocess.run(["git", "commit", "-m", "chore: sync seen deals from local runner [skip ci]"], capture_output=True, timeout=5)
+        subprocess.run(["git", "push"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN이 없습니다.")
         sys.exit(1)
+
+    # 로컬 PC 실행 시 하트비트 전송 & 클라우드 상태 동기화
+    update_pc_heartbeat()
+    sync_git_state()
 
     logger.info("🚀 핫딜 수집 및 송출 작업 시작 (할인율 30% 및 취소선 정상가 복원)...")
     seen = load_seen()
@@ -954,6 +994,9 @@ def main():
 
     # 5. 밤 23시 결산 리포트
     run_daily_report_if_night()
+
+    if total_sent > 0:
+        sync_git_push()
 
     logger.info(f"🎉 모든 작업 완료! (새로 송출된 핫딜 총 {total_sent}건)")
 
