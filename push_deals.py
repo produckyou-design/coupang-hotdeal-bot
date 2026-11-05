@@ -115,7 +115,9 @@ def clean_spec_title(t: str) -> str:
     t = re.sub(r"(?:최저가|가격\s*비교|가격변동|와우할인).*$", "", t)
     t = re.sub(r"[\d,]+원.*", "", t)
     t = re.sub(r"/\s*[\d,]+.*", "", t)
-    t = re.sub(r"\|\s*핫딜.*", "", t)
+    t = re.sub(r"\|\s*.*$", "", t)
+    t = re.sub(r"\s+\d+g\s*×\s*\d+매.*$", "", t)
+    t = re.sub(r"\s+액체세제$", "", t)
     t = re.sub(r">\s*국내핫딜.*", "", t)
     t = re.sub(r"-\s*(?:도시락김|기타|핫딜|마이너|dc|채널|1개).*", "", t)
     t = re.sub(r"[·•].*$", "", t)
@@ -720,7 +722,7 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
     if "--force-goldbox" not in sys.argv:
         if today_key in seen:
             return 0
-        if now.hour != 7:
+        if now.hour < 7:
             return 0
 
     logger.info("🍯 아침 골드박스 상위 5개 자동 송출 시작...")
