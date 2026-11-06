@@ -284,12 +284,21 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     """
     full_text = f"{title}\n{body}\n{ocr_text}"
 
-    # 1. OCR 취소선 노이즈 복원 (예: 8i580원 -> 8,580원, 95.170원 -> 95,170원)
+    # 0. 배송비/로켓배송 기준금액(19,800원 이상, 9,800원 등) 식별하여 정가 오인 원천 차단
+    shipping_thresholds = set([19800, 9800, 30000, 50000])
+    for sm in re.finditer(r"(?:로켓배송|배송|주문)?\s*([\d,]+)\s*원\s*(?:이상|미만)", ocr_text + " " + body):
+        try:
+            shipping_thresholds.add(int(sm.group(1).replace(",", "")))
+        except Exception:
+            pass
+
+    # 1. OCR 취소선 노이즈 복원 (예: 8i580원 -> 8,580원, 24819원 -> 24,810원)
     noisy_prices = []
     for m in re.finditer(r"(\d{1,3})[iIl\.\,\'\s](\d{3})\s*원", ocr_text):
         try:
             clean_num = int(m.group(1) + m.group(2))
-            noisy_prices.append(clean_num)
+            if clean_num not in shipping_thresholds:
+                noisy_prices.append(clean_num)
         except Exception:
             pass
 
@@ -304,21 +313,24 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     if sale_price == 0 and noisy_prices:
         sale_price = min(noisy_prices)
     if sale_price == 0:
-        ocr_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", ocr_text) if int(p.replace(",", "")) >= 1000]
+        ocr_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", ocr_text) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in shipping_thresholds]
         if ocr_prices:
             sale_price = ocr_prices[0]
 
-    # 3. 정상가 및 할인율 추출 (핵심 3대 패턴)
+    # 3. 정상가 및 할인율 추출 (엄격한 5%~85% 범위 검증)
     orig_price = 0
     discount_rate = 0
 
-    # 패턴 A: 쿠팡 특유의 할인금액 표기 (예: '2,580원 와우할인', '3,000원 즉시할인')
+    # 패턴 A: 쿠팡 특유의 할인금액 표기 (예: '7,590원 쿠폰할인', '2,580원 와우할인')
     m_disc_amt = re.search(r"([\d,]+)\s*원\s*(?:와우할인|할인|쿠폰할인|즉시할인)", ocr_text)
     if m_disc_amt and sale_price > 0:
         disc_amt = int(m_disc_amt.group(1).replace(",", ""))
-        if disc_amt > 0:
-            orig_price = sale_price + disc_amt
-            discount_rate = round(disc_amt / orig_price * 100)
+        if disc_amt > 0 and disc_amt not in shipping_thresholds:
+            cand_orig = sale_price + disc_amt
+            cand_rate = round(disc_amt / cand_orig * 100)
+            if 5 <= cand_rate <= 85:
+                orig_price = cand_orig
+                discount_rate = cand_rate
 
     # 패턴 B: 본문/제목의 화살표 패턴 (예: 21,900원 -> 12,900원)
     if orig_price == 0:
@@ -326,38 +338,58 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         if arrow_match:
             p1 = int(arrow_match.group(1).replace(",", ""))
             p2 = int(arrow_match.group(2).replace(",", ""))
-            if p1 > p2:
-                orig_price = p1
-                sale_price = p2
-                discount_rate = round((orig_price - sale_price) / orig_price * 100)
+            if p1 > p2 and p1 not in shipping_thresholds:
+                cand_rate = round((p1 - p2) / p1 * 100)
+                if 5 <= cand_rate <= 85:
+                    orig_price = p1
+                    sale_price = p2
+                    discount_rate = cand_rate
 
-    # 패턴 C: 할인율(%) 매칭 (예: '29% 95,170원' 또는 '30% 할인')
+    # 패턴 C: 할인율(%) 매칭 (단위가격 오인 방지: 5% ~ 85% 범위만 허용)
     if discount_rate == 0:
-        disc_match = re.search(r"(\d+)%\s*(?:할인|dc|DC)?", full_text, re.IGNORECASE)
-        if disc_match:
-            discount_rate = int(disc_match.group(1))
+        for disc_match in re.finditer(r"(\d+)%\s*(?:할인|dc|DC)?", full_text, re.IGNORECASE):
+            r = int(disc_match.group(1))
+            if 5 <= r <= 85:
+                discount_rate = r
+                break
 
-    # 정가가 아직 없고 복원된 노이즈 가격들 중 판매가보다 큰 원래 가격이 있는 경우
+    # 정가가 아직 없고 복원된 노이즈 가격들 중 판매가보다 큰 원래 가격이 있는 경우 (배송비 기준 제외)
     if orig_price == 0 and noisy_prices and sale_price > 0:
         for p in noisy_prices:
             if p > sale_price:
-                orig_price = p
-                if discount_rate == 0:
-                    discount_rate = round((orig_price - sale_price) / orig_price * 100)
-                break
+                cand_rate = round((p - sale_price) / p * 100)
+                if 5 <= cand_rate <= 85:
+                    orig_price = p
+                    discount_rate = cand_rate
+                    break
 
     # 정상가 키워드 체크 (예: 정가 65,000원, 마트가 15,000원)
     if orig_price == 0:
         orig_match = re.search(r"(?:정가|원가|정상가|마트가|기존가|소비자가|시중가|출고가)\s*[:~약]?\s*([\d,]+)\s*원?", full_text)
         if orig_match:
-            orig_price = int(orig_match.group(1).replace(",", ""))
+            p = int(orig_match.group(1).replace(",", ""))
+            if p > sale_price and p not in shipping_thresholds:
+                cand_rate = round((p - sale_price) / p * 100)
+                if 5 <= cand_rate <= 85:
+                    orig_price = p
+                    discount_rate = cand_rate
 
-    # 할인율(>=10%)이 확인되었으나 정가가 없을 때 역산 복원
-    if orig_price == 0 and discount_rate >= 10 and sale_price > 0:
+    # 할인율(10~85%)이 확인되었으나 정가가 없을 때 역산 복원
+    if orig_price == 0 and 10 <= discount_rate <= 85 and sale_price > 0:
         raw_orig = sale_price / (1 - discount_rate / 100)
         orig_price = int(round(raw_orig, -1))
-    elif orig_price > 0 and sale_price > 0 and orig_price > sale_price and discount_rate == 0:
-        discount_rate = round((orig_price - sale_price) / orig_price * 100)
+
+    # [수학적 일관성 검증 1차]: 정가와 판매가가 모두 있을 경우, 할인율은 반드시 공식으로 재계산
+    if orig_price > sale_price > 0:
+        recalc_rate = round((orig_price - sale_price) / orig_price * 100)
+        if 5 <= recalc_rate <= 85:
+            discount_rate = recalc_rate
+        else:
+            orig_price = 0
+            discount_rate = 0
+    else:
+        orig_price = 0
+        discount_rate = 0
 
     # 4. 체감 최종가 (쿠폰 등 적용 시)
     final_price = sale_price
@@ -698,9 +730,20 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
 
     best_price = final_p if 0 < final_p < sale_p else sale_p
 
-    # 1) 상단 헤드라인: 할인율이 명확한 경우 파격할인 강조
+    # [수학적 일관성 검증 2차 (최종 방어선)]:
+    # 헤드라인과 특가정보의 할인율/정상가는 무조건 수학적 계산이 일치해야만 표기
+    if orig_p > best_price > 0:
+        disc_rate = round((orig_p - best_price) / orig_p * 100)
+        if not (5 <= disc_rate <= 85):
+            orig_p = 0
+            disc_rate = 0
+    else:
+        orig_p = 0
+        disc_rate = 0
+
+    # 1) 상단 헤드라인: 유효 할인율(15%~85%) 및 정상가 검증 완료 시에만 강조
     header_line = "🔥 <b>[실시간 검증 특가]</b>"
-    if disc_rate >= 15 and orig_p > 0 and best_price > 0:
+    if 15 <= disc_rate <= 85 and orig_p > 0 and best_price > 0:
         header_line = f"🔥 <b>[{disc_rate}% 파격할인] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {best_price:,}원!</b>"
 
     # 2) 정상가격
@@ -710,7 +753,7 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
 
     # 3) 최종특가
     if best_price > 0:
-        disc_text = f" (🔥 <b>{disc_rate}% 할인</b>)" if disc_rate > 0 else ""
+        disc_text = f" (🔥 <b>{disc_rate}% 할인</b>)" if (5 <= disc_rate <= 85) else ""
         price_lines.append(f"• <b>최종특가</b>: <b>{best_price:,}원</b>{disc_text}")
     else:
         price_lines.append(f"• <b>최종특가</b>: <b>한정수량 최저가</b>")
