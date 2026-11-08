@@ -226,21 +226,10 @@ def enrich_product_spec(p_name: str, p_url: str, img_url: Optional[str] = None) 
         except Exception:
             pass
 
-    # 4. 이미지 OCR 보강 (용량 및 반복 개수)
-    if best_score == 0 and img_url:
-        try:
-            ocr = extract_ocr_text(img_url)
-            m_cap = re.search(r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg)", ocr, re.IGNORECASE)
-            if m_cap:
-                cap_str = m_cap.group(0).strip()
-                occ = len(re.findall(re.escape(cap_str), ocr, re.IGNORECASE))
-                if occ >= 2:
-                    best_candidate = f"{p_name} {cap_str} {occ}개"
-                else:
-                    best_candidate = f"{p_name} {cap_str}"
-                best_score = 50
-        except Exception:
-            pass
+    # 규격 후보 검증: 길이가 너무 길거나(55자 초과) 콤마가 많으면 원본 유지
+    if best_candidate and (len(best_candidate) > 55 or best_candidate.count(",") >= 2):
+        best_candidate = ""
+        best_score = 0
 
     if best_score > 0 and best_candidate:
         logger.info(f"✨ 상품 상세 규격 복원 완료: {p_name} ➡️ {best_candidate}")
@@ -254,8 +243,12 @@ def compute_unit_pricing(name: str, price: int) -> str:
     if price <= 0:
         return ""
 
-    counts = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p)", name)
-    weights = re.findall(r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)", name, re.IGNORECASE)
+    # 전자기기, 가전, 잡화 등은 단가계산 대상에서 제외
+    if any(k in name.lower() for k in ["노트북", "모니터", "tv", "아이폰", "갤럭시", "태블릿", "컴퓨터", "그래픽카드", "ssd", "ram", "cpu", "본체", "이어폰", "헤드폰", "워치", "닌텐도", "플스", "패드", "마우스", "키보드"]):
+        return ""
+
+    counts = re.findall(r"(\d+)\s*(개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|p)(?![a-zA-Z])", name)
+    weights = re.findall(r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)(?![a-zA-Z])", name, re.IGNORECASE)
 
     count_val = int(counts[-1][0]) if counts else 0
     count_unit = counts[-1][1] if counts else ""
@@ -303,7 +296,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     """
     full_text = f"{title}\n{body}\n{ocr_text}"
 
-    # 0. 배송비/로켓배송 기준금액(19,800원 이상, 9,800원 등) 식별하여 정가 오인 원천 차단
+    # 0. 배송비/로켓배송 기준금액(19,800원 이상, 9,800원 등) 식별하여 정가/판매가 오인 원천 차단
     shipping_thresholds = set([19800, 9800, 30000, 50000])
     for sm in re.finditer(r"(?:로켓배송|배송|주문)?\s*([\d,]+)\s*원\s*(?:이상|미만)", ocr_text + " " + body):
         try:
@@ -311,32 +304,54 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         except Exception:
             pass
 
+    # 안심케어(보증연장 보험) 및 부가옵션 기준금액 식별 (5,000원, 5,800원, 6,000원 등 상품 가격으로 오인 방지)
+    care_thresholds = set()
+    for cm in re.finditer(r"(?:안심케어|무상보증|보증연장|한도)[\w\s\d]*?([\d,]+)\s*원", ocr_text):
+        try:
+            care_thresholds.add(int(cm.group(1).replace(",", "")))
+        except Exception:
+            pass
+
+    blacklisted_prices = shipping_thresholds | care_thresholds
+
     # 1. OCR 취소선 노이즈 복원 (예: 8i580원 -> 8,580원, 24819원 -> 24,810원)
     noisy_prices = []
     for m in re.finditer(r"(\d{1,3})[iIl\.\,\'\s](\d{3})\s*원", ocr_text):
         try:
             clean_num = int(m.group(1) + m.group(2))
-            if clean_num not in shipping_thresholds:
+            if clean_num not in blacklisted_prices:
                 noisy_prices.append(clean_num)
         except Exception:
             pass
 
-    # 2. 판매가(현재 표시가격) 찾기
+    # 2. 판매가(현재 표시가격) 찾기 (제목 -> 본문 라벨 -> 본문 일반 -> OCR 명시적 특가 순서)
     sale_price = 0
-    # 제목에서 가격 우선 추출 (예: 6,000원, 66030원)
-    title_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", title) if int(p.replace(",", "")) >= 1000]
+    # 1) 제목에서 가격 우선 추출 (예: 6,000원, 66030원)
+    title_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", title) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in blacklisted_prices]
     if not title_prices:
-        title_prices = [int(p.replace(",", "")) for p in re.findall(r"(?:^|[\(\s])([\d,]{4,})\s*(?:/|무료|와우)", title) if int(p.replace(",", "")) >= 1000]
+        title_prices = [int(p.replace(",", "")) for p in re.findall(r"(?:^|[\(\s])([\d,]{4,})\s*(?:/|무료|와우)", title) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in blacklisted_prices]
     if title_prices:
         sale_price = title_prices[-1]
 
-    # 제목에 없으면 OCR에서 최소 판매가 탐색
-    if sale_price == 0 and noisy_prices:
-        sale_price = min(noisy_prices)
+    # 2) 제목에 없으면 본문(body)의 가격 라벨 탐색 (예: 가격: 649,000원, 체감가: 15,000원)
     if sale_price == 0:
-        ocr_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", ocr_text) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in shipping_thresholds]
-        if ocr_prices:
-            sale_price = ocr_prices[0]
+        body_label_prices = [int(p.replace(",", "")) for p in re.findall(r"(?:가격|특가|체감가|판매가|할인가)\s*[:\s]*([\d,]+)\s*원", body) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in blacklisted_prices]
+        if body_label_prices:
+            sale_price = body_label_prices[0]
+
+    # 3) 본문 일반 가격 탐색
+    if sale_price == 0:
+        body_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", body) if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in blacklisted_prices]
+        if body_prices:
+            sale_price = body_prices[0]
+
+    # 4) 제목/본문에 전혀 없을 때만 OCR 명시적 특가 패턴 탐색 (절대 min(noisy_prices) 같은 임의 최소값 사용 금지!)
+    if sale_price == 0:
+        m_ocr_sale = re.findall(r"([\d,]+)\s*원\s*(?:와우쿠폰할인|와우할인|쿠폰할인|즉시할인|와우가|할인가)", ocr_text)
+        if m_ocr_sale:
+            cand_p = int(m_ocr_sale[0].replace(",", ""))
+            if cand_p not in blacklisted_prices and cand_p >= 1000:
+                sale_price = cand_p
 
     # 3. 정상가 및 할인율 추출 (엄격한 5%~85% 범위 검증)
     orig_price = 0
@@ -346,7 +361,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     m_disc_amt = re.search(r"([\d,]+)\s*원\s*(?:와우할인|할인|쿠폰할인|즉시할인)", ocr_text)
     if m_disc_amt and sale_price > 0:
         disc_amt = int(m_disc_amt.group(1).replace(",", ""))
-        if disc_amt > 0 and disc_amt not in shipping_thresholds:
+        if disc_amt > 0 and disc_amt not in blacklisted_prices:
             cand_orig = sale_price + disc_amt
             cand_rate = round(disc_amt / cand_orig * 100)
             if 5 <= cand_rate <= 85:
@@ -359,7 +374,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         if arrow_match:
             p1 = int(arrow_match.group(1).replace(",", ""))
             p2 = int(arrow_match.group(2).replace(",", ""))
-            if p1 > p2 and p1 not in shipping_thresholds:
+            if p1 > p2 and p1 not in blacklisted_prices:
                 cand_rate = round((p1 - p2) / p1 * 100)
                 if 5 <= cand_rate <= 85:
                     orig_price = p1
@@ -374,7 +389,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
                 discount_rate = r
                 break
 
-    # 정가가 아직 없고 복원된 노이즈 가격들 중 판매가보다 큰 원래 가격이 있는 경우 (배송비 기준 제외)
+    # 정가가 아직 없고 복원된 노이즈 가격들 중 판매가보다 큰 원래 가격이 있는 경우 (배송비/보험 기준 제외)
     if orig_price == 0 and noisy_prices and sale_price > 0:
         for p in noisy_prices:
             if p > sale_price:
@@ -389,7 +404,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         orig_match = re.search(r"(?:정가|원가|정상가|마트가|기존가|소비자가|시중가|출고가|원래|원래는|평소|평소엔|이전|이전가)\s*[:~약]?\s*([\d,]+)\s*원?", full_text)
         if orig_match:
             p = int(orig_match.group(1).replace(",", ""))
-            if p > sale_price and p not in shipping_thresholds:
+            if p > sale_price and p not in blacklisted_prices:
                 cand_rate = round((p - sale_price) / p * 100)
                 if 5 <= cand_rate <= 85:
                     orig_price = p
@@ -398,7 +413,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     # 할인율(10~85%)이 확인되었으나 정가가 없을 때 역산 복원
     if orig_price == 0 and 10 <= discount_rate <= 85 and sale_price > 0:
         raw_orig = sale_price / (1 - discount_rate / 100)
-        orig_price = int(round(raw_orig, -1))
+        orig_price = int(round(raw_orig, -3 if sale_price >= 100000 else -1))
 
     # [수학적 일관성 검증 1차]: 정가와 판매가가 모두 있을 경우, 할인율은 반드시 공식으로 재계산
     if orig_price > sale_price > 0:
@@ -662,7 +677,7 @@ def collect_arcalive_deals() -> List[Dict[str, Any]]:
 
 
 def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
-    """아카라이브 핫딜 본문 파싱 (쿠팡 URL, 본문 텍스트, 이미지)"""
+    """아카라이브 핫딜 본문 파싱 (쿠팡 URL, 본문 텍스트, 이미지, 상품명, 가격)"""
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
         if res.status_code != 200:
@@ -670,13 +685,42 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
         soup = BeautifulSoup(res.text, "html.parser")
 
         cp_url = None
-        for a in soup.select("table.article-info a, div.article-body a, a"):
-            href = a.get("href", "")
-            if "coupang.com" in href:
-                if "unsafelink.com/" in href:
-                    href = href.split("unsafelink.com/")[-1]
-                cp_url = href
-                break
+        extracted_title = ""
+        extracted_price = 0
+
+        # 아카라이브 핫딜 전용 옵션 테이블 정밀 추출
+        for tr in soup.select("table.article-options tr, table.article-info tr"):
+            th = tr.select_one("th, td:first-child")
+            td = tr.select_one("td:last-child")
+            if th and td:
+                lbl = th.text.strip()
+                val = td.text.strip()
+                if "링크" in lbl:
+                    a = td.select_one("a")
+                    if a and "coupang.com" in a.get("href", ""):
+                        h = a["href"]
+                        if "unsafelink.com/" in h:
+                            h = h.split("unsafelink.com/")[-1]
+                        cp_url = h
+                elif "상품명" in lbl and val:
+                    extracted_title = val
+                elif "가격" in lbl and val:
+                    m = re.search(r"([\d,]+)\s*원", val)
+                    if m:
+                        extracted_price = int(m.group(1).replace(",", ""))
+
+        # 단순 쿠폰 예고 / 이벤트 글은 스킵
+        if extracted_price == 0 and any(kw in (extracted_title + " " + res.text[:200]) for kw in ["쿠폰 예고", "선착쿠폰", "이벤트", "출석체크"]):
+            return None
+
+        if not cp_url:
+            for a in soup.select("table.article-info a, div.article-body a, a"):
+                href = a.get("href", "")
+                if "coupang.com" in href:
+                    if "unsafelink.com/" in href:
+                        href = href.split("unsafelink.com/")[-1]
+                    cp_url = href
+                    break
 
         if not cp_url:
             all_cp = re.findall(r"https?://(?:www\.|m\.)?coupang\.com/vp/products/\d+[^\s\"\'<>]*", res.text)
@@ -699,7 +743,13 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
                 if img_url and img_url.startswith("//"):
                     img_url = "https:" + img_url
 
-        return {"coupang_url": cp_url, "body_text": body_text, "img_url": img_url}
+        return {
+            "coupang_url": cp_url,
+            "body_text": body_text,
+            "img_url": img_url,
+            "extracted_title": extracted_title,
+            "extracted_price": extracted_price,
+        }
     except Exception as e:
         logger.error(f"아카라이브 상세 파싱 오류 ({url}): {e}")
         return None
@@ -796,7 +846,10 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     raw_url = detail["coupang_url"]
     body_text = detail.get("body_text", "")
     img_url = detail.get("img_url")
-    title = d["title"]
+    title = detail.get("extracted_title") or d["title"]
+    if detail.get("extracted_price") and detail["extracted_price"] > 0:
+        if f"{detail['extracted_price']:,}원" not in title:
+            title = f"{title} ({detail['extracted_price']:,}원)"
 
     # 1. 제목 정리 및 실제 상품 상세 규격(용량/수량) 먼저 정밀 보강
     clean_title = re.sub(r"^\[.*?\]\s*", "", title)
@@ -806,8 +859,8 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     # 2. 본문 이미지 OCR 텍스트 추출 (정상가, 할인율 팩트 확인)
     ocr_text = extract_ocr_text(img_url)
 
-    # 3. 가격 및 메리트 종합 분석 (보강된 상품명 기준으로 정밀 단가/할인율 분석)
-    p_info = parse_pricing_details(clean_title, body_text, ocr_text)
+    # 3. 가격 및 메리트 종합 분석 (원본 제목과 보강된 상품명 모두 반영)
+    p_info = parse_pricing_details(f"{title} {clean_title}", body_text, ocr_text)
 
     # 판매가 식별 불가(1000원 미만) 시 스킵
     if p_info["sale_price"] < 1000:
