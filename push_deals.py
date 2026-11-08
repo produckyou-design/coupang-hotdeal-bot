@@ -1531,15 +1531,19 @@ def check_and_notify_sales():
         logger.error(f"판매 모니터링 오류: {e}")
 
 
-def run_daily_report_if_night():
+def run_daily_report_if_night(seen: Set[str]) -> int:
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
+    today_str = now.strftime("%Y%m%d")
+    report_key = f"report_{today_str}"
 
-    if now.hour != 23 and "--force-report" not in sys.argv:
-        return
+    if "--force-report" not in sys.argv:
+        if now.hour != 23:
+            return 0
+        if report_key in seen:
+            return 0
 
     logger.info("📊 일일 파트너스 결산 리포트 생성 중...")
-    today_str = now.strftime("%Y%m%d")
     try:
         res = coupang_api.get_order_report(start_date=today_str, end_date=today_str)
         items = res.get("data", [])
@@ -1558,10 +1562,14 @@ def run_daily_report_if_night():
         )
 
         target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
-        send_telegram(chat_id=target_channel, text=report_msg)
-        logger.info("✅ 일일 결산 리포트 관리자 전송 완료")
+        if send_telegram(chat_id=target_channel, text=report_msg):
+            seen.add(report_key)
+            save_seen(seen)
+            logger.info("✅ 일일 결산 리포트 관리자 전송 완료 (하루 1회 기록됨)")
+            return 1
     except Exception as e:
         logger.error(f"결산 리포트 조회 오류: {e}")
+    return 0
 
 
 def update_pc_heartbeat():
@@ -1647,8 +1655,8 @@ def main():
     # 5. 실시간 판매액 및 마일스톤 모니터링
     check_and_notify_sales()
 
-    # 6. 밤 23시 결산 리포트
-    run_daily_report_if_night()
+    # 6. 밤 23시 결산 리포트 (하루 1회만 발송)
+    total_sent += run_daily_report_if_night(seen)
 
     if total_sent > 0:
         sync_git_push()
