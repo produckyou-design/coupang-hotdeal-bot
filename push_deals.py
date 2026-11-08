@@ -12,15 +12,27 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# 콘솔 인코딩 대응
-sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding="utf-8", errors="replace")
+# 콘솔 인코딩 대응 (pythonw 실행 시 sys.stdout/stderr가 None일 수 있음)
+if sys.stdout is not None:
+    sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding="utf-8", errors="replace")
+if sys.stderr is not None:
+    sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding="utf-8", errors="replace")
 
 load_dotenv()
 
 from coupang_api import CoupangPartnersAPI
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# 파일 로깅 및 콘솔 로깅 동시 지원 (배경 실행 시에도 deal_pusher.log에 실시간 기록)
+log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_pusher.log")
+handlers = [logging.FileHandler(log_file, encoding="utf-8")]
+if sys.stderr is not None:
+    handlers.append(logging.StreamHandler(sys.stderr))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=handlers
+)
 logger = logging.getLogger(__name__)
 
 # 설정값
@@ -103,7 +115,11 @@ def extract_ocr_text(img_url: Optional[str]) -> str:
 
 def clean_spec_title(t: str) -> str:
     """네이버 검색 및 커뮤니티 SKU 결과에서 군더더기 태그를 제거하고 상품 스펙명만 정제"""
+    if any(bad in t for bad in ["로그인", "회원가입", "게시판", "조회수", "등록일", "포럼", "자유게시판", "시간 전", "일 전", "오늘의집", "스탠리"]):
+        return ""
     t = re.sub(r"^.*?›\s*", "", t)
+    t = re.sub(r"^\d+일\s*전\s*", "", t)
+    t = re.sub(r"^\d+시간\s*전\s*", "", t)
     t = re.sub(r"^\d+일\s*전\s*", "", t)
     t = re.sub(r"^[\d\.]+\s*", "", t)
     t = re.sub(r"새\s*창\s*열림", "", t)
@@ -124,7 +140,10 @@ def clean_spec_title(t: str) -> str:
     t = re.sub(r"\.{2,}", "", t)
     t = re.sub(r"-", " ", t)
     t = re.sub(r"\s+", " ", t)
-    return t.strip(" ,.-")
+    res = t.strip(" ,.-")
+    if len(res) > 50:
+        return ""
+    return res
 
 
 def enrich_product_spec(p_name: str, p_url: str, img_url: Optional[str] = None) -> str:
@@ -306,6 +325,8 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     sale_price = 0
     # 제목에서 가격 우선 추출 (예: 6,000원, 66030원)
     title_prices = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)\s*원", title) if int(p.replace(",", "")) >= 1000]
+    if not title_prices:
+        title_prices = [int(p.replace(",", "")) for p in re.findall(r"(?:^|[\(\s])([\d,]{4,})\s*(?:/|무료|와우)", title) if int(p.replace(",", "")) >= 1000]
     if title_prices:
         sale_price = title_prices[-1]
 
@@ -365,7 +386,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
 
     # 정상가 키워드 체크 (예: 정가 65,000원, 마트가 15,000원)
     if orig_price == 0:
-        orig_match = re.search(r"(?:정가|원가|정상가|마트가|기존가|소비자가|시중가|출고가)\s*[:~약]?\s*([\d,]+)\s*원?", full_text)
+        orig_match = re.search(r"(?:정가|원가|정상가|마트가|기존가|소비자가|시중가|출고가|원래|원래는|평소|평소엔|이전|이전가)\s*[:~약]?\s*([\d,]+)\s*원?", full_text)
         if orig_match:
             p = int(orig_match.group(1).replace(",", ""))
             if p > sale_price and p not in shipping_thresholds:
@@ -466,34 +487,47 @@ def send_telegram(
             "inline_keyboard": [[{"text": button_text, "url": button_url}]]
         }
 
-    try:
-        if photo_url:
-            payload["photo"] = photo_url
-            payload["caption"] = text
+    # 1. 사진이 있는 경우 sendPhoto 시도
+    if photo_url:
+        try:
+            p_payload = dict(payload)
+            p_payload["photo"] = photo_url
+            p_payload["caption"] = text
             res = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", json=payload, timeout=10
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", json=p_payload, timeout=8
             ).json()
-        else:
-            payload["text"] = text
-            res = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10
-            ).json()
+            if res.get("ok"):
+                return True
+        except Exception as e:
+            logger.warning(f"사진 전송 실패, 텍스트 전송으로 자동 전환 ({photo_url[:50]}...): {e}")
 
+    # 2. 사진 없거나 사진 전송 실패 시 일반 텍스트 메시지로 자동 안전 전송
+    try:
+        t_payload = dict(payload)
+        t_payload["text"] = text
+        res = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=t_payload, timeout=8
+        ).json()
         return res.get("ok", False)
     except Exception as e:
-        logger.error(f"텔레그램 전송 실패: {e}")
+        logger.error(f"텔레그램 메시지 전송 최종 실패: {e}")
         return False
 
 
 # ==========================================
 # 1. 루리웹 핫딜 수집기
 # ==========================================
-def collect_ruliweb_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
-    """루리웹 핫딜 게시판 최근 N페이지를 광범위 스캔하여 신규 핫딜 누락 없이 수집"""
+def collect_ruliweb_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
+    """루리웹 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집"""
     deals = []
-    try:
-        for page in range(1, max_pages + 1):
-            url = f"https://bbs.ruliweb.com/market/board/1020?page={page}"
+    urls = [
+        "https://bbs.ruliweb.com/market/board/1020?search_type=subject&search_key=%EC%BF%A0%ED%8C%A1",
+    ]
+    for page in range(1, max_pages + 1):
+        urls.append(f"https://bbs.ruliweb.com/market/board/1020?page={page}")
+
+    for url in urls:
+        try:
             res = requests.get(url, headers=HEADERS, timeout=8)
             if res.status_code != 200:
                 continue
@@ -510,13 +544,12 @@ def collect_ruliweb_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
                 link = s.get("href", "")
                 m = re.search(r"/read/(\d+)", link)
                 pid = f"ruliweb_{m.group(1)}" if m else link
-                deals.append({"id": pid, "title": title, "link": link})
-    except Exception as e:
-        logger.error(f"루리웹 수집 오류: {e}")
+                if not any(d["id"] == pid for d in deals):
+                    deals.append({"id": pid, "title": title, "link": link})
+        except Exception as e:
+            logger.error(f"루리웹 수집 오류 ({url}): {e}")
 
     return deals
-
-
 def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
@@ -561,10 +594,19 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 # 2. 뽐뿌 핫딜 수집기 (게시판 1~5페이지 직접 스캔)
 # ==========================================
-def collect_ppomppu_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
+def collect_ppomppu_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
+    """뽐뿌 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집"""
     deals = []
+    import urllib.parse
+    kw = urllib.parse.quote("쿠팡", encoding="euc-kr")
+    urls = [
+        f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&keyword={kw}&page=1",
+        f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&keyword={kw}&page=2",
+    ]
     for page in range(1, max_pages + 1):
-        url = f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page={page}"
+        urls.append(f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page={page}")
+
+    for url in urls:
         try:
             r = requests.get(url, headers=HEADERS, timeout=6)
             if r.status_code != 200:
@@ -584,10 +626,83 @@ def collect_ppomppu_deals(max_pages: int = 5) -> List[Dict[str, Any]]:
                         if not any(d["id"] == deal_id for d in deals):
                             deals.append({"id": deal_id, "title": title, "link": full_url})
         except Exception as e:
-            logger.error(f"뽐뿌 페이지({page}) 수집 오류: {e}")
+            logger.error(f"뽐뿌 수집 오류 ({url}): {e}")
     return deals
 
 
+# ==========================================
+# 2-2. 아카라이브 핫딜 수집기
+# ==========================================
+def collect_arcalive_deals() -> List[Dict[str, Any]]:
+    """아카라이브 핫딜 채널 쿠팡 실시간 검색 수집"""
+    deals = []
+    import urllib.parse
+    kw = urllib.parse.quote("쿠팡")
+    url = f"https://arca.live/b/hotdeal?target=all&keyword={kw}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if r.status_code != 200:
+            return deals
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.select("a.title"):
+            href = a.get("href", "")
+            title = a.text.strip()
+            title = re.sub(r"\s*\[\d+\]$", "", title).strip()
+            if not title:
+                continue
+            m = re.search(r"/b/hotdeal/(\d+)", href)
+            if m:
+                deal_id = f"arca_{m.group(1)}"
+                full_url = f"https://arca.live/b/hotdeal/{m.group(1)}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({"id": deal_id, "title": title, "link": full_url})
+    except Exception as e:
+        logger.error(f"아카라이브 수집 오류: {e}")
+    return deals
+
+
+def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
+    """아카라이브 핫딜 본문 파싱 (쿠팡 URL, 본문 텍스트, 이미지)"""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        if res.status_code != 200:
+            return None
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        cp_url = None
+        for a in soup.select("table.article-info a, div.article-body a, a"):
+            href = a.get("href", "")
+            if "coupang.com" in href:
+                if "unsafelink.com/" in href:
+                    href = href.split("unsafelink.com/")[-1]
+                cp_url = href
+                break
+
+        if not cp_url:
+            all_cp = re.findall(r"https?://(?:www\.|m\.)?coupang\.com/vp/products/\d+[^\s\"\'<>]*", res.text)
+            if all_cp:
+                cp_url = all_cp[0]
+
+        if not cp_url:
+            return None
+
+        body_text = ""
+        body_el = soup.select_one("div.article-body")
+        if body_el:
+            body_text = body_el.text.strip()
+
+        img_url = None
+        if body_el:
+            img = body_el.select_one("img")
+            if img:
+                img_url = img.get("src")
+                if img_url and img_url.startswith("//"):
+                    img_url = "https:" + img_url
+
+        return {"coupang_url": cp_url, "body_text": body_text, "img_url": img_url}
+    except Exception as e:
+        logger.error(f"아카라이브 상세 파싱 오류 ({url}): {e}")
+        return None
 def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=6)
@@ -683,22 +798,20 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     img_url = detail.get("img_url")
     title = d["title"]
 
-    # 1. 본문 이미지 OCR 텍스트 추출 (정상가, 할인율 팩트 확인)
+    # 1. 제목 정리 및 실제 상품 상세 규격(용량/수량) 먼저 정밀 보강
+    clean_title = re.sub(r"^\[.*?\]\s*", "", title)
+    clean_title = re.sub(r"\s*\(\d+\)$", "", clean_title)
+    clean_title = enrich_product_spec(clean_title, raw_url, img_url)
+
+    # 2. 본문 이미지 OCR 텍스트 추출 (정상가, 할인율 팩트 확인)
     ocr_text = extract_ocr_text(img_url)
 
-    # 2. 가격 및 메리트 종합 분석
-    p_info = parse_pricing_details(title, body_text, ocr_text)
+    # 3. 가격 및 메리트 종합 분석 (보강된 상품명 기준으로 정밀 단가/할인율 분석)
+    p_info = parse_pricing_details(clean_title, body_text, ocr_text)
 
-    # 3. 가격 메리트 필터링 (정상가/할인율/단가/반응 없는 글 제외)
-    has_merit = any([
-        p_info["orig_price"] > 0,
-        p_info["discount_rate"] > 0,
-        bool(p_info["unit_info"]),
-        bool(p_info["reaction_text"]),
-    ])
-
-    if not has_merit:
-        logger.info(f"⏭️ [스킵] 가격 메리트 불충분: {title}")
+    # 판매가 식별 불가(1000원 미만) 시 스킵
+    if p_info["sale_price"] < 1000:
+        logger.info(f"⏭️ [스킵] 유효 가격 식별 불가: {title}")
         seen.add(deal_id)
         save_seen(seen)
         return False
@@ -715,11 +828,6 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     except Exception as e:
         logger.error(f"딥링크 생성 실패: {e}")
         return False
-
-    # 제목 정리 및 실제 상품 상세 규격(용량/수량) 보강
-    clean_title = re.sub(r"^\[.*?\]\s*", "", title)
-    clean_title = re.sub(r"\s*\(\d+\)$", "", clean_title)
-    clean_title = enrich_product_spec(clean_title, raw_url, img_url)
 
     # 4. 가격 블록 정밀 구성
     price_lines = []
@@ -1022,12 +1130,17 @@ def main():
         if process_deal(d, parse_ruliweb_detail, "ruliweb", seen):
             total_sent += 1
 
-    # 2. 뽐뿌 RSS 핫딜 검사 & 송출
+    # 2. 뽐뿌 핫딜 검사 & 송출
     p_deals = collect_ppomppu_deals()
     for d in p_deals:
         if process_deal(d, parse_ppomppu_detail, "ppomppu", seen):
             total_sent += 1
 
+    # 3. 아카라이브 핫딜 검사 & 송출
+    a_deals = collect_arcalive_deals()
+    for d in a_deals:
+        if process_deal(d, parse_arcalive_detail, "arca", seen):
+            total_sent += 1
     # 3. 아침 골드박스
     gb_sent = run_goldbox_if_morning(seen)
     total_sent += gb_sent
