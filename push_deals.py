@@ -858,13 +858,24 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         if raw_unit:
             unit_info = raw_unit.replace("• <b>단가계산</b>: ", "").replace("\n", "").strip()
 
-    # 커뮤니티 반응 (URL, 테이블 헤더, 단순 감상평 배제)
+    # 커뮤니티 반응 (URL/쿠파스 링크, 테이블 헤더, 단순 감상평 원천 배제)
     community_reactions: List[str] = []
     for line in body.splitlines():
-        ln = line.strip()
-        if not ln or ln.startswith("http") or len(ln) < 5:
+        # 줄 내부에 포함된 모든 URL 및 도메인 주소 완전 제거
+        ln = re.sub(r"https?://\S+", "", line)
+        ln = re.sub(r"www\.\S+", "", ln)
+        ln = re.sub(r"\b[a-zA-Z0-9.-]+\.(?:com|co\.kr|kr|live|me|gl|ly)(?:/\S*)?", "", ln, flags=re.IGNORECASE)
+        ln = re.sub(r"(?:구매\s*링크|상품\s*링크|링크)\s*[:：\-]?\s*$", "", ln).strip()
+        if not ln or len(ln) < 5:
             continue
-        if any(bad in ln for bad in ["맛있", "맛나", "좋네", "샀습", "추천합", "감사", "양도 많고", "구매링크", "쇼핑몰"]):
+        if any(
+            bad in ln.lower()
+            for bad in [
+                "맛있", "맛나", "좋네", "샀습", "추천합", "감사", "양도 많고",
+                "구매링크", "상품링크", "링크", "쇼핑몰", "쿠파스", "파트너스", "수수료", "일정액",
+                "coupang", "unsafelink", "http",
+            ]
+        ):
             continue
         if any(kw in ln for kw in ["최저가", "역대", "마트", "당근", "가성비", "단가", "품절", "싼듯", "저렴"]):
             community_reactions.append(ln)
@@ -1003,7 +1014,7 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
         img_urls: List[str] = []
         vc = soup.select_one("div.view_content")
         if vc:
-            body_text = vc.text.strip()
+            body_text = vc.get_text("\n", strip=True)
             for img in vc.select("img"):
                 iu = img.get("src")
                 if iu and not iu.endswith(".svg"):
@@ -1100,7 +1111,7 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
         body_text = ""
         content_el = soup.select_one("td.board-contents, td.han")
         if content_el:
-            body_text = content_el.text.strip()
+            body_text = content_el.get_text("\n", strip=True)
 
         # 본문 첨부 캡처 이미지(가격표 포함) 우선 수집 + 썸네일 보조
         content_imgs: List[str] = []
@@ -1241,7 +1252,7 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
             # 테이블 텍스트 중복 제거 후 순수 본문만 추출
             for tbl in body_el.select("table"):
                 tbl.decompose()
-            body_text = body_el.text.strip()
+            body_text = body_el.get_text("\n", strip=True)
 
         return {
             "coupang_url": cp_url,
