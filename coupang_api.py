@@ -155,3 +155,27 @@ class CoupangPartnersAPI:
         path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/orders"
         params = {"startDate": start_date, "endDate": end_date, "page": page}
         return self._request("GET", path, params=params)
+
+    def get_commission_report(
+        self, start_date: str, end_date: str
+    ) -> Dict[str, Any]:
+        """
+        일별 클릭/주문/취소/확정 수익 리포트 조회
+        :param start_date: 'YYYYMMDD' 형식
+        :param end_date: 'YYYYMMDD' 형식
+        """
+        path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/commission"
+        params = {"startDate": start_date, "endDate": end_date}
+        return self._request("GET", path, params=params)
+
+    def get_cancel_report(
+        self, start_date: str, end_date: str
+    ) -> Dict[str, Any]:
+        """
+        취소 내역 리포트 조회
+        :param start_date: 'YYYYMMDD' 형식
+        :param end_date: 'YYYYMMDD' 형식
+        """
+        path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/cancels"
+        params = {"startDate": start_date, "endDate": end_date}
+        return self._request("GET", path, params=params)

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,13 @@ HEADERS = {
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
 
+PROMO_SKIP_KEYWORDS = [
+    "쿠팡이츠", "배민", "배달의민족", "요기요", "선착쿠폰", "쿠폰 예고",
+    "출석체크", "래플", "응모", "와우 멤버스 데이", "와멤데",
+]
+
+KST = timezone(timedelta(hours=9))
+
 ELECTRONICS_KEYWORDS = [
     "노트북", "모니터", "tv", "티비", "아이폰", "iphone", "갤럭시", "태블릿", "아이패드", "ipad",
     "맥북", "macbook", "컴퓨터", "데스크탑", "그래픽카드", "rtx", "라데온", "ssd", "nvme",
@@ -113,11 +121,75 @@ def load_seen() -> Set[str]:
 
 def save_seen(seen: Set[str]):
     try:
-        recent = list(seen)[-1000:]
+        recent = list(seen)[-1500:]
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(recent, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"seen_deals 저장 에러: {e}")
+
+
+def clean_coupang_url(raw_url: str) -> Tuple[str, str]:
+    """
+    단축링크(link.coupang.com 등) 302 Location 헤더를 추적해 제3자 lptag를 제거하고
+    정규 상품 URL(https://www.coupang.com/vp/products/{pid}?...) 및 (clean_url, product_id) 반환.
+    """
+    url = (raw_url or "").strip()
+    if not url:
+        return "", ""
+
+    if "unsafelink.com/" in url:
+        url = url.split("unsafelink.com/")[-1]
+
+    # link.coupang.com 단축링크는 allow_redirects=False로 Location만 추적 (www.coupang.com 403 우회)
+    for _ in range(2):
+        if "link.coupang.com" not in url:
+            break
+        try:
+            r = requests.get(url, headers=HEADERS, allow_redirects=False, timeout=6)
+            loc = r.headers.get("Location", "")
+            if not loc:
+                break
+            url = loc
+        except Exception:
+            break
+
+    m_pid = re.search(r"/products/(\d+)", url) or re.search(r"pageKey=(\d+)", url)
+    if not m_pid:
+        return url, ""
+
+    product_id = m_pid.group(1)
+    m_item = re.search(r"itemId=(\d+)", url)
+    m_vendor = re.search(r"vendorItemId=(\d+)", url)
+
+    clean_url = f"https://www.coupang.com/vp/products/{product_id}"
+    qs: List[str] = []
+    if m_item:
+        qs.append(f"itemId={m_item.group(1)}")
+    if m_vendor:
+        qs.append(f"vendorItemId={m_vendor.group(1)}")
+    if qs:
+        clean_url += "?" + "&".join(qs)
+
+    return clean_url, product_id
+
+
+def is_product_recently_seen(product_id: str, seen: Set[str]) -> bool:
+    """최근 3일 이내 동일 Coupang productId가 이미 송출되었는지 확인 (커뮤니티 간 중복 방지)"""
+    if not product_id:
+        return False
+    now = datetime.now(KST)
+    for delta in range(3):
+        day_str = (now - timedelta(days=delta)).strftime("%Y%m%d")
+        if f"cp_prod_{product_id}_{day_str}" in seen:
+            return True
+    return False
+
+
+def mark_product_seen(product_id: str, seen: Set[str]):
+    if not product_id:
+        return
+    day_str = datetime.now(KST).strftime("%Y%m%d")
+    seen.add(f"cp_prod_{product_id}_{day_str}")
 
 
 # ==========================================
@@ -310,8 +382,8 @@ def clean_display_title(raw_title: str) -> str:
     t = raw_title.strip()
     t = re.sub(r"^뽐뿌::\s*", "", t)
     t = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", t)
-    # 끝에 붙은 댓글 수 제거: [12]
-    t = re.sub(r"\s*\[\d+\]\s*$", "", t)
+    # 끝에 붙은 댓글 수 제거: [12] 또는 (2)
+    t = re.sub(r"\s*(?:\[\d+\]|\(\d+\))\s*$", "", t)
     # 끝에 붙은 (가격/배송) 괄호 제거: (23,100원/무료), (89,890/무료), (13,600원) (무배)
     for _ in range(3):
         t = re.sub(
@@ -965,7 +1037,8 @@ def collect_ruliweb_deals(max_pages: int = 2) -> List[Dict[str, Any]]:
                 s = row.select_one("a.subject_link, a.deco")
                 if not s:
                     continue
-                title = " ".join(s.text.split())
+                raw_t = " ".join(s.text.split())
+                title = re.sub(r"\s*\(\d+\)\s*$", "", raw_t).strip()
                 if "쿠팡" not in title and "coupang" not in title.lower():
                     continue
                 if is_closed_deal(title):
@@ -974,8 +1047,33 @@ def collect_ruliweb_deals(max_pages: int = 2) -> List[Dict[str, Any]]:
                 link = s.get("href", "")
                 m = re.search(r"/read/(\d+)", link)
                 pid = f"ruliweb_{m.group(1)}" if m else link
+
+                votes = 0
+                hits = 0
+                comments = 0
+                rec_el = row.select_one("td.recomd")
+                if rec_el:
+                    m_v = re.search(r"-?\d+", rec_el.get_text(strip=True))
+                    if m_v:
+                        votes = int(m_v.group(0))
+                hit_el = row.select_one("td.hit")
+                if hit_el:
+                    m_h = re.search(r"\d+", hit_el.get_text(strip=True).replace(",", ""))
+                    if m_h:
+                        hits = int(m_h.group(0))
+                nr_el = row.select_one("span.num_reply, a.num_reply")
+                if nr_el:
+                    m_c = re.search(r"\d+", nr_el.get_text(strip=True))
+                    if m_c:
+                        comments = int(m_c.group(0))
+                elif re.search(r"\((\d+)\)\s*$", raw_t):
+                    comments = int(re.search(r"\((\d+)\)\s*$", raw_t).group(1))
+
                 if not any(d["id"] == pid for d in deals):
-                    deals.append({"id": pid, "title": title, "link": link})
+                    deals.append({
+                        "id": pid, "title": title, "link": link,
+                        "votes": votes, "hits": hits, "comments": comments, "downvotes": 0,
+                    })
         except Exception as e:
             logger.error(f"루리웹 수집 오류 ({url}): {e}")
 
@@ -1037,7 +1135,7 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 # 2. 뽐뿌 핫딜 수집기
 # ==========================================
-def collect_ppomppu_deals(max_pages: int = 2) -> List[Dict[str, Any]]:
+def collect_ppomppu_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
     """뽐뿌 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집"""
     deals = []
     import urllib.parse
@@ -1055,23 +1153,67 @@ def collect_ppomppu_deals(max_pages: int = 2) -> List[Dict[str, Any]]:
                 continue
             r.encoding = "euc-kr"
             soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.select("a"):
-                href = a.get("href", "")
-                if "view.php?id=ppomppu&" in href and a.text.strip():
-                    # 종료된 딜(취소선/종료 아이콘) 배제
-                    if a.select_one("strike, del, span[style*='line-through']"):
+            rows = soup.select("tr.baseList")
+            if rows:
+                for tr in rows:
+                    a = tr.select_one("a.baseList-title")
+                    if not a or not a.text.strip():
+                        continue
+                    href = a.get("href", "")
+                    if "view.php?id=ppomppu&" not in href:
+                        continue
+                    if tr.select_one("span.baseList-end, img[src*='end'], strike, del, span[style*='line-through']") or a.select_one("strike, del, span[style*='line-through']"):
                         continue
                     title = " ".join(a.text.split())
                     if is_closed_deal(title):
                         continue
-                    if "쿠팡" in title or "coupang" in title.lower():
-                        m = re.search(r"no=(\d+)", href)
-                        if not m:
+                    if "쿠팡" not in title and "coupang" not in title.lower():
+                        continue
+                    m = re.search(r"no=(\d+)", href)
+                    if not m:
+                        continue
+                    deal_id = f"ppomppu_{m.group(1)}"
+                    full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
+
+                    votes = 0
+                    downvotes = 0
+                    rec_el = tr.select_one("td.baseList-rec")
+                    if rec_el:
+                        rec_nums = re.findall(r"\d+", rec_el.get_text(" ", strip=True))
+                        if len(rec_nums) >= 2:
+                            votes = int(rec_nums[0])
+                            downvotes = int(rec_nums[1])
+                        elif len(rec_nums) == 1:
+                            votes = int(rec_nums[0])
+                    comments = 0
+                    c_el = tr.select_one("span.baseList-c")
+                    if c_el:
+                        m_c = re.search(r"\d+", c_el.get_text(strip=True))
+                        if m_c:
+                            comments = int(m_c.group(0))
+
+                    if not any(d["id"] == deal_id for d in deals):
+                        deals.append({
+                            "id": deal_id, "title": title, "link": full_url,
+                            "votes": votes, "downvotes": downvotes, "comments": comments, "hits": 0,
+                        })
+            else:
+                for a in soup.select("a"):
+                    href = a.get("href", "")
+                    if "view.php?id=ppomppu&" in href and a.text.strip():
+                        if a.select_one("strike, del, span[style*='line-through']"):
                             continue
-                        deal_id = f"ppomppu_{m.group(1)}"
-                        full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
-                        if not any(d["id"] == deal_id for d in deals):
-                            deals.append({"id": deal_id, "title": title, "link": full_url})
+                        title = " ".join(a.text.split())
+                        if is_closed_deal(title):
+                            continue
+                        if "쿠팡" in title or "coupang" in title.lower():
+                            m = re.search(r"no=(\d+)", href)
+                            if not m:
+                                continue
+                            deal_id = f"ppomppu_{m.group(1)}"
+                            full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
+                            if not any(d["id"] == deal_id for d in deals):
+                                deals.append({"id": deal_id, "title": title, "link": full_url, "votes": 0, "downvotes": 0, "comments": 0, "hits": 0})
             time.sleep(0.2)
         except Exception as e:
             logger.error(f"뽐뿌 수집 오류 ({url}): {e}")
@@ -1101,12 +1243,9 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
         cp_url = all_cp[0]
 
         if "link.coupang.com" in cp_url:
-            try:
-                head_res = requests.head(cp_url, headers=HEADERS, allow_redirects=True, timeout=4)
-                if "coupang.com" in head_res.url:
-                    cp_url = head_res.url
-            except Exception:
-                pass
+            clean_cp, _ = clean_coupang_url(cp_url)
+            if "coupang.com" in clean_cp:
+                cp_url = clean_cp
 
         body_text = ""
         content_el = soup.select_one("td.board-contents, td.han")
@@ -1141,38 +1280,97 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
 
 
 # ==========================================
-# 3. 아카라이브 핫딜 수집기
+# 3. 아카라이브 핫딜 수집기 (메인 게시판 스토어 태그 + 검색 듀얼 수집)
 # ==========================================
 def collect_arcalive_deals() -> List[Dict[str, Any]]:
-    """아카라이브 핫딜 채널 쿠팡 실시간 검색 수집"""
+    """아카라이브 핫딜 채널 메인 게시판(쿠팡 스토어 태그) 및 검색 결과 듀얼 수집"""
     deals = []
     import urllib.parse
     kw = urllib.parse.quote("쿠팡")
-    url = f"https://arca.live/b/hotdeal?target=all&keyword={kw}"
+
+    # 1) 메인 게시판 1~3페이지 스캔 (제목에 '쿠팡' 없어도 스토어 태그가 쿠팡인 딜 전량 포착)
+    for page in (1, 2, 3):
+        url = f"https://arca.live/b/hotdeal?p={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for row in soup.select("div.vrow.hybrid"):
+                if "notice" in (row.get("class") or []) or "deal-close" in (row.get("class") or []):
+                    continue
+                if row.select_one(".deal-close, .close, del, s"):
+                    continue
+                store_el = row.select_one(".deal-store")
+                store_txt = store_el.get_text(strip=True) if store_el else ""
+                a = row.select_one("a.title, a.hybrid-title")
+                if not a:
+                    continue
+                raw_t = " ".join(a.get_text(" ", strip=True).split())
+                if "쿠팡" not in store_txt and "쿠팡" not in raw_t and "coupang" not in raw_t.lower():
+                    continue
+                m = re.search(r"/b/hotdeal/(\d+)", a.get("href", ""))
+                if not m:
+                    continue
+
+                comments = 0
+                m_c = re.search(r"\[(\d+)\]\s*$", raw_t)
+                if m_c:
+                    comments = int(m_c.group(1))
+                title = re.sub(r"\s*\[\d+\]$", "", raw_t).strip()
+                if not title or is_closed_deal(title):
+                    continue
+
+                votes = 0
+                rate_el = row.select_one(".col-rate")
+                if rate_el:
+                    m_v = re.search(r"-?\d+", rate_el.get_text(strip=True))
+                    if m_v:
+                        votes = int(m_v.group(0))
+
+                deal_id = f"arca_{m.group(1)}"
+                full_url = f"https://arca.live/b/hotdeal/{m.group(1)}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({
+                        "id": deal_id, "title": title, "link": full_url,
+                        "votes": votes, "downvotes": 0, "comments": comments, "hits": 0,
+                    })
+        except Exception as e:
+            logger.error(f"아카라이브 메인 수집 오류 (p={page}): {e}")
+
+    # 2) 키워드 검색 보조 수집
+    search_url = f"https://arca.live/b/hotdeal?target=all&keyword={kw}"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if r.status_code != 200:
-            return deals
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.select("a.title, div.vrow-top a.hybrid-title, a.vrow"):
-            if "notice" in (a.get("class") or []):
-                continue
-            href = a.get("href", "")
-            m = re.search(r"/b/hotdeal/(\d+)", href)
-            if not m:
-                continue
-            if a.select_one(".deal-close, del, s"):
-                continue
-            title = " ".join(a.text.split())
-            title = re.sub(r"\s*\[\d+\]$", "", title).strip()
-            if not title or is_closed_deal(title):
-                continue
-            deal_id = f"arca_{m.group(1)}"
-            full_url = f"https://arca.live/b/hotdeal/{m.group(1)}"
-            if not any(d["id"] == deal_id for d in deals):
-                deals.append({"id": deal_id, "title": title, "link": full_url})
+        r = requests.get(search_url, headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a.title, div.vrow-top a.hybrid-title, a.vrow"):
+                if "notice" in (a.get("class") or []):
+                    continue
+                href = a.get("href", "")
+                m = re.search(r"/b/hotdeal/(\d+)", href)
+                if not m:
+                    continue
+                if a.select_one(".deal-close, del, s"):
+                    continue
+                raw_t = " ".join(a.text.split())
+                comments = 0
+                m_c = re.search(r"\[(\d+)\]\s*$", raw_t)
+                if m_c:
+                    comments = int(m_c.group(1))
+                title = re.sub(r"\s*\[\d+\]$", "", raw_t).strip()
+                if not title or is_closed_deal(title):
+                    continue
+                deal_id = f"arca_{m.group(1)}"
+                full_url = f"https://arca.live/b/hotdeal/{m.group(1)}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({
+                        "id": deal_id, "title": title, "link": full_url,
+                        "votes": 0, "downvotes": 0, "comments": comments, "hits": 0,
+                    })
     except Exception as e:
-        logger.error(f"아카라이브 수집 오류: {e}")
+        logger.error(f"아카라이브 검색 수집 오류: {e}")
+
     return deals
 
 
@@ -1324,6 +1522,51 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
     )
 
 
+def is_quality_hotdeal(
+    d: Dict[str, Any],
+    source_name: str,
+    p_info: Dict[str, Any],
+    base_title: str,
+    body_text: str,
+) -> Tuple[bool, str]:
+    """
+    '확실히 핫딜이라고 할 만한 딜' 판별 품질 게이트.
+    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'wait')
+    """
+    low_title = base_title.lower()
+    if any(kw in low_title for kw in PROMO_SKIP_KEYWORDS):
+        return False, "permanent"
+
+    votes = int(d.get("votes", 0) or 0)
+    downvotes = int(d.get("downvotes", 0) or 0)
+    comments = int(d.get("comments", 0) or 0)
+    hits = int(d.get("hits", 0) or 0)
+
+    if votes < 0:
+        return False, "permanent"
+    if (downvotes >= 6 and votes == 0) or (downvotes >= 10 and downvotes >= votes * 2):
+        return False, "permanent"
+
+    # 조건 1: 명시적 검증 할인율 15% 이상
+    if p_info.get("discount_rate", 0) >= 15:
+        return True, "ok"
+
+    # 조건 2: 커뮤니티 추천/댓글 검증
+    if source_name == "arca" and (votes >= 2 or comments >= 5):
+        return True, "ok"
+    if source_name == "ruliweb" and (votes >= 1 or comments >= 3 or hits >= 500):
+        return True, "ok"
+    if source_name == "ppomppu" and (votes >= 2 or comments >= 3):
+        return True, "ok"
+
+    # 조건 3: 본문/제목에 명확한 가성비/역대가 키워드가 있고 비추천이 거의 없는 경우
+    combined = f"{base_title}\n{body_text}"
+    if downvotes < 3 and any(kw in combined for kw in ("역대가", "최저가", "대란", "꿀딜", "역대")):
+        return True, "ok"
+
+    return False, "wait"
+
+
 def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[str]) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
@@ -1336,12 +1579,19 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         return False
 
     raw_url = detail["coupang_url"]
+    clean_url, product_id = clean_coupang_url(raw_url)
+    if is_product_recently_seen(product_id, seen):
+        logger.info(f"⏭️ [중복상품 스킵] 최근 3일 내 동일 productId({product_id}) 이미 송출됨: {d['title'][:40]}")
+        seen.add(deal_id)
+        save_seen(seen)
+        return False
+
     body_text = detail.get("body_text", "")
     img_url = detail.get("img_url")
     ocr_imgs = detail.get("ocr_img_urls") or ([img_url] if img_url else [])
 
     base_title = detail.get("extracted_title") or d["title"]
-    if is_closed_deal(base_title):
+    if is_closed_deal(base_title) or any(kw in base_title for kw in PROMO_SKIP_KEYWORDS):
         seen.add(deal_id)
         save_seen(seen)
         return False
@@ -1363,9 +1613,21 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         save_seen(seen)
         return False
 
-    # 파트너스 딥링크 생성
+    ok_q, reason = is_quality_hotdeal(d, source_name, p_info, base_title, body_text)
+    if not ok_q:
+        if reason == "permanent":
+            logger.info(f"🚫 [영구제외] 비핫딜/비추천 과다: {clean_title}")
+            seen.add(deal_id)
+            save_seen(seen)
+        else:
+            logger.info(
+                f"⏳ [검증대기] 핫딜 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
+            )
+        return False
+
+    # 파트너스 딥링크 생성 (제3자 lptag 제거된 정규 URL 사용)
     try:
-        res = coupang_api.create_deeplink([raw_url], sub_id=f"auto_{source_name}")
+        res = coupang_api.create_deeplink([clean_url], sub_id=f"auto_{source_name}")
         items = res.get("data", [])
         if not items:
             seen.add(deal_id)
@@ -1388,6 +1650,7 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
 
     if ok:
         seen.add(deal_id)
+        mark_product_seen(product_id, seen)
         save_seen(seen)
         logger.info(
             f"✅ [{source_name}] 송출 완료: {clean_title} "
@@ -1400,29 +1663,68 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
 
 
 # ==========================================
-# 5. 아침 골드박스 & 밤 23시 결산 리포트
+# 5. 시간대 분산 로켓 골드박스 & D+1~D+2 지연 대응 쿠파스 결산
 # ==========================================
-def run_goldbox_if_morning(seen: Set[str]) -> int:
-    kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst)
-    today_key = f"gb_{now.strftime('%Y%m%d')}"
+GOLDBOX_EXCLUDE_CATS = ("국내투어", "여행", "티켓", "렌탈", "콘도", "호텔", "리프트", "숙박")
 
+
+def run_goldbox_staggered(seen: Set[str]) -> int:
+    """로켓배송 골드박스 상품만 선별하여 오전(7~10시)·점심(12~15시)·저녁(18~20시) 3개 타임에 4개씩 분산 송출"""
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y%m%d")
+
+    slot_num = 0
+    slice_start, slice_end = 0, 4
+    slot_label = "오전"
+    if "--force-goldbox" in sys.argv:
+        slot_num, slice_start, slice_end, slot_label = 1, 0, 4, "오전(강제)"
+    elif 7 <= now.hour < 11:
+        slot_num, slice_start, slice_end, slot_label = 1, 0, 4, "아침"
+    elif 12 <= now.hour < 16:
+        slot_num, slice_start, slice_end, slot_label = 2, 4, 8, "점심"
+    elif 18 <= now.hour < 21:
+        slot_num, slice_start, slice_end, slot_label = 3, 8, 12, "저녁"
+    else:
+        return 0
+
+    slot_key = f"gb_{today_str}_s{slot_num}"
+    legacy_key = f"gb_{today_str}"
     if "--force-goldbox" not in sys.argv:
-        if today_key in seen:
-            return 0
-        if now.hour < 7:
+        if slot_key in seen or (slot_num == 1 and legacy_key in seen):
             return 0
 
-    logger.info("🍯 아침 골드박스 상위 5개 자동 송출 시작...")
+    logger.info(f"🍯 [{slot_label}] 로켓배송 골드박스 슬롯 {slot_num} ({slice_start+1}~{slice_end}위) 자동 송출 시작...")
     res = coupang_api.get_goldbox_products(sub_id="auto_goldbox")
-    items = res.get("data", [])
-    if not items:
+    raw_items = res.get("data", []) or []
+
+    # 로켓배송 + 여행/숙박/티켓 잡상품 제외 필터
+    filtered_items = []
+    for it in raw_items:
+        if it.get("isRocket") is not True:
+            continue
+        cat = str(it.get("categoryName") or "")
+        pname = str(it.get("productName") or "")
+        if any(ex in cat or ex in pname for ex in GOLDBOX_EXCLUDE_CATS):
+            continue
+        filtered_items.append(it)
+
+    batch = filtered_items[slice_start:slice_end]
+    if not batch:
+        seen.add(slot_key)
+        save_seen(seen)
         return 0
 
     sent = 0
-    for i, it in enumerate(items[:5]):
+    for idx_in_batch, it in enumerate(batch):
+        rank_num = slice_start + idx_in_batch + 1
+        prod_id = str(it.get("productId") or "")
+        if prod_id and is_product_recently_seen(prod_id, seen):
+            continue
+
         raw_name = it.get("productName", "")
-        p_price = int(float(it.get("productPrice", 0)))
+        p_price = int(round(float(it.get("productPrice", 0) or 0)))
+        if p_price < 1000:
+            continue
         p_url = it.get("productUrl", "")
         img_url = it.get("productImage")
         cat = it.get("categoryName", "")
@@ -1431,8 +1733,8 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
         unit_str = compute_unit_pricing(p_name, p_price)
 
         msg = (
-            f"🍯 <b>[쿠팡 공식 골드박스] 👑 와우회원 단독 하루 특가</b>\n"
-            f"🏆 <b>오늘의 골드박스 랭킹 {i+1}위!</b>\n\n"
+            f"🍯 <b>[쿠팡 공식 골드박스 · {slot_label} 타임] 👑 와우회원 단독 특가</b>\n"
+            f"🏆 <b>오늘의 로켓 골드박스 #{rank_num}!</b>\n\n"
             f"📌 <b>{esc(p_name)}</b>\n\n"
             f"💵 <b>특가 정보</b>\n"
             f"• <b>골드특가</b>: <b>{p_price:,}원</b> (와우회원 한정가)\n"
@@ -1447,11 +1749,12 @@ def run_goldbox_if_morning(seen: Set[str]) -> int:
 
         if send_telegram(CHANNEL_ID, msg, img_url, "👉 실시간 수량 및 최저가 확인", p_url):
             sent += 1
+            if prod_id:
+                mark_product_seen(prod_id, seen)
             time.sleep(2)
 
-    if sent > 0:
-        seen.add(today_key)
-        save_seen(seen)
+    seen.add(slot_key)
+    save_seen(seen)
     return sent
 
 
@@ -1462,7 +1765,7 @@ def load_sales_tracker() -> Dict[str, Any]:
                 return json.load(f)
         except Exception:
             pass
-    return {"date": "", "last_orders": 0, "last_gmv": 0, "last_milestone_step": 0}
+    return {}
 
 
 def save_sales_tracker(data: Dict[str, Any]):
@@ -1474,57 +1777,112 @@ def save_sales_tracker(data: Dict[str, Any]):
 
 
 def check_and_notify_sales():
-    """실시간 새 주문 감지 및 누적 판매액 10만원 단위 마일스톤 알림"""
-    kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst)
+    """최근 4일(D-3~D) 주문 집계 감지로 쿠팡 D+1~D+2 지연 주문까지 누락 없이 실시간 알림"""
+    now = datetime.now(KST)
     today_str = now.strftime("%Y%m%d")
+    start_4d = (now - timedelta(days=3)).strftime("%Y%m%d")
+    month_start = now.strftime("%Y%m01")
+    month_str = now.strftime("%Y%m")
     target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
 
     try:
-        res = coupang_api.get_order_report(start_date=today_str, end_date=today_str)
-        items = res.get("data", [])
-        cur_orders = len(items)
-        cur_gmv = sum(int(it.get("gmv", 0)) for it in items)
-        est_comm = round(cur_gmv * 0.03)
+        res = coupang_api.get_order_report(start_date=start_4d, end_date=today_str)
+        items = res.get("data", []) or []
 
         tracker = load_sales_tracker()
-        if tracker.get("date") != today_str:
-            tracker = {"date": today_str, "last_orders": 0, "last_gmv": 0, "last_milestone_step": 0}
+        is_first_migration = "notified_order_keys" not in tracker
 
-        last_orders = tracker.get("last_orders", 0)
-        last_step = tracker.get("last_milestone_step", 0)
+        if tracker.get("month") != month_str:
+            tracker["month"] = month_str
+            tracker["month_milestone_step"] = 0
 
-        if cur_orders > last_orders:
-            new_count = cur_orders - last_orders
-            diff_gmv = cur_gmv - tracker.get("last_gmv", 0)
-            msg = (
-                f"🔔 <b>[새 주문 체결 알림!]</b>\n\n"
-                f"📦 오늘 <b>{cur_orders}번째 주문</b>이 발생했습니다! (+{new_count}건)\n"
-                f"• 신규 체결액: <b>약 {diff_gmv:,}원</b>\n"
-                f"• 오늘 누적 판매액: <b>{cur_gmv:,}원</b>\n"
-                f"• 오늘 예상 수익: <b>약 {est_comm:,}원</b> (3%)\n\n"
-                f"🎉 축하합니다! 실시간 주문이 계속 늘어나고 있습니다. 🚀"
-            )
-            send_telegram(chat_id=target_channel, text=msg)
-            logger.info(f"📢 새 주문 알림 발송: {cur_orders}건 누적")
+        if is_first_migration:
+            seeded_keys: List[str] = []
+            for it in items:
+                k = f"{it.get('date')}_{it.get('orderId')}_{it.get('productId')}"
+                if k not in seeded_keys:
+                    seeded_keys.append(k)
+            try:
+                comm_res = coupang_api.get_commission_report(start_date=month_start, end_date=today_str)
+                comm_rows = comm_res.get("data", []) or []
+                m_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in comm_rows)
+                tracker["month_milestone_step"] = m_gmv // 100000
+            except Exception:
+                pass
+            tracker["notified_order_keys"] = seeded_keys[-500:]
+            save_sales_tracker(tracker)
+            logger.info(f"📦 sales_tracker 새 스키마 마이그레이션 완료 (최근 4일 기존 주문 {len(seeded_keys)}건 시드)")
+            return
 
-        cur_step = cur_gmv // 100000
+        notified_list: List[str] = list(tracker.get("notified_order_keys", []))
+        notified_set = set(notified_list)
+
+        new_items: List[Dict[str, Any]] = []
+        for it in items:
+            k = f"{it.get('date')}_{it.get('orderId')}_{it.get('productId')}"
+            if k not in notified_set:
+                new_items.append(it)
+                notified_list.append(k)
+                notified_set.add(k)
+
+        if not new_items:
+            return
+
+        new_gmv = sum(int(round(float(it.get("gmv", 0) or 0))) for it in new_items)
+        new_comm = sum(int(round(float(it.get("commission", 0) or 0))) for it in new_items)
+
+        # 이번 달 누적 확정 실적 조회
+        m_orders, m_gmv, m_comm, m_clicks = 0, 0, 0, 0
+        try:
+            comm_res = coupang_api.get_commission_report(start_date=month_start, end_date=today_str)
+            comm_rows = comm_res.get("data", []) or []
+            m_clicks = sum(int(r.get("click", 0) or 0) for r in comm_rows)
+            m_orders = sum(int(r.get("order", 0) or 0) for r in comm_rows)
+            m_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in comm_rows)
+            m_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in comm_rows)
+        except Exception:
+            pass
+
+        item_lines = []
+        for it in new_items[:5]:
+            d_raw = str(it.get("date") or "")
+            d_fmt = f"{d_raw[4:6]}/{d_raw[6:8]}" if len(d_raw) == 8 else d_raw
+            pname = str(it.get("productName") or "상품")[:30]
+            qty = int(it.get("quantity", 1) or 1)
+            g = int(round(float(it.get("gmv", 0) or 0)))
+            c = int(round(float(it.get("commission", 0) or 0)))
+            item_lines.append(f"• [{d_fmt}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수수료 <b>{c:,}원</b>)")
+        if len(new_items) > 5:
+            item_lines.append(f"• 외 {len(new_items) - 5}건 추가")
+        items_block = "\n".join(item_lines)
+
+        msg = (
+            f"🔔 <b>[쿠팡 파트너스 새 주문 집계!]</b> (+{len(new_items)}건)\n\n"
+            f"{items_block}\n\n"
+            f"• 신규 결제액 / 확정 수익: <b>{new_gmv:,}원</b> / <b>{new_comm:,}원</b>\n"
+            f"• {now.month}월 누적: <b>{m_orders:,}건</b> | <b>{m_gmv:,}원</b> | 수익 <b>{m_comm:,}원</b> (클릭 {m_clicks:,}회)\n"
+            f"※ <i>쿠팡 API는 D+1~D+2 지연 집계 기준입니다.</i>"
+        )
+        send_telegram(chat_id=target_channel, text=msg)
+        logger.info(f"📢 새 주문 알림 발송: +{len(new_items)}건 ({new_gmv:,}원 / 수수료 {new_comm:,}원)")
+
+        cur_step = m_gmv // 100000
+        last_step = int(tracker.get("month_milestone_step", 0) or 0)
         if cur_step > last_step and cur_step > 0:
             target_amount = cur_step * 100000
             milestone_msg = (
-                f"🏆 <b>[판매액 마일스톤 달성!]</b>\n\n"
-                f"💰 오늘 누적 판매액 <b>{target_amount:,}원</b>을 돌파했습니다!\n"
-                f"• 현재 누적 판매액: <b>{cur_gmv:,}원</b>\n"
-                f"• 현재 예상 수익: <b>약 {est_comm:,}원</b>\n"
-                f"• 총 체결 건수: <b>{cur_orders}건</b>\n\n"
-                f"📈 대박 행진 중! 다음 목표({(cur_step+1)*10:,}만원)를 향해 달립니다! 🔥"
+                f"🏆 <b>[월 누적 판매액 마일스톤 달성!]</b>\n\n"
+                f"💰 {now.month}월 누적 결제액 <b>{target_amount:,}원</b>을 돌파했습니다!\n"
+                f"• {now.month}월 누적 결제액: <b>{m_gmv:,}원</b>\n"
+                f"• {now.month}월 확정 수익: <b>{m_comm:,}원</b>\n"
+                f"• 총 주문 건수: <b>{m_orders:,}건</b>\n\n"
+                f"📈 다음 목표({(cur_step+1)*10:,}만원)를 향해 순항 중! 🔥"
             )
             send_telegram(chat_id=target_channel, text=milestone_msg)
-            logger.info(f"🏆 마일스톤 알림 발송: {target_amount:,}원 돌파")
-            tracker["last_milestone_step"] = cur_step
+            logger.info(f"🏆 월 누적 마일스톤 알림 발송: {target_amount:,}원 돌파")
+            tracker["month_milestone_step"] = cur_step
 
-        tracker["last_orders"] = cur_orders
-        tracker["last_gmv"] = cur_gmv
+        tracker["notified_order_keys"] = notified_list[-500:]
         save_sales_tracker(tracker)
 
     except Exception as e:
@@ -1532,8 +1890,7 @@ def check_and_notify_sales():
 
 
 def run_daily_report_if_night(seen: Set[str]) -> int:
-    kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst)
+    now = datetime.now(KST)
     today_str = now.strftime("%Y%m%d")
     report_key = f"report_{today_str}"
 
@@ -1543,34 +1900,79 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         if report_key in seen:
             return 0
 
-    logger.info("📊 일일 파트너스 결산 리포트 생성 중...")
-    try:
-        res = coupang_api.get_order_report(start_date=today_str, end_date=today_str)
-        items = res.get("data", [])
+    logger.info("📊 일일·월간 파트너스 결산 리포트 생성 중...")
+    month_start = now.strftime("%Y%m01")
+    start_4d = (now - timedelta(days=3)).strftime("%Y%m%d")
 
-        total_orders = len(items)
-        total_gmv = sum(int(it.get("gmv", 0)) for it in items)
-        est_commission = round(total_gmv * 0.03)
+    try:
+        comm_res = coupang_api.get_commission_report(start_date=month_start, end_date=today_str)
+        comm_rows = comm_res.get("data", []) or []
+
+        order_res = coupang_api.get_order_report(start_date=start_4d, end_date=today_str)
+        order_items = order_res.get("data", []) or []
+
+        # 1. 월 누적 집계 (API 확정 수치 합산)
+        m_clicks = sum(int(r.get("click", 0) or 0) for r in comm_rows)
+        m_orders = sum(int(r.get("order", 0) or 0) for r in comm_rows)
+        m_cancels = sum(int(r.get("cancel", 0) or 0) for r in comm_rows)
+        m_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in comm_rows)
+        m_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in comm_rows)
+
+        # 2. 최근 확정일 집계 (D+1~D+2 지연 반영된 가장 최신 날짜)
+        latest_date = max((str(r.get("date") or "") for r in comm_rows), default="")
+        if latest_date:
+            l_rows = [r for r in comm_rows if str(r.get("date") or "") == latest_date]
+            l_clicks = sum(int(r.get("click", 0) or 0) for r in l_rows)
+            l_orders = sum(int(r.get("order", 0) or 0) for r in l_rows)
+            l_cancels = sum(int(r.get("cancel", 0) or 0) for r in l_rows)
+            l_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in l_rows)
+            l_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in l_rows)
+            l_fmt = f"{latest_date[:4]}.{latest_date[4:6]}.{latest_date[6:8]}" if len(latest_date) == 8 else latest_date
+
+            matched_prods = [str(it.get("productName") or "")[:28] for it in order_items if str(it.get("date") or "") == latest_date and it.get("productName")]
+            prod_note = f"\n• <b>주문 품목</b>: {esc(', '.join(matched_prods[:3]))}" if matched_prods else ""
+            latest_block = (
+                f"📌 <b>최근 확정일 ({l_fmt})</b>\n"
+                f"• 클릭/주문/취소: <b>{l_clicks:,}회</b> / <b>{l_orders:,}건</b> / {l_cancels:,}건\n"
+                f"• 결제 금액: <b>{l_gmv:,}원</b>\n"
+                f"• 확정 수익: <b>{l_comm:,}원</b>{prod_note}\n\n"
+            )
+        else:
+            latest_block = "📌 <b>최근 확정일</b>: 집계된 내역 없음\n\n"
 
         report_msg = (
-            f"📊 <b>[오늘의 쿠팡 파트너스 일일 결산]</b>\n"
-            f"📅 기준 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
-            f"• <b>총 주문 건수</b>: <b>{total_orders}건</b>\n"
-            f"• <b>총 결제 금액</b>: <b>{total_gmv:,}원</b>\n"
-            f"• <b>예상 정산 수익</b>: <b>약 {est_commission:,}원</b> (3% 기준)\n\n"
-            f"오늘 하루도 고생 많으셨습니다! 내일도 알짜 핫딜이 자동으로 배달됩니다. 🚀"
+            f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
+            f"📅 리포트 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
+            f"{latest_block}"
+            f"🗓️ <b>{now.month}월 누적 ({now.month}/1 ~ {now.month}/{now.day})</b>\n"
+            f"• 총 클릭 수: <b>{m_clicks:,}회</b>\n"
+            f"• 총 주문 / 취소: <b>{m_orders:,}건</b> / {m_cancels:,}건\n"
+            f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
+            f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
+            f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>"
         )
 
         target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
         if send_telegram(chat_id=target_channel, text=report_msg):
             seen.add(report_key)
             save_seen(seen)
-            logger.info("✅ 일일 결산 리포트 관리자 전송 완료 (하루 1회 기록됨)")
+            logger.info(f"✅ 일일·월간 결산 리포트 전송 완료 (최근확정={latest_date}, 월수익={m_comm:,}원)")
             return 1
     except Exception as e:
         logger.error(f"결산 리포트 조회 오류: {e}")
     return 0
 
+
+
+def _hidden_subp_kwargs():
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        sinfo = subprocess.STARTUPINFO()
+        sinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        sinfo.wShowWindow = 0
+        kwargs["startupinfo"] = sinfo
+    return kwargs
 
 def update_pc_heartbeat():
     """로컬 PC 실행 시 깃허브에 생존신고 타임스탬프 전송 (깃허브 액션 중복 실행 방지용)"""
@@ -1584,6 +1986,7 @@ def update_pc_heartbeat():
             cwd=BASE_DIR,
             capture_output=True,
             timeout=5,
+            **_hidden_subp_kwargs(),
         )
     except Exception:
         pass
@@ -1595,7 +1998,7 @@ def sync_git_state():
         return
     try:
         import subprocess
-        subprocess.run(["git", "pull", "--rebase"], cwd=BASE_DIR, capture_output=True, timeout=10)
+        subprocess.run(["git", "pull", "--rebase"], cwd=BASE_DIR, capture_output=True, timeout=10, **_hidden_subp_kwargs())
     except Exception:
         pass
 
@@ -1606,14 +2009,15 @@ def sync_git_push():
         return
     try:
         import subprocess
-        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json"], cwd=BASE_DIR, capture_output=True, timeout=5)
+        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json"], cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
         subprocess.run(
             ["git", "commit", "-m", "chore: sync seen deals from local runner [skip ci]"],
             cwd=BASE_DIR,
             capture_output=True,
             timeout=5,
+            **_hidden_subp_kwargs(),
         )
-        subprocess.run(["git", "push"], cwd=BASE_DIR, capture_output=True, timeout=10)
+        subprocess.run(["git", "push"], cwd=BASE_DIR, capture_output=True, timeout=10, **_hidden_subp_kwargs())
     except Exception:
         pass
 
@@ -1649,13 +2053,13 @@ def main():
         if process_deal(d, parse_arcalive_detail, "arca", seen):
             total_sent += 1
 
-    # 4. 아침 골드박스
-    total_sent += run_goldbox_if_morning(seen)
+    # 4. 시간대 분산 로켓 골드박스 (아침/점심/저녁 각 4건)
+    total_sent += run_goldbox_staggered(seen)
 
-    # 5. 실시간 판매액 및 마일스톤 모니터링
+    # 6. 최근 4일 주문 집계 감지 및 마일스톤 알림
     check_and_notify_sales()
 
-    # 6. 밤 23시 결산 리포트 (하루 1회만 발송)
+    # 7. 밤 23시 일일·월간 결산 리포트 (하루 1회만 발송)
     total_sent += run_daily_report_if_night(seen)
 
     if total_sent > 0:
