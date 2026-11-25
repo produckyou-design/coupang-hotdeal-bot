@@ -58,11 +58,11 @@ LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한 및 야간 방해금지 시간대 설정 (KST)
-DAILY_MAX_COMMUNITY_DEALS = 12
+DAILY_MAX_COMMUNITY_DEALS = 15
 GOLDBOX_PER_SLOT = 3
-DAILY_MAX_TOTAL_DEALS = 20
-MAX_COMMUNITY_PER_RUN = 1
-MIN_COMMUNITY_INTERVAL_MINUTES = 20
+DAILY_MAX_TOTAL_DEALS = 24
+MAX_COMMUNITY_PER_RUN = 3
+MIN_COMMUNITY_INTERVAL_MINUTES = 0
 QUIET_HOURS_START = 0
 QUIET_HOURS_END = 7
 
@@ -71,7 +71,8 @@ HEADERS = {
 }
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
-MIN_HOTDEAL_DISCOUNT_RATE = 30
+MIN_HOTDEAL_DISCOUNT_RATE = 20
+STRONG_HOTDEAL_DISCOUNT_RATE = 40
 
 PROMO_SKIP_KEYWORDS = [
     "쿠팡이츠", "배민", "배달의민족", "요기요", "선착쿠폰", "쿠폰 예고",
@@ -208,10 +209,11 @@ def can_send_community_now(
         return False, "daily_comm_cap"
     if (comm_cnt + gb_cnt) >= DAILY_MAX_TOTAL_DEALS:
         return False, "daily_total_cap"
-    last_ts = int(quota.get("last_community_ts", 0) or 0)
-    cur_ts = time.time() if now_ts is None else now_ts
-    if last_ts > 0 and (cur_ts - last_ts) < MIN_COMMUNITY_INTERVAL_MINUTES * 60:
-        return False, "cooldown"
+    if MIN_COMMUNITY_INTERVAL_MINUTES > 0:
+        last_ts = int(quota.get("last_community_ts", 0) or 0)
+        cur_ts = time.time() if now_ts is None else now_ts
+        if last_ts > 0 and (cur_ts - last_ts) < MIN_COMMUNITY_INTERVAL_MINUTES * 60:
+            return False, "cooldown"
     return True, "ok"
 
 
@@ -1617,9 +1619,11 @@ def is_quality_hotdeal(
     body_text: str,
 ) -> Tuple[bool, str]:
     """
-    '확실히 핫딜이라고 할 만한 딜' 판별 품질 게이트.
-    최소 30% 이상 검증된 할인율이 확인된 상품만 통과시키며, 비추천·프로모션 글을 배제한다.
-    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'low_discount')
+    2단계 '진짜 핫딜' 판별 품질 게이트:
+    - 1차(40%+): 명시적 40% 이상 파격 할인이며 업자 비추 스팸이 아니면 즉시 송출
+    - 2차(20~39%): 커뮤니티 추천·댓글·조회수 또는 역대가/대란 신호가 검증된 경우에만 송출 (미달 시 'wait'로 대기)
+    - 20% 미만 및 미식별(0%), 프로모션/비추천 스팸은 원천 배제
+    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'low_discount' | 'wait')
     """
     low_title = base_title.lower()
     if any(kw in low_title for kw in PROMO_SKIP_KEYWORDS):
@@ -1627,10 +1631,12 @@ def is_quality_hotdeal(
 
     votes = int(d.get("votes", 0) or 0)
     downvotes = int(d.get("downvotes", 0) or 0)
+    comments = int(d.get("comments", 0) or 0)
+    hits = int(d.get("hits", 0) or 0)
 
     if votes < 0:
         return False, "permanent"
-    if (downvotes >= 6 and votes == 0) or (downvotes >= 10 and downvotes >= votes * 2):
+    if (downvotes >= 4 and votes == 0) or (downvotes >= 6 and downvotes >= votes * 2):
         return False, "permanent"
 
     disc_rate = int(p_info.get("discount_rate", 0) or 0)
@@ -1640,7 +1646,23 @@ def is_quality_hotdeal(
     if disc_rate < MIN_HOTDEAL_DISCOUNT_RATE or not (orig_p > final_p >= 1000):
         return False, "low_discount"
 
-    return True, "ok"
+    # Tier 1: 40%+ 파격 할인은 업자 스팸 신호만 없으면 즉시 통과
+    if disc_rate >= STRONG_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
+        return True, "ok"
+
+    # Tier 2: 20~39% 구간은 커뮤니티 화력 검증 시 통과
+    if source_name == "arca" and (votes >= 2 or comments >= 5):
+        return True, "ok"
+    if source_name == "ruliweb" and (votes >= 1 or comments >= 3 or hits >= 1000):
+        return True, "ok"
+    if source_name == "ppomppu" and (votes >= 2 or comments >= 5):
+        return True, "ok"
+
+    combined = f"{base_title}\n{body_text}"
+    if downvotes < 2 and any(kw in combined for kw in ("역대가", "역대", "대란", "꿀딜")):
+        return True, "ok"
+
+    return False, "wait"
 
 
 def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[str]) -> bool:
@@ -2129,7 +2151,7 @@ def main():
     update_pc_heartbeat()
     sync_git_state()
 
-    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (30%+ 정밀 검증 · 일일 수량 제한 엔진)...")
+    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (20%+ 정밀 검증 · 일일 수량 제한 엔진)...")
     seen = load_seen()
     quota = load_post_quota()
     total_sent = 0
