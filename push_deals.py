@@ -61,6 +61,7 @@ HEADERS = {
 }
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
+MIN_HOTDEAL_DISCOUNT_RATE = 30
 
 PROMO_SKIP_KEYWORDS = [
     "쿠팡이츠", "배민", "배달의민족", "요기요", "선착쿠폰", "쿠폰 예고",
@@ -1485,7 +1486,7 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
         disc_rate = 0
 
     header_line = "🔥 <b>[실시간 검증 특가]</b>"
-    if 10 <= disc_rate <= 85 and orig_p > best_price > 0:
+    if MIN_HOTDEAL_DISCOUNT_RATE <= disc_rate <= 85 and orig_p > best_price > 0:
         header_line = f"🔥 <b>[{disc_rate}% 파격할인] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {best_price:,}원!</b>"
 
     price_lines = []
@@ -1531,7 +1532,8 @@ def is_quality_hotdeal(
 ) -> Tuple[bool, str]:
     """
     '확실히 핫딜이라고 할 만한 딜' 판별 품질 게이트.
-    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'wait')
+    최소 30% 이상 검증된 할인율이 확인된 상품만 통과시키며, 비추천·프로모션 글을 배제한다.
+    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'low_discount')
     """
     low_title = base_title.lower()
     if any(kw in low_title for kw in PROMO_SKIP_KEYWORDS):
@@ -1539,32 +1541,20 @@ def is_quality_hotdeal(
 
     votes = int(d.get("votes", 0) or 0)
     downvotes = int(d.get("downvotes", 0) or 0)
-    comments = int(d.get("comments", 0) or 0)
-    hits = int(d.get("hits", 0) or 0)
 
     if votes < 0:
         return False, "permanent"
     if (downvotes >= 6 and votes == 0) or (downvotes >= 10 and downvotes >= votes * 2):
         return False, "permanent"
 
-    # 조건 1: 명시적 검증 할인율 15% 이상
-    if p_info.get("discount_rate", 0) >= 15:
-        return True, "ok"
+    disc_rate = int(p_info.get("discount_rate", 0) or 0)
+    orig_p = int(p_info.get("orig_price", 0) or 0)
+    final_p = int(p_info.get("final_price", 0) or 0)
 
-    # 조건 2: 커뮤니티 추천/댓글 검증
-    if source_name == "arca" and (votes >= 2 or comments >= 5):
-        return True, "ok"
-    if source_name == "ruliweb" and (votes >= 1 or comments >= 3 or hits >= 500):
-        return True, "ok"
-    if source_name == "ppomppu" and (votes >= 2 or comments >= 3):
-        return True, "ok"
+    if disc_rate < MIN_HOTDEAL_DISCOUNT_RATE or not (orig_p > final_p >= 1000):
+        return False, "low_discount"
 
-    # 조건 3: 본문/제목에 명확한 가성비/역대가 키워드가 있고 비추천이 거의 없는 경우
-    combined = f"{base_title}\n{body_text}"
-    if downvotes < 3 and any(kw in combined for kw in ("역대가", "최저가", "대란", "꿀딜", "역대")):
-        return True, "ok"
-
-    return False, "wait"
+    return True, "ok"
 
 
 def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[str]) -> bool:
@@ -1617,6 +1607,12 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
     if not ok_q:
         if reason == "permanent":
             logger.info(f"🚫 [영구제외] 비핫딜/비추천 과다: {clean_title}")
+            seen.add(deal_id)
+            save_seen(seen)
+        elif reason == "low_discount":
+            logger.info(
+                f"⏭️ [할인율 미달 스킵] 최소 {MIN_HOTDEAL_DISCOUNT_RATE}% 미만({p_info['discount_rate']}%): {clean_title}"
+            )
             seen.add(deal_id)
             save_seen(seen)
         else:
