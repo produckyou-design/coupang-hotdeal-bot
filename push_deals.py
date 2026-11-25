@@ -53,8 +53,18 @@ REPORT_CHANNEL_ID = os.getenv("TELEGRAM_REPORT_CHANNEL_ID", "-1003981511629")
 coupang_api = CoupangPartnersAPI()
 SEEN_FILE = os.path.join(BASE_DIR, "seen_deals.json")
 TRACKER_FILE = os.path.join(BASE_DIR, "sales_tracker.json")
+QUOTA_FILE = os.path.join(BASE_DIR, "post_quota.json")
 LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
+
+# 일일/회차별 송출 수량 제한 및 야간 방해금지 시간대 설정 (KST)
+DAILY_MAX_COMMUNITY_DEALS = 12
+GOLDBOX_PER_SLOT = 3
+DAILY_MAX_TOTAL_DEALS = 20
+MAX_COMMUNITY_PER_RUN = 1
+MIN_COMMUNITY_INTERVAL_MINUTES = 20
+QUIET_HOURS_START = 0
+QUIET_HOURS_END = 7
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
@@ -121,12 +131,88 @@ def load_seen() -> Set[str]:
 
 
 def save_seen(seen: Set[str]):
+    """디스크 기존 기록과 병합한 뒤 임시 파일 교체(os.replace)로 기록 유실/축소 원천 차단"""
     try:
-        recent = list(seen)[-1500:]
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(recent, f, ensure_ascii=False, indent=2)
+        disk_seen: List[str] = []
+        if os.path.exists(SEEN_FILE):
+            try:
+                with open(SEEN_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    disk_seen = loaded
+            except Exception:
+                pass
+        merged = list(dict.fromkeys(disk_seen + list(seen)))[-1500:]
+        tmp_path = SEEN_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, SEEN_FILE)
     except Exception as e:
         logger.error(f"seen_deals 저장 에러: {e}")
+
+
+def load_post_quota() -> Dict[str, Any]:
+    today_str = datetime.now(KST).strftime("%Y%m%d")
+    default_q = {
+        "date": today_str,
+        "community_sent": 0,
+        "goldbox_sent": 0,
+        "last_community_ts": 0,
+    }
+    if os.path.exists(QUOTA_FILE):
+        try:
+            with open(QUOTA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("date") == today_str:
+                return {
+                    "date": today_str,
+                    "community_sent": int(data.get("community_sent", 0) or 0),
+                    "goldbox_sent": int(data.get("goldbox_sent", 0) or 0),
+                    "last_community_ts": int(data.get("last_community_ts", 0) or 0),
+                }
+        except Exception:
+            pass
+    return default_q
+
+
+def save_post_quota(q: Dict[str, Any]):
+    try:
+        tmp_path = QUOTA_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(q, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, QUOTA_FILE)
+    except Exception as e:
+        logger.error(f"post_quota 저장 에러: {e}")
+
+
+def is_quiet_hours(now: Optional[datetime] = None) -> bool:
+    if "--ignore-quiet" in sys.argv:
+        return False
+    cur = now or datetime.now(KST)
+    return QUIET_HOURS_START <= cur.hour < QUIET_HOURS_END
+
+
+def can_send_community_now(
+    quota: Dict[str, Any],
+    run_comm_sent: int,
+    now_ts: Optional[float] = None,
+    now_dt: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    if is_quiet_hours(now_dt):
+        return False, "quiet_hours"
+    if run_comm_sent >= MAX_COMMUNITY_PER_RUN:
+        return False, "per_run_cap"
+    comm_cnt = int(quota.get("community_sent", 0) or 0)
+    gb_cnt = int(quota.get("goldbox_sent", 0) or 0)
+    if comm_cnt >= DAILY_MAX_COMMUNITY_DEALS:
+        return False, "daily_comm_cap"
+    if (comm_cnt + gb_cnt) >= DAILY_MAX_TOTAL_DEALS:
+        return False, "daily_total_cap"
+    last_ts = int(quota.get("last_community_ts", 0) or 0)
+    cur_ts = time.time() if now_ts is None else now_ts
+    if last_ts > 0 and (cur_ts - last_ts) < MIN_COMMUNITY_INTERVAL_MINUTES * 60:
+        return False, "cooldown"
+    return True, "ok"
 
 
 def clean_coupang_url(raw_url: str) -> Tuple[str, str]:
@@ -1664,22 +1750,26 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
 GOLDBOX_EXCLUDE_CATS = ("국내투어", "여행", "티켓", "렌탈", "콘도", "호텔", "리프트", "숙박")
 
 
-def run_goldbox_staggered(seen: Set[str]) -> int:
-    """로켓배송 골드박스 상품만 선별하여 오전(7~10시)·점심(12~15시)·저녁(18~20시) 3개 타임에 4개씩 분산 송출"""
+def run_goldbox_staggered(seen: Set[str], quota: Dict[str, Any]) -> int:
+    """로켓배송 골드박스 상품만 선별하여 오전(7~10시)·점심(12~15시)·저녁(18~20시) 3개 타임에 GOLDBOX_PER_SLOT(3)개씩 분산 송출"""
     now = datetime.now(KST)
+    if is_quiet_hours(now) and "--force-goldbox" not in sys.argv:
+        return 0
+
     today_str = now.strftime("%Y%m%d")
+    per_slot = GOLDBOX_PER_SLOT
 
     slot_num = 0
-    slice_start, slice_end = 0, 4
+    slice_start, slice_end = 0, per_slot
     slot_label = "오전"
     if "--force-goldbox" in sys.argv:
-        slot_num, slice_start, slice_end, slot_label = 1, 0, 4, "오전(강제)"
+        slot_num, slice_start, slice_end, slot_label = 1, 0, per_slot, "오전(강제)"
     elif 7 <= now.hour < 11:
-        slot_num, slice_start, slice_end, slot_label = 1, 0, 4, "아침"
+        slot_num, slice_start, slice_end, slot_label = 1, 0, per_slot, "아침"
     elif 12 <= now.hour < 16:
-        slot_num, slice_start, slice_end, slot_label = 2, 4, 8, "점심"
+        slot_num, slice_start, slice_end, slot_label = 2, per_slot, per_slot * 2, "점심"
     elif 18 <= now.hour < 21:
-        slot_num, slice_start, slice_end, slot_label = 3, 8, 12, "저녁"
+        slot_num, slice_start, slice_end, slot_label = 3, per_slot * 2, per_slot * 3, "저녁"
     else:
         return 0
 
@@ -1688,6 +1778,10 @@ def run_goldbox_staggered(seen: Set[str]) -> int:
     if "--force-goldbox" not in sys.argv:
         if slot_key in seen or (slot_num == 1 and legacy_key in seen):
             return 0
+
+    if (int(quota.get("community_sent", 0) or 0) + int(quota.get("goldbox_sent", 0) or 0)) >= DAILY_MAX_TOTAL_DEALS:
+        logger.info("⏸️ [송출 제한] 일일 총 송출 상한 도달로 골드박스 생략")
+        return 0
 
     logger.info(f"🍯 [{slot_label}] 로켓배송 골드박스 슬롯 {slot_num} ({slice_start+1}~{slice_end}위) 자동 송출 시작...")
     res = coupang_api.get_goldbox_products(sub_id="auto_goldbox")
@@ -1712,6 +1806,9 @@ def run_goldbox_staggered(seen: Set[str]) -> int:
 
     sent = 0
     for idx_in_batch, it in enumerate(batch):
+        if (int(quota.get("community_sent", 0) or 0) + int(quota.get("goldbox_sent", 0) or 0)) >= DAILY_MAX_TOTAL_DEALS:
+            logger.info("⏸️ [송출 제한] 일일 총 송출 상한 도달로 잔여 골드박스 중단")
+            break
         rank_num = slice_start + idx_in_batch + 1
         prod_id = str(it.get("productId") or "")
         if prod_id and is_product_recently_seen(prod_id, seen):
@@ -1745,6 +1842,8 @@ def run_goldbox_staggered(seen: Set[str]) -> int:
 
         if send_telegram(CHANNEL_ID, msg, img_url, "👉 실시간 수량 및 최저가 확인", p_url):
             sent += 1
+            quota["goldbox_sent"] = int(quota.get("goldbox_sent", 0) or 0) + 1
+            save_post_quota(quota)
             if prod_id:
                 mark_product_seen(prod_id, seen)
             time.sleep(2)
@@ -1989,12 +2088,13 @@ def update_pc_heartbeat():
 
 
 def sync_git_state():
-    """로컬 실행 시 깃허브 액션이 올렸을 수 있는 최신 seen_deals를 pull 동기화"""
+    """로컬 실행 시 깃허브 액션이 올렸을 수 있는 최신 seen_deals를 pull 동기화 (충돌 시 즉시 rebase abort로 파일 훼손 방지)"""
     if os.getenv("GITHUB_ACTIONS"):
         return
     try:
-        import subprocess
-        subprocess.run(["git", "pull", "--rebase"], cwd=BASE_DIR, capture_output=True, timeout=10, **_hidden_subp_kwargs())
+        res = subprocess.run(["git", "pull", "--rebase"], cwd=BASE_DIR, capture_output=True, timeout=10, **_hidden_subp_kwargs())
+        if res.returncode != 0:
+            subprocess.run(["git", "rebase", "--abort"], cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
     except Exception:
         pass
 
@@ -2004,8 +2104,7 @@ def sync_git_push():
     if os.getenv("GITHUB_ACTIONS"):
         return
     try:
-        import subprocess
-        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json"], cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
+        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json", "post_quota.json"], cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
         subprocess.run(
             ["git", "commit", "-m", "chore: sync seen deals from local runner [skip ci]"],
             cwd=BASE_DIR,
@@ -2030,27 +2129,38 @@ def main():
     update_pc_heartbeat()
     sync_git_state()
 
-    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (명시적 가격·할인가·할인율 정밀 검증 엔진)...")
+    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (30%+ 정밀 검증 · 일일 수량 제한 엔진)...")
     seen = load_seen()
+    quota = load_post_quota()
     total_sent = 0
+    comm_sent_this_run = 0
 
-    # 1. 루리웹 핫딜 검사 & 송출
-    for d in collect_ruliweb_deals():
-        if process_deal(d, parse_ruliweb_detail, "ruliweb", seen):
-            total_sent += 1
+    ok_comm, cap_reason = can_send_community_now(quota, comm_sent_this_run)
+    if not ok_comm:
+        logger.info(
+            f"⏸️ [송출 제한] 사유={cap_reason} (금일 커뮤니티={quota['community_sent']}/{DAILY_MAX_COMMUNITY_DEALS}, "
+            f"골드박스={quota['goldbox_sent']}) — 이번 회차 커뮤니티 송출 생략"
+        )
+    else:
+        for collector, parser, source_name in (
+            (collect_ruliweb_deals, parse_ruliweb_detail, "ruliweb"),
+            (collect_ppomppu_deals, parse_ppomppu_detail, "ppomppu"),
+            (collect_arcalive_deals, parse_arcalive_detail, "arca"),
+        ):
+            if not can_send_community_now(quota, comm_sent_this_run)[0]:
+                break
+            for d in collector():
+                if not can_send_community_now(quota, comm_sent_this_run)[0]:
+                    break
+                if process_deal(d, parser, source_name, seen):
+                    total_sent += 1
+                    comm_sent_this_run += 1
+                    quota["community_sent"] = int(quota.get("community_sent", 0) or 0) + 1
+                    quota["last_community_ts"] = int(time.time())
+                    save_post_quota(quota)
 
-    # 2. 뽐뿌 핫딜 검사 & 송출
-    for d in collect_ppomppu_deals():
-        if process_deal(d, parse_ppomppu_detail, "ppomppu", seen):
-            total_sent += 1
-
-    # 3. 아카라이브 핫딜 검사 & 송출
-    for d in collect_arcalive_deals():
-        if process_deal(d, parse_arcalive_detail, "arca", seen):
-            total_sent += 1
-
-    # 4. 시간대 분산 로켓 골드박스 (아침/점심/저녁 각 4건)
-    total_sent += run_goldbox_staggered(seen)
+    # 4. 시간대 분산 로켓 골드박스 (아침/점심/저녁 각 3건, 야간 차단)
+    total_sent += run_goldbox_staggered(seen, quota)
 
     # 6. 최근 4일 주문 집계 감지 및 마일스톤 알림
     check_and_notify_sales()

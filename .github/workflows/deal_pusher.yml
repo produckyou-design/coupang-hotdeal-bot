@@ -71,5 +71,5 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_deals.json sales_tracker.json
+          git add seen_deals.json sales_tracker.json post_quota.json
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update seen deals and sales tracker [skip ci]" && git push)
