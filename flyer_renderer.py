@@ -349,12 +349,12 @@ def _tier_emoji(rate: int) -> str:
 
 
 def is_half_off_mega(deal: Dict[str, Any]) -> bool:
-    """50% 이상 반값·역대폭락 초강력 특가 여부"""
+    """50% 이상 반값 초특가 여부"""
     return int(deal.get("discount_rate", 0) or 0) >= 50
 
 
 def is_high_ticket_mega(deal: Dict[str, Any]) -> bool:
-    """백만원 이상 고가 상품이면서 20% 이상 할인되는 대박 딜 여부"""
+    """백만원 이상 고가 상품이면서 20% 이상 할인되는 특가 딜 여부"""
     orig_p = int(deal.get("orig_price", 0) or 0)
     sale_p = int(deal.get("sale_price", 0) or 0)
     disc_r = int(deal.get("discount_rate", 0) or 0)
@@ -388,11 +388,11 @@ def _deal_badge_style(
     theme = _deal_theme(deal)
     if theme == "half":
         if disc_r >= 60:
-            return "역대폭락 · 품절임박", (185, 28, 28), (254, 240, 138), (254, 240, 138)
-        return "반값폭락 · 품절주의", (225, 29, 72), (255, 255, 255), None
+            return "반값 특가 · 품절 주의", (185, 28, 28), (254, 240, 138), (254, 240, 138)
+        return "반값 특가", (225, 29, 72), (255, 255, 255), None
     if theme == "vip":
         save_str = _format_save_kor(save_p) if save_p >= 10000 else f"{disc_r}%"
-        return f"고가 대박 · {save_str}↓", (15, 23, 42), (253, 224, 71), (245, 158, 11)
+        return f"고가 특가 · {save_str}↓", (15, 23, 42), (253, 224, 71), (245, 158, 11)
     lbl, col = _tier_badge(disc_r) if disc_r >= 20 else ("검증특가", (37, 99, 235))
     return lbl, col, (255, 255, 255), None
 
@@ -534,7 +534,7 @@ def _draw_single_rich_card(
     hv_font: Optional[str],
     eb_font: Optional[str],
 ) -> bytes:
-    """1건 전용 가로형 리치 카드 (1560x980 2배 -> 780x490): 50%+ 폭락 / 100만+ VIP / 일반 특가 테마 자동 적용"""
+    """1건 전용 가로형 리치 카드 (1560x980 2배 -> 780x490): 50%+ 반값 / 100만+ 프리미엄 / 일반 특가 테마 자동 적용"""
     W, H = 1560, 980
     header_h = 146
     theme = _deal_theme(deal)
@@ -548,14 +548,14 @@ def _draw_single_rich_card(
 
     if theme == "half":
         _draw_vertical_gradient(canvas, (0, 0, W, header_h), (127, 29, 29), (190, 18, 60))
-        hdr_title = "역대폭락 · 품절임박 특가" if disc_r >= 60 else "반값폭락 · 지금 품절주의"
-        hdr_badge_txt = f"{disc_r}%↓ 초특가"
+        hdr_title = "50%+ 반값 특가"
+        hdr_badge_txt = f"{disc_r}%↓ 특가"
         hb_bg, hb_fg, hb_bd = (15, 23, 42), (254, 240, 138), (254, 240, 138)
         card_bd, card_bd_w = (225, 29, 72), 6
     elif theme == "vip":
         _draw_vertical_gradient(canvas, (0, 0, W, header_h), (10, 15, 28), (30, 41, 59))
-        hdr_title = "백만단위 VIP 역대특가"
-        hdr_badge_txt = f"{_format_save_kor(save_p)}↓ ({disc_r}%)"
+        hdr_title = "100만원대 프리미엄 특가"
+        hdr_badge_txt = f"{_format_save_kor(save_p)} 할인"
         hb_bg, hb_fg, hb_bd = (245, 158, 11), (15, 23, 42), None
         card_bd, card_bd_w = (245, 158, 11), 6
     else:
@@ -606,10 +606,10 @@ def _draw_single_rich_card(
     pw_ship, _ = _draw_pill(draw, rx1, cur_y, "로켓 무료배송", f_chip, bg=(219, 234, 254), fg=(29, 78, 216), pad_x=22, pad_y=11, radius=14)
     unit_part = extract_unit_part(str(deal.get("clean_title") or ""), str(deal.get("unit_info") or ""))
     if theme == "vip" and save_p >= 10000:
-        extra_chip = f"{_format_save_kor(save_p)} 초특가 절약"
+        extra_chip = f"{_format_save_kor(save_p)} 할인"
         ex_bg, ex_fg = (254, 243, 199), (146, 64, 14)
     elif theme == "half":
-        extra_chip = unit_part or "반값 이상 초특가"
+        extra_chip = unit_part or "반값 이상 할인"
         ex_bg, ex_fg = (255, 228, 230), (190, 18, 60)
     else:
         extra_chip = unit_part or (f"{orig_p - sale_p:,}원 절약" if orig_p > sale_p >= 1000 else "")
@@ -640,10 +640,10 @@ def _draw_single_rich_card(
             _draw_pill(draw, rx1, cur_y + 10, r_lines[0], f_react, bg=(241, 245, 249), fg=(71, 85, 105), pad_x=18, pad_y=10, radius=12)
         elif theme == "half":
             f_react = _load_font(hv_font, 28)
-            _draw_pill(draw, rx1, cur_y + 10, "조기 품절·가격 복귀 주의 · 지금 바로 확인", f_react, bg=(255, 241, 242), fg=(190, 18, 60), pad_x=18, pad_y=10, radius=12)
+            _draw_pill(draw, rx1, cur_y + 10, "조기 품절·가격 변동 가능", f_react, bg=(255, 241, 242), fg=(190, 18, 60), pad_x=18, pad_y=10, radius=12)
         elif theme == "vip":
             f_react = _load_font(hv_font, 28)
-            _draw_pill(draw, rx1, cur_y + 10, "고가 프리미엄 할인 · 놓치면 아쉬운 대박 가격", f_react, bg=(254, 249, 195), fg=(113, 63, 18), pad_x=18, pad_y=10, radius=12)
+            _draw_pill(draw, rx1, cur_y + 10, "고가 상품 할인 · 로켓 무료배송", f_react, bg=(254, 249, 195), fg=(113, 63, 18), pad_x=18, pad_y=10, radius=12)
 
     # 4) Rich Price Story Box
     _draw_price_box(draw, (rx1, box_y1, rx2, cy2 - 26), orig_p, sale_p, disc_r, hv_font, eb_font, orig_prefix="정상가 ", theme=theme)
@@ -733,42 +733,102 @@ def _draw_grid_card_item(
     _draw_price_box(draw, (box_x1, box_y1, box_x2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font, theme=theme)
 
 
-def _draw_brand_promo_card(
+def _draw_wide_card_item(
     canvas: Image.Image,
     draw: ImageDraw.ImageDraw,
     cx1: int,
     cy1: int,
     cx2: int,
     cy2: int,
+    idx_num: int,
+    deal: Dict[str, Any],
+    prod_img: Image.Image,
     hv_font: Optional[str],
     eb_font: Optional[str],
 ) -> None:
-    """3건일 때 4번째 빈 칸에 넣는 @HOTpang911 안내 카드"""
-    draw.rounded_rectangle([cx1 + 4, cy1 + 8, cx2 + 4, cy2 + 8], radius=28, fill=(203, 213, 225))
-    draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=28, fill=(15, 23, 42), outline=(30, 41, 59), width=3)
+    """3건 1+2 벤토 레이아웃 상단 가로 와이드 카드"""
+    theme = _deal_theme(deal)
+    disc_r = int(deal.get("discount_rate", 0) or 0)
+    orig_p = int(deal.get("orig_price", 0) or 0)
+    sale_p = int(deal.get("sale_price", 0) or 0)
+    save_p = max(0, orig_p - sale_p)
 
-    card_w = cx2 - cx1
-    card_h = cy2 - cy1
-    f_badge = _load_font(hv_font, 34)
-    f_big = _load_font(hv_font, 56)
-    f_sub = _load_font(eb_font, 36)
+    card_bd = (225, 29, 72) if theme == "half" else ((245, 158, 11) if theme == "vip" else (226, 232, 240))
+    card_bd_w = 6 if theme in ("half", "vip") else 3
 
-    bw_txt = "쿠팡 핫딜 알리미"
-    btw, _ = _text_size(draw, bw_txt, f_badge)
-    _draw_pill(draw, cx1 + (card_w - (btw + 48)) // 2, cy1 + int(card_h * 0.22), bw_txt, f_badge, bg=(225, 29, 72), fg=(255, 255, 255), pad_x=24, pad_y=12)
+    draw.rounded_rectangle([cx1 + 4, cy1 + 8, cx2 + 4, cy2 + 8], radius=28, fill=(216, 224, 236))
+    draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=28, fill=(255, 255, 255), outline=card_bd, width=card_bd_w)
 
-    for dy, line, col, fn in (
-        (0.40, "20%+ 진짜 특가만", (255, 255, 255), f_big),
-        (0.51, "선별해 드립니다", (226, 232, 240), f_big),
-        (0.67, "로켓 무료배송 · @HOTpang911", (74, 222, 128), f_sub),
-    ):
-        lw, _ = _text_size(draw, line, fn)
-        bb = draw.textbbox((0, 0), line, font=fn)
-        draw.text((cx1 + (card_w - lw) // 2 - bb[0], cy1 + int(card_h * dy) - bb[1]), line, font=fn, fill=col)
+    # Left: photo stage + index pill
+    stage_x1, stage_y1 = cx1 + 22, cy1 + 20
+    stage_x2, stage_y2 = cx1 + 540, cy2 - 20
+    draw.rounded_rectangle([stage_x1, stage_y1, stage_x2, stage_y2], radius=20, fill=(255, 255, 255), outline=(241, 245, 249), width=3)
+
+    f_num = _load_font(hv_font, 42)
+    num_bg = (190, 18, 60) if theme == "half" else (15, 23, 42)
+    num_fg = (254, 240, 138) if theme == "half" else ((253, 224, 71) if theme == "vip" else (255, 255, 255))
+    _draw_pill(draw, stage_x1 + 14, stage_y1 + 14, f"{idx_num}", f_num, bg=num_bg, fg=num_fg, pad_x=22, pad_y=10, radius=16)
+
+    _paste_fit_center(canvas, prod_img, (stage_x1 + 22, stage_y1 + 88, stage_x2 - 22, stage_y2 - 20))
+
+    # Right column
+    rx1 = stage_x2 + 30
+    rx2 = cx2 - 26
+    rw = rx2 - rx1
+
+    # Top row: left delivery/extra pills + right tier badge
+    t_lbl, t_bg, t_fg, t_bd = _deal_badge_style(deal)
+    f_tag = _load_font(hv_font, 34)
+    badge_w = _text_size(draw, t_lbl, f_tag)[0] + 40
+    badge_x = rx2 - badge_w
+    _draw_pill(draw, badge_x, cy1 + 24, t_lbl, f_tag, bg=t_bg, fg=t_fg, pad_x=20, pad_y=10, radius=16, outline=t_bd, outline_width=2)
+
+    f_chip = _load_font(hv_font, 30)
+    pw_ship, _ = _draw_pill(draw, rx1, cy1 + 26, "로켓 무료배송", f_chip, bg=(219, 234, 254), fg=(29, 78, 216), pad_x=18, pad_y=10, radius=12)
+
+    full_title = str(deal.get("clean_title") or "").strip()
+    unit_part = extract_unit_part(full_title, str(deal.get("unit_info") or ""))
+    if theme == "vip" and save_p >= 10000:
+        extra_chip = f"{_format_save_kor(save_p)} 할인"
+        ex_bg, ex_fg = (254, 243, 199), (146, 64, 14)
+    elif theme == "half":
+        extra_chip = unit_part or "반값 이상 할인"
+        ex_bg, ex_fg = (255, 228, 230), (190, 18, 60)
+    else:
+        extra_chip = unit_part or (f"{orig_p - sale_p:,}원 절약" if orig_p > sale_p >= 1000 else "")
+        ex_bg, ex_fg = (220, 252, 231), (4, 120, 87)
+
+    if extra_chip:
+        nx = rx1 + pw_ship + 12
+        if nx + _text_size(draw, extra_chip, f_chip)[0] + 36 <= badge_x - 16:
+            _draw_pill(draw, nx, cy1 + 26, extra_chip, f_chip, bg=ex_bg, fg=ex_fg, pad_x=18, pad_y=10, radius=12)
+
+    # Wrapped 2-line title
+    cur_y = cy1 + 98
+    f_title = _load_font(hv_font, 44)
+    t_lines = _wrap_title_lines(draw, full_title, f_title, rw, max_lines=2)
+    for ln in t_lines:
+        tb = draw.textbbox((0, 0), ln, font=f_title)
+        draw.text((rx1 - tb[0], cur_y - tb[1]), ln, font=f_title, fill=(15, 23, 42))
+        cur_y += 54
+
+    # Bottom price box
+    box_h = 204
+    box_y1 = cy2 - 22 - box_h
+    box_y2 = cy2 - 22
+
+    # Optional community reaction quote
+    reaction = str(deal.get("reaction_text") or "").strip()
+    if reaction and (cur_y + 62) <= box_y1:
+        f_react = _load_font(eb_font, 28)
+        r_lines = _wrap_title_lines(draw, f"반응: {reaction}", f_react, rw - 32, max_lines=1)
+        _draw_pill(draw, rx1, cur_y + 10, r_lines[0], f_react, bg=(241, 245, 249), fg=(71, 85, 105), pad_x=18, pad_y=10, radius=12)
+
+    _draw_price_box(draw, (rx1, box_y1, rx2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font, orig_prefix="정상가 ", theme=theme)
 
 
 def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -> bytes:
-    """1~4건 커뮤니티 핫딜 목록을 빅타이포 전단지 PNG 바이트로 렌더링 (세로 슬림 비율 + 저수량 리치 정보)"""
+    """1~4건 커뮤니티 핫딜 목록을 빅타이포 전단지 PNG 바이트로 렌더링 (세로 슬림 비율 + 3건 1+2 벤토 레이아웃)"""
     batch = deals[:4]
     if not batch:
         raise ValueError("deals must not be empty")
@@ -795,16 +855,18 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     has_half = any(is_half_off_mega(d) for d in batch)
     has_vip = any(is_high_ticket_mega(d) for d in batch)
 
-    if n >= 3:
+    if n >= 4:
         W, H = 1800, 1980
-        cols, rows = 2, 2
         out_size = (900, 990)
-        hdr_title = "반값폭락 · 실시간 긴급전단지" if has_half else ("고가 대박 · 실시간 핫딜" if has_vip else "쿠팡 실시간 핫딜")
+        hdr_title = "50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜")
+    elif n == 3:
+        W, H = 1800, 1700
+        out_size = (900, 850)
+        hdr_title = "50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜")
     else:
         W, H = 1800, 1080
-        cols, rows = 2, 1
         out_size = (900, 540)
-        hdr_title = "반값폭락 · 긴급 추천 핫딜" if has_half else ("고가 대박 · 추천 핫딜" if has_vip else "쿠팡 추천 핫딜")
+        hdr_title = "50%+ 반값 포함 · 추천 핫딜" if has_half else ("프리미엄 특가 포함 · 추천 핫딜" if has_vip else "쿠팡 추천 핫딜")
 
     header_h = 152
     canvas = Image.new("RGB", (W, H), (241, 245, 249))
@@ -829,23 +891,37 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     margin_top = header_h + 26
     margin_bot = 26
     gap = 30
-    card_w = (W - margin_x * 2 - gap * (cols - 1)) // cols
-    card_h = (H - margin_top - margin_bot - gap * (rows - 1)) // rows
 
-    for idx in range(cols * rows):
-        row, col = divmod(idx, cols)
-        cx1 = margin_x + col * (card_w + gap)
-        cy1 = margin_top + row * (card_h + gap)
-        cx2 = cx1 + card_w
-        cy2 = cy1 + card_h
-        if idx < n:
+    if n == 3:
+        top_h = 600
+        _draw_wide_card_item(
+            canvas, draw, margin_x, margin_top, W - margin_x, margin_top + top_h,
+            1, batch[0], prod_imgs[0], hv_font, eb_font,
+        )
+        bot_y1 = margin_top + top_h + gap
+        bot_y2 = H - margin_bot
+        card_w = (W - margin_x * 2 - gap) // 2
+        for col_idx, deal_idx in enumerate((1, 2)):
+            cx1 = margin_x + col_idx * (card_w + gap)
             _draw_grid_card_item(
-                canvas, draw, cx1, cy1, cx2, cy2,
+                canvas, draw, cx1, bot_y1, cx1 + card_w, bot_y2,
+                deal_idx + 1, batch[deal_idx], prod_imgs[deal_idx],
+                hv_font, eb_font, rich_mode=True,
+            )
+    else:
+        cols = 2
+        rows = 2 if n >= 4 else 1
+        card_w = (W - margin_x * 2 - gap * (cols - 1)) // cols
+        card_h = (H - margin_top - margin_bot - gap * (rows - 1)) // rows
+        for idx in range(min(n, cols * rows)):
+            row, col = divmod(idx, cols)
+            cx1 = margin_x + col * (card_w + gap)
+            cy1 = margin_top + row * (card_h + gap)
+            _draw_grid_card_item(
+                canvas, draw, cx1, cy1, cx1 + card_w, cy1 + card_h,
                 idx + 1, batch[idx], prod_imgs[idx],
                 hv_font, eb_font, rich_mode=(n == 2),
             )
-        elif n == 3 and idx == 3:
-            _draw_brand_promo_card(canvas, draw, cx1, cy1, cx2, cy2, hv_font, eb_font)
 
     final = canvas.resize(out_size, Image.Resampling.LANCZOS)
     buf = io.BytesIO()
@@ -862,15 +938,15 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
         d0 = batch[0]
         save0 = max(0, int(d0.get("orig_price", 0) or 0) - int(d0.get("sale_price", 0) or 0))
         if is_half_off_mega(d0):
-            header = "🚨 <b>[긴급] 반값 이상 역대폭락! 품절 전 무조건 줍줍 🔥</b>"
+            header = f"🚨 <b>[{int(d0.get('discount_rate', 0) or 0)}%↓ 반값 특가]</b>"
         elif is_high_ticket_mega(d0):
-            header = f"💎 <b>[백만단위 대박딜] 무려 {_format_save_kor(save0)}↓ 역대급 할인!!</b>"
+            header = f"💎 <b>[고가 특가 · {_format_save_kor(save0)} 할인]</b>"
         else:
             header = "🔥 <b>[쿠팡 실시간 특가]</b>"
     elif has_half:
-        header = "🚨 <b>[반값폭락 포함 · 쿠팡 긴급 전단지]</b>"
+        header = "🚨 <b>[반값 특가 포함 · 쿠팡 핫딜]</b>"
     elif has_vip:
-        header = "💎 <b>[고가 대박 포함 · 쿠팡 실시간 전단지]</b>"
+        header = "💎 <b>[고가 특가 포함 · 쿠팡 핫딜]</b>"
     elif n >= 3:
         header = "🔥 <b>[쿠팡 실시간 핫딜 모아보기]</b>"
     else:
@@ -896,9 +972,9 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
 
         tags: List[str] = []
         if is_half_off_mega(d):
-            tags.append("🚨<b>[반값폭락·품절주의]</b>")
+            tags.append("🚨<b>[반값 특가]</b>")
         if is_high_ticket_mega(d):
-            tags.append(f"💎<b>[고가대박 {_format_save_kor(save_amt)}↓]</b>")
+            tags.append(f"💎<b>[{_format_save_kor(save_amt)} 할인]</b>")
         tag_prefix = (" ".join(tags) + " ") if tags else ""
 
         emo = _tier_emoji(disc_r) if disc_r >= 20 else "🔥"
@@ -950,7 +1026,7 @@ def format_flyer_caption_and_buttons(
         price_part = f"{sale_p:,}원" if sale_p >= 1000 else "확인"
         urgent_emo = "🚨" if is_half_off_mega(d) else ("💎" if is_high_ticket_mega(d) else "")
         if n == 1 and urgent_emo:
-            btn_text = f"{urgent_emo} {short_t} · {rate_part}{price_part} 지금 구매 ↗"
+            btn_text = f"{urgent_emo} {short_t} · {rate_part}{price_part} ↗"
         elif urgent_emo:
             btn_text = f"{icon} {urgent_emo}{short_t} · {rate_part}{price_part} ↗"
         else:
