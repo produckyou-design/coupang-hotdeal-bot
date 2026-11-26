@@ -27,7 +27,13 @@ if sys.stderr is not None and hasattr(sys.stderr, "detach"):
 
 load_dotenv()
 
-from coupang_api import CoupangPartnersAPI
+from coupang_api import (
+    CoupangPartnersAPI,
+    classify_sub_id,
+    format_channel_split_block,
+    format_order_source_badge,
+    summarize_partner_stats,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -68,6 +74,12 @@ QUIET_HOURS_END = 7
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
+}
+
+SOURCE_SUB_ID_MAP = {
+    "arca": "tgarca",
+    "ruliweb": "tgruli",
+    "ppomppu": "tgppom",
 }
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
@@ -1760,9 +1772,10 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
             )
         return False
 
-    # 파트너스 딥링크 생성 (제3자 lptag 제거된 정규 URL 사용)
+    # 파트너스 딥링크 생성 (제3자 lptag 제거된 정규 URL 사용, 영숫자 subId 부여)
     try:
-        res = coupang_api.create_deeplink([clean_url], sub_id=f"auto_{source_name}")
+        sub_id = SOURCE_SUB_ID_MAP.get(source_name, f"tg{re.sub(r'[^a-zA-Z0-9]', '', source_name)}")
+        res = coupang_api.create_deeplink([clean_url], sub_id=sub_id)
         items = res.get("data", [])
         if not items:
             seen.add(deal_id)
@@ -1840,7 +1853,7 @@ def run_goldbox_staggered(seen: Set[str], quota: Dict[str, Any]) -> int:
         return 0
 
     logger.info(f"🍯 [{slot_label}] 로켓배송 골드박스 슬롯 {slot_num} ({slice_start+1}~{slice_end}위) 자동 송출 시작...")
-    res = coupang_api.get_goldbox_products(sub_id="auto_goldbox")
+    res = coupang_api.get_goldbox_products(sub_id="tggold")
     raw_items = res.get("data", []) or []
 
     # 로켓배송 + 여행/숙박/티켓 잡상품 제외 필터
@@ -2010,7 +2023,8 @@ def check_and_notify_sales():
             qty = int(it.get("quantity", 1) or 1)
             g = int(round(float(it.get("gmv", 0) or 0)))
             c = int(round(float(it.get("commission", 0) or 0)))
-            item_lines.append(f"• [{d_fmt}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수수료 <b>{c:,}원</b>)")
+            src_badge = format_order_source_badge(it.get("subId"))
+            item_lines.append(f"• [{d_fmt}·{esc(src_badge)}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수수료 <b>{c:,}원</b>)")
         if len(new_items) > 5:
             item_lines.append(f"• 외 {len(new_items) - 5}건 추가")
         items_block = "\n".join(item_lines)
@@ -2070,22 +2084,23 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         order_res = coupang_api.get_order_report(start_date=start_4d, end_date=today_str)
         order_items = order_res.get("data", []) or []
 
-        # 1. 월 누적 집계 (API 확정 수치 합산)
-        m_clicks = sum(int(r.get("click", 0) or 0) for r in comm_rows)
-        m_orders = sum(int(r.get("order", 0) or 0) for r in comm_rows)
-        m_cancels = sum(int(r.get("cancel", 0) or 0) for r in comm_rows)
-        m_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in comm_rows)
-        m_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in comm_rows)
+        stats = summarize_partner_stats(comm_rows, order_items)
+        m_tot = stats["total"]
+        m_clicks = m_tot["clicks"]
+        m_orders = m_tot["orders"]
+        m_cancels = m_tot["cancels"]
+        m_gmv = m_tot["gmv"]
+        m_comm = m_tot["commission"]
 
         # 2. 최근 확정일 집계 (D+1~D+2 지연 반영된 가장 최신 날짜)
-        latest_date = max((str(r.get("date") or "") for r in comm_rows), default="")
+        latest_date = stats["latest_date"]
         if latest_date:
-            l_rows = [r for r in comm_rows if str(r.get("date") or "") == latest_date]
-            l_clicks = sum(int(r.get("click", 0) or 0) for r in l_rows)
-            l_orders = sum(int(r.get("order", 0) or 0) for r in l_rows)
-            l_cancels = sum(int(r.get("cancel", 0) or 0) for r in l_rows)
-            l_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in l_rows)
-            l_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in l_rows)
+            l_tot = stats["latest_total"]
+            l_clicks = l_tot["clicks"]
+            l_orders = l_tot["orders"]
+            l_cancels = l_tot["cancels"]
+            l_gmv = l_tot["gmv"]
+            l_comm = l_tot["commission"]
             l_fmt = f"{latest_date[:4]}.{latest_date[4:6]}.{latest_date[6:8]}" if len(latest_date) == 8 else latest_date
 
             matched_prods = [str(it.get("productName") or "")[:28] for it in order_items if str(it.get("date") or "") == latest_date and it.get("productName")]
@@ -2099,6 +2114,8 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         else:
             latest_block = "📌 <b>최근 확정일</b>: 집계된 내역 없음\n\n"
 
+        channel_split_block = format_channel_split_block(stats, f"채널별 분리 집계 ({now.month}월 누적)")
+
         report_msg = (
             f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
             f"📅 리포트 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
@@ -2108,6 +2125,7 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             f"• 총 주문 / 취소: <b>{m_orders:,}건</b> / {m_cancels:,}건\n"
             f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
             f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
+            f"{channel_split_block}\n\n"
             f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>"
         )
 

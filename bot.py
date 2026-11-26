@@ -8,7 +8,7 @@ import re
 import socket
 import sys
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 # Windows 콘솔 utf-8 설정
@@ -36,7 +36,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from coupang_api import CoupangPartnersAPI
+from coupang_api import (
+    CoupangPartnersAPI,
+    format_channel_split_block,
+    format_order_source_badge,
+    summarize_partner_stats,
+)
 from deal_crawler import DealCrawler, load_seen_deals, save_seen_deals
 
 # 환경변수 로드
@@ -343,7 +348,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /menu — 리모콘 메뉴\n"
         "• /goldbox — 골드박스 5개 조회\n"
         "• /search &lt;키워드&gt; — 상품 검색 (버튼 ‘🔍 검색’ 후 키워드 입력도 가능)\n"
-        "• /report — 실적 요약\n"
+        "• /report (또는 /stats, /통계) — 채널별 클릭/구매/수익 통계\n"
         "• /post_test — 테스트 송출 1건\n"
         "• /status — 봇 상태\n"
         "• /auto [on|off] — 자동송출 토글\n\n"
@@ -355,7 +360,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_goldbox_list(target_message, context: ContextTypes.DEFAULT_TYPE, count: int = 5):
     """골드박스 목록 전송 공용 로직 (명령어/버튼 공용, HTML)"""
     clean_cache()
-    res = coupang_api.get_goldbox_products(sub_id="tg_goldbox")
+    res = coupang_api.get_goldbox_products(sub_id="tggold")
     items = res.get("data", [])
     if not items:
         await target_message.reply_text("❌ 조회된 골드박스 상품이 없습니다.")
@@ -416,7 +421,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.effective_message.reply_text(f"🔍 '{keyword}' 검색 중...")
 
     try:
-        res = coupang_api.search_products(keyword=keyword, limit=5, sub_id="tg_search")
+        res = coupang_api.search_products(keyword=keyword, limit=5, sub_id="tgsearch")
         data = res.get("data", {})
         items = data.get("productData", []) if isinstance(data, dict) else []
 
@@ -473,44 +478,83 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/report 명령어: 최근 실적 조회"""
+    """/report (/stats, /통계) 명령어: 최근 7일·이번 달 누적 채널별 클릭/구매/수익 통계"""
     if not is_admin_update(update):
         return
 
-    msg = await update.effective_message.reply_text("📊 최근 파트너스 실적 조회 중...")
+    msg = await update.effective_message.reply_text("📊 채널별 파트너스 통계 조회 중...")
 
     try:
-        today = datetime.now()
-        yesterday = today - timedelta(days=1)
-        start_date = yesterday.strftime("%Y%m%d")
-        end_date = today.strftime("%Y%m%d")
+        kst = timezone(timedelta(hours=9))
+        now = datetime.now(kst)
+        today_str = now.strftime("%Y%m%d")
+        month_start = now.strftime("%Y%m01")
+        week_start = (now - timedelta(days=6)).strftime("%Y%m%d")
 
-        res = coupang_api.get_order_report(start_date=start_date, end_date=end_date)
-        items = res.get("data", [])
-
-        if not items:
-            await msg.edit_text(
-                f"📊 <b>[최근 실적 리포트 ({start_date} ~ {end_date})]</b>\n\n"
-                f"기록된 주문 내역이 아직 없습니다.\n"
-                f"꾸준히 특가를 송출해 보세요! 💪",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        total_orders = len(items)
-        report_text = (
-            f"📊 <b>[최근 실적 리포트 ({start_date} ~ {end_date})]</b>\n\n"
-            f"• 총 주문 건수: <b>{total_orders}건</b>\n\n"
-            f"<b>[최근 주문 품목]</b>\n"
+        comm_month_rows = (
+            coupang_api.get_commission_report(start_date=month_start, end_date=today_str).get("data", []) or []
         )
-        for i, item in enumerate(items[:5]):
-            p_name = item.get("productName", "상품")
-            gmv = item.get("gmv", 0)  # 결제금액
-            try:
-                gmv_n = int(gmv)
-            except Exception:
-                gmv_n = 0
-            report_text += f"{i+1}. {esc(p_name)} ({gmv_n:,}원)\n"
+        comm_week_rows = (
+            coupang_api.get_commission_report(start_date=week_start, end_date=today_str).get("data", []) or []
+        )
+        order_rows = (
+            coupang_api.get_order_report(start_date=week_start, end_date=today_str).get("data", []) or []
+        )
+
+        m_stats = summarize_partner_stats(comm_month_rows, order_rows)
+        w_stats = summarize_partner_stats(comm_week_rows)
+
+        latest_date = m_stats["latest_date"]
+        if latest_date:
+            lt = m_stats["latest_total"]
+            l_fmt = f"{latest_date[:4]}.{latest_date[4:6]}.{latest_date[6:8]}" if len(latest_date) == 8 else latest_date
+            latest_block = (
+                f"📌 <b>최근 확정일 ({l_fmt})</b>\n"
+                f"• 클릭/주문: <b>{lt['clicks']:,}회</b> / <b>{lt['orders']:,}건</b> | "
+                f"{lt['gmv']:,}원 (수익 <b>{lt['commission']:,}원</b>)\n\n"
+            )
+        else:
+            latest_block = "📌 <b>최근 확정일</b>: 집계 내역 없음\n\n"
+
+        wt = w_stats["total"]
+        mt = m_stats["total"]
+        channel_block = format_channel_split_block(m_stats, f"채널별 분리 집계 ({now.month}월 누적)")
+
+        tagged_orders = sorted(
+            m_stats["tagged_orders"],
+            key=lambda x: str(x.get("date") or ""),
+            reverse=True,
+        )
+        order_lines = []
+        for it in tagged_orders[:5]:
+            d_raw = str(it.get("date") or "")
+            d_fmt = f"{d_raw[4:6]}/{d_raw[6:8]}" if len(d_raw) == 8 else d_raw
+            pname = str(it.get("productName") or "상품")[:28]
+            qty = int(it.get("quantity", 1) or 1)
+            g = int(round(float(it.get("gmv", 0) or 0)))
+            c = int(round(float(it.get("commission", 0) or 0)))
+            src_badge = format_order_source_badge(it.get("subId"))
+            order_lines.append(f"• [{d_fmt}·{esc(src_badge)}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수익 {c:,}원)")
+        orders_block = (
+            "<b>[최근 7일 주문 품목]</b>\n" + "\n".join(order_lines) + "\n\n"
+            if order_lines
+            else "<b>[최근 7일 주문 품목]</b>\n• 확정 주문 내역 없음\n\n"
+        )
+
+        report_text = (
+            f"📊 <b>[쿠팡 파트너스 채널별 통계]</b>\n"
+            f"📅 조회 기준: {now.strftime('%Y.%m.%d %H:%M')} KST\n\n"
+            f"{latest_block}"
+            f"🗓️ <b>최근 7일 합계</b>\n"
+            f"• 클릭/주문/취소: <b>{wt['clicks']:,}회</b> / <b>{wt['orders']:,}건</b> / {wt['cancels']:,}건\n"
+            f"• 결제액 / 수익: {wt['gmv']:,}원 / <b>{wt['commission']:,}원</b>\n\n"
+            f"🗓️ <b>{now.month}월 누적 ({now.month}/1 ~ {now.month}/{now.day})</b>\n"
+            f"• 클릭/주문/취소: <b>{mt['clicks']:,}회</b> / <b>{mt['orders']:,}건</b> / {mt['cancels']:,}건\n"
+            f"• 결제액 / 확정 수익: {mt['gmv']:,}원 / <b>{mt['commission']:,}원</b>\n\n"
+            f"{channel_block}\n\n"
+            f"{orders_block}"
+            f"※ <i>쿠팡 API 리포트는 익일 오후(D+1~D+2) 확정 집계됩니다.</i>"
+        )
 
         await msg.edit_text(report_text, parse_mode=ParseMode.HTML)
 
@@ -527,7 +571,7 @@ async def post_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.effective_message.reply_text(f"📡 <code>{esc(PUBLIC_CHANNEL_ID)}</code> 채널로 테스트 발송 중...", parse_mode=ParseMode.HTML)
 
     try:
-        res = coupang_api.get_goldbox_products(sub_id="tg_test")
+        res = coupang_api.get_goldbox_products(sub_id="tgtest")
         items = res.get("data", [])
         if not items:
             await status.edit_text("❌ 골드박스 상품이 없습니다.")
@@ -600,7 +644,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "🔍 검색할 키워드를 입력하세요. (예: 생수, 기저귀)\n취소하려면 /menu"
         )
         return
-    if text in ("📊 리포트", "리포트"):
+    if text in ("📊 리포트", "리포트", "통계", "/통계"):
         await report_cmd(update, context)
         return
     if text in ("🧪 테스트송출", "테스트송출", "테스트"):
@@ -643,7 +687,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     status_msg = await update.effective_message.reply_text("🔗 쿠팡 파트너스 딥링크 생성 중...")
 
     try:
-        res = coupang_api.create_deeplink([target_url], sub_id="tg_manual")
+        res = coupang_api.create_deeplink([target_url], sub_id="tgmanual")
         data = res.get("data", [])
         if not data:
             await status_msg.edit_text("❌ 딥링크 생성 실패 (응답 데이터 없음)")
@@ -789,7 +833,7 @@ async def post_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.effective_message.reply_text("🚀 골드박스 전 품목 송출을 시작합니다! 잠시만 기다려주세요...")
 
     try:
-        res = coupang_api.get_goldbox_products(sub_id="tg_all_manual")
+        res = coupang_api.get_goldbox_products(sub_id="tggoldall")
         items = res.get("data", [])
         if not items:
             await status.edit_text("❌ 조회된 골드박스 상품이 없습니다.")
@@ -860,7 +904,7 @@ async def scheduled_morning_goldbox(bot):
         return
     logger.info(f"아침 골드박스 자동 송출 시작 (상위 {AUTO_GOLDBOX_LIMIT}개)")
     try:
-        res = coupang_api.get_goldbox_products(sub_id="tg_auto_all")
+        res = coupang_api.get_goldbox_products(sub_id="tggoldauto")
         if str(res.get("rCode", "0")) != "0":
             logger.error(f"골드박스 API 오류: {res.get('rCode')} {res.get('rMessage')}")
             if ADMIN_CHAT_ID:
@@ -964,7 +1008,7 @@ async def check_and_publish_community_deals(bot) -> int:
 
         # 쿠팡 파트너스 딥링크 생성
         try:
-            res = coupang_api.create_deeplink([coupang_raw_url], sub_id="tg_community_auto")
+            res = coupang_api.create_deeplink([coupang_raw_url], sub_id="tgcomm")
             items = res.get("data", [])
             if not items:
                 seen.add(deal_id)
@@ -1085,7 +1129,7 @@ def main():
     app.add_handler(CommandHandler("post_all", post_all_cmd))
     app.add_handler(CommandHandler("crawl_now", crawl_now_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler(["report", "stats"], report_cmd))
     app.add_handler(CommandHandler("post_test", post_test_cmd))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     app.add_handler(CallbackQueryHandler(publish_callback, pattern="^publish:"))

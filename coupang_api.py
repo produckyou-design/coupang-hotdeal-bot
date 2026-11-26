@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
@@ -145,7 +145,7 @@ class CoupangPartnersAPI:
         return self._request("GET", path, params=params)
 
     def get_order_report(
-        self, start_date: str, end_date: str, page: int = 0
+        self, start_date: str, end_date: str, page: int = 0, sub_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         주문/실적 리포트 조회
@@ -153,11 +153,27 @@ class CoupangPartnersAPI:
         :param end_date: 'YYYYMMDD' 형식
         """
         path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/orders"
-        params = {"startDate": start_date, "endDate": end_date, "page": page}
+        params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date, "page": page}
+        if sub_id:
+            params["subId"] = sub_id
+        return self._request("GET", path, params=params)
+
+    def get_click_report(
+        self, start_date: str, end_date: str, sub_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        일별/채널별 클릭 리포트 조회
+        :param start_date: 'YYYYMMDD' 형식
+        :param end_date: 'YYYYMMDD' 형식
+        """
+        path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/clicks"
+        params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date}
+        if sub_id:
+            params["subId"] = sub_id
         return self._request("GET", path, params=params)
 
     def get_commission_report(
-        self, start_date: str, end_date: str
+        self, start_date: str, end_date: str, sub_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         일별 클릭/주문/취소/확정 수익 리포트 조회
@@ -165,11 +181,13 @@ class CoupangPartnersAPI:
         :param end_date: 'YYYYMMDD' 형식
         """
         path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/commission"
-        params = {"startDate": start_date, "endDate": end_date}
+        params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date}
+        if sub_id:
+            params["subId"] = sub_id
         return self._request("GET", path, params=params)
 
     def get_cancel_report(
-        self, start_date: str, end_date: str
+        self, start_date: str, end_date: str, sub_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         취소 내역 리포트 조회
@@ -177,5 +195,140 @@ class CoupangPartnersAPI:
         :param end_date: 'YYYYMMDD' 형식
         """
         path = "/v2/providers/affiliate_open_api/apis/openapi/v1/reports/cancels"
-        params = {"startDate": start_date, "endDate": end_date}
+        params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date}
+        if sub_id:
+            params["subId"] = sub_id
         return self._request("GET", path, params=params)
+
+
+def classify_sub_id(sub_id: Optional[str]) -> Tuple[str, str]:
+    """쿠팡 파트너스 subId를 유입 채널 그룹('telegram' | 'poliwiki' | 'other')과 세부 라벨로 분류"""
+    s = (sub_id or "").strip().lower()
+    if not s:
+        return "poliwiki", "폴리위키/미지정"
+    if s.startswith(("tg", "auto_", "hotpang")):
+        if "arca" in s:
+            return "telegram", "아카라이브"
+        if "ruli" in s:
+            return "telegram", "루리웹"
+        if "ppom" in s:
+            return "telegram", "뽐뿌"
+        if "gold" in s:
+            return "telegram", "골드박스"
+        if "manual" in s:
+            return "telegram", "수동링크"
+        if "search" in s:
+            return "telegram", "봇검색"
+        return "telegram", "기타"
+    return "other", s
+
+
+def _empty_stat_bucket() -> Dict[str, int]:
+    return {"clicks": 0, "orders": 0, "cancels": 0, "gmv": 0, "commission": 0}
+
+
+def _add_comm_row(bucket: Dict[str, int], row: Dict[str, Any]) -> None:
+    bucket["clicks"] += int(row.get("click", 0) or 0)
+    bucket["orders"] += int(row.get("order", 0) or 0)
+    bucket["cancels"] += int(row.get("cancel", 0) or 0)
+    bucket["gmv"] += int(round(float(row.get("gmv", 0) or 0)))
+    bucket["commission"] += int(round(float(row.get("commission", 0) or 0)))
+
+
+def summarize_partner_stats(
+    comm_rows: List[Dict[str, Any]],
+    order_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """commission 리포트 행과 주문 행을 채널 그룹(telegram/poliwiki/other) 및 텔레그램 소스별로 집계"""
+    total = _empty_stat_bucket()
+    telegram = _empty_stat_bucket()
+    poliwiki = _empty_stat_bucket()
+    other = _empty_stat_bucket()
+    tg_sources: Dict[str, Dict[str, int]] = {}
+
+    groups = {"telegram": telegram, "poliwiki": poliwiki, "other": other}
+    for row in comm_rows or []:
+        _add_comm_row(total, row)
+        grp, src_label = classify_sub_id(row.get("subId"))
+        _add_comm_row(groups[grp], row)
+        if grp == "telegram":
+            src_bucket = tg_sources.setdefault(src_label, _empty_stat_bucket())
+            _add_comm_row(src_bucket, row)
+
+    active_tg_sources = {
+        k: {key: val[key] for key in ("clicks", "orders", "gmv", "commission")}
+        for k, val in tg_sources.items()
+        if any(val[key] > 0 for key in ("clicks", "orders", "cancels", "gmv", "commission"))
+    }
+
+    latest_date = max((str(r.get("date") or "") for r in (comm_rows or [])), default="")
+    latest_total = _empty_stat_bucket()
+    latest_telegram = _empty_stat_bucket()
+    latest_poliwiki = _empty_stat_bucket()
+    if latest_date:
+        for row in comm_rows or []:
+            if str(row.get("date") or "") != latest_date:
+                continue
+            _add_comm_row(latest_total, row)
+            grp, _ = classify_sub_id(row.get("subId"))
+            if grp == "telegram":
+                _add_comm_row(latest_telegram, row)
+            elif grp == "poliwiki":
+                _add_comm_row(latest_poliwiki, row)
+
+    tagged_orders: List[Dict[str, Any]] = []
+    for it in order_rows or []:
+        grp, src_label = classify_sub_id(it.get("subId"))
+        tagged = dict(it)
+        tagged["channel_group"] = grp
+        tagged["source_label"] = src_label
+        tagged_orders.append(tagged)
+
+    return {
+        "total": total,
+        "telegram": telegram,
+        "poliwiki": poliwiki,
+        "other": other,
+        "tg_sources": active_tg_sources,
+        "latest_date": latest_date,
+        "latest_total": latest_total,
+        "latest_telegram": latest_telegram,
+        "latest_poliwiki": latest_poliwiki,
+        "tagged_orders": tagged_orders,
+    }
+
+
+def format_order_source_badge(sub_id: Optional[str]) -> str:
+    """주문 항목 한 줄 표기용 유입 출처 배지"""
+    grp, src_label = classify_sub_id(sub_id)
+    if grp == "telegram":
+        return f"✈️텔레그램·{src_label}"
+    if grp == "poliwiki":
+        return "🌐폴리위키"
+    return f"🔖{src_label}"
+
+
+def format_channel_split_block(stats: Dict[str, Any], heading: str) -> str:
+    """텔레그램 vs 폴리위키 분리 집계 HTML 블록 생성"""
+    tg = stats["telegram"]
+    pw = stats["poliwiki"]
+    ot = stats["other"]
+    lines = [
+        f"📡 <b>{heading}</b>",
+        f"• ✈️ 텔레그램(@HOTpang911): 클릭 <b>{tg['clicks']:,}회</b> / 주문 <b>{tg['orders']:,}건</b> / {tg['gmv']:,}원 (수익 <b>{tg['commission']:,}원</b>)",
+    ]
+    tg_sources = stats.get("tg_sources") or {}
+    if tg_sources:
+        src_parts = [
+            f"{src}: {v['clicks']:,}클릭·{v['orders']:,}건"
+            for src, v in tg_sources.items()
+        ]
+        lines.append(f"  └ {', '.join(src_parts)}")
+    lines.append(
+        f"• 🌐 폴리위키/미지정: 클릭 <b>{pw['clicks']:,}회</b> / 주문 <b>{pw['orders']:,}건</b> / {pw['gmv']:,}원 (수익 <b>{pw['commission']:,}원</b>)"
+    )
+    if any(ot[k] > 0 for k in ("clicks", "orders", "gmv", "commission")):
+        lines.append(
+            f"• 🔖 기타 채널: 클릭 <b>{ot['clicks']:,}회</b> / 주문 <b>{ot['orders']:,}건</b> / {ot['gmv']:,}원 (수익 <b>{ot['commission']:,}원</b>)"
+        )
+    return "\n".join(lines)
