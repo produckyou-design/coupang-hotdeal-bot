@@ -180,6 +180,12 @@ def status_text() -> str:
     )
 
 
+def build_deal_cta_button(url: str, price: int = 0) -> InlineKeyboardButton:
+    """채널 송출용 초록색(success) 쿠팡 CTA 버튼 생성"""
+    label = f"🛒 쿠팡에서 {price:,}원에 구매하기 ↗" if price >= 1000 else "🛒 쿠팡 특가 바로가기 ↗"
+    return InlineKeyboardButton(label, url=url, api_kwargs={"style": "success"})
+
+
 def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
     """할인율 구간별 강조 이모지 및 문구 반환"""
     if disc_rate >= 60:
@@ -539,7 +545,7 @@ async def post_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             badge="🍯 [오늘의 핫 꿀템 특가 테스트]",
         )
 
-        keyboard = [[InlineKeyboardButton("👉 최저가 특가 확인하기", url=p_url)]]
+        keyboard = [[build_deal_cta_button(p_url, p_price)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         if img_url:
@@ -711,7 +717,7 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_free_shipping=item.get("is_free_shipping", False),
         custom_note=item.get("custom_note"),
     )
-    keyboard = [[InlineKeyboardButton("👉 수량/옵션 및 최저가 확인하기", url=p_url)]]
+    keyboard = [[build_deal_cta_button(p_url, p_price)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
@@ -807,7 +813,7 @@ async def post_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_rocket=item.get("isRocket", True),
                 is_free_shipping=item.get("isFreeShipping", False),
             )
-            keyboard = [[InlineKeyboardButton("👉 수량/옵션 및 최저가 확인하기", url=p_url)]]
+            keyboard = [[build_deal_cta_button(p_url, p_price)]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
@@ -888,7 +894,7 @@ async def scheduled_morning_goldbox(bot):
                 is_rocket=item.get("isRocket", True),
                 is_free_shipping=item.get("isFreeShipping", False),
             )
-            keyboard = [[InlineKeyboardButton("👉 수량/옵션 및 최저가 확인하기", url=p_url)]]
+            keyboard = [[build_deal_cta_button(p_url, p_price)]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
@@ -980,7 +986,7 @@ async def check_and_publish_community_deals(bot) -> int:
             "※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
         )
 
-        keyboard = [[InlineKeyboardButton("👉 특가 혜택 및 수량 확인하기", url=deeplink)]]
+        keyboard = [[build_deal_cta_button(deeplink)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:

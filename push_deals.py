@@ -1064,14 +1064,18 @@ def send_telegram(
     photo_url: Optional[str] = None,
     button_text: Optional[str] = None,
     button_url: Optional[str] = None,
+    button_style: Optional[str] = None,
 ) -> bool:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "parse_mode": "HTML",
     }
     if button_text and button_url:
+        btn: Dict[str, Any] = {"text": button_text, "url": button_url}
+        if button_style:
+            btn["style"] = button_style
         payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": button_text, "url": button_url}]]
+            "inline_keyboard": [[btn]]
         }
 
     # 1. 사진이 있는 경우 sendPhoto 시도
@@ -1092,6 +1096,7 @@ def send_telegram(
     try:
         t_payload = dict(payload)
         t_payload["text"] = text
+        t_payload["link_preview_options"] = {"is_disabled": True}
         res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=t_payload, timeout=10
         ).json()
@@ -1572,7 +1577,7 @@ def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
     return "🏷️", "할인"
 
 
-def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
+def format_deal_message(clean_title: str, p_info: Dict[str, Any], deal_url: str = "") -> str:
     """검증된 가격 정보만으로 텔레그램 HTML 메시지 생성"""
     orig_p = p_info["orig_price"]
     best_price = p_info["final_price"]
@@ -1612,6 +1617,11 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
         price_lines.append(f"• <b>단가계산</b>: <b>{p_info['unit_info']}</b>")
 
     price_block = "\n".join(price_lines)
+    link_block = (
+        f'🔗 <b><a href="{html.escape(deal_url, quote=True)}">👉 쿠팡 특가 바로가기 (클릭)</a></b>\n\n'
+        if deal_url
+        else ""
+    )
     reaction_block = (
         f"💬 <b>커뮤니티 반응</b>: <code>{esc(p_info['reaction_text'])}</code>\n\n"
         if p_info["reaction_text"]
@@ -1623,6 +1633,7 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
         f"📌 <b>{esc(clean_title)}</b>\n\n"
         f"💵 <b>특가 정보</b>\n"
         f"{price_block}\n\n"
+        f"{link_block}"
         f"{reaction_block}"
         f"🚚 🚀 <b>로켓배송 / 무료배송</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1762,14 +1773,17 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         logger.error(f"딥링크 생성 실패: {e}")
         return False
 
-    msg = format_deal_message(clean_title, p_info)
+    msg = format_deal_message(clean_title, p_info, deal_url=deeplink)
+    btn_price = p_info["final_price"]
+    btn_text = f"🛒 쿠팡에서 {btn_price:,}원에 구매하기 ↗" if btn_price >= 1000 else "🛒 쿠팡 특가 바로가기 ↗"
 
     ok = send_telegram(
         chat_id=CHANNEL_ID,
         text=msg,
         photo_url=img_url,
-        button_text="👉 실시간 특가 및 수량 확인하기",
+        button_text=btn_text,
         button_url=deeplink,
+        button_style="success",
     )
 
     if ok:
@@ -1876,13 +1890,21 @@ def run_goldbox_staggered(seen: Set[str], quota: Dict[str, Any]) -> int:
             f"{unit_str}"
             f"• <b>카테고리</b>: {esc(cat)}\n"
             f"⏰ <b>특가시간</b>: 오늘 자정(24:00) 마감 또는 한정수량 소진 시 종료\n\n"
+            f'🔗 <b><a href="{html.escape(p_url, quote=True)}">👉 쿠팡 골드박스 바로가기 (클릭)</a></b>\n\n'
             f"🚚 🚀 <b>로켓배송 (내일 도착 보장)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>쿠팡 공식 엄선 당일 최저가 상품입니다.</i>\n"
             f"※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
         )
 
-        if send_telegram(CHANNEL_ID, msg, img_url, "👉 실시간 수량 및 최저가 확인", p_url):
+        if send_telegram(
+            CHANNEL_ID,
+            msg,
+            img_url,
+            f"🛒 쿠팡에서 {p_price:,}원에 구매하기 ↗",
+            p_url,
+            button_style="success",
+        ):
             sent += 1
             quota["goldbox_sent"] = int(quota.get("goldbox_sent", 0) or 0) + 1
             save_post_quota(quota)
