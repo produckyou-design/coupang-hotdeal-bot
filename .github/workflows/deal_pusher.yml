@@ -47,7 +47,7 @@ jobs:
         if: steps.check_pc.outputs.pc_active != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-kor
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-kor fonts-nanum
 
       - name: Install Dependencies
         if: steps.check_pc.outputs.pc_active != 'true'
@@ -71,5 +71,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_deals.json sales_tracker.json post_quota.json
+          for f in seen_deals.json sales_tracker.json post_quota.json flyer_queue.json; do
+            [ -f "$f" ] && git add "$f"
+          done
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update seen deals and sales tracker [skip ci]" && git push)

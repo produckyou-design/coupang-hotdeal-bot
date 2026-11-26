@@ -34,6 +34,12 @@ from coupang_api import (
     format_order_source_badge,
     summarize_partner_stats,
 )
+from flyer_renderer import (
+    build_card_chip,
+    format_flyer_caption_and_buttons,
+    render_hotdeal_flyer,
+    shorten_card_title,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -60,15 +66,23 @@ coupang_api = CoupangPartnersAPI()
 SEEN_FILE = os.path.join(BASE_DIR, "seen_deals.json")
 TRACKER_FILE = os.path.join(BASE_DIR, "sales_tracker.json")
 QUOTA_FILE = os.path.join(BASE_DIR, "post_quota.json")
+QUEUE_FILE = os.path.join(BASE_DIR, "flyer_queue.json")
 LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
-# 일일/회차별 송출 수량 제한 및 야간 방해금지 시간대 설정 (KST)
-DAILY_MAX_COMMUNITY_DEALS = 15
+# 일일/회차별 송출 수량 제한, 전단지 배치 및 야간 방해금지 설정 (KST)
+ENABLE_GOLDBOX = False
+DAILY_MAX_COMMUNITY_DEALS = 40
 GOLDBOX_PER_SLOT = 3
-DAILY_MAX_TOTAL_DEALS = 24
-MAX_COMMUNITY_PER_RUN = 3
+DAILY_MAX_TOTAL_DEALS = 44
+MAX_COMMUNITY_PER_RUN = 8
 MIN_COMMUNITY_INTERVAL_MINUTES = 0
+FLYER_BATCH_SIZE = 4
+FLYER_MAX_WAIT_MINUTES = 90
+FLYER_SOLO_WAIT_MINUTES = 150
+FLYER_URGENT_DISCOUNT_RATE = 55
+FLYER_URGENT_WAIT_MINUTES = 20
+FLYER_ITEM_TTL_HOURS = 6
 QUIET_HOURS_START = 0
 QUIET_HOURS_END = 7
 
@@ -196,6 +210,28 @@ def save_post_quota(q: Dict[str, Any]):
         os.replace(tmp_path, QUOTA_FILE)
     except Exception as e:
         logger.error(f"post_quota 저장 에러: {e}")
+
+
+def load_flyer_queue() -> List[Dict[str, Any]]:
+    if os.path.exists(QUEUE_FILE):
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+        except Exception:
+            pass
+    return []
+
+
+def save_flyer_queue(queue: List[Dict[str, Any]]):
+    try:
+        tmp_path = QUEUE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(queue, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, QUEUE_FILE)
+    except Exception as e:
+        logger.error(f"flyer_queue 저장 에러: {e}")
 
 
 def is_quiet_hours(now: Optional[datetime] = None) -> bool:
@@ -516,6 +552,7 @@ def clean_spec_title(t: str) -> str:
     t = re.sub(r"(?:최저가|가격\s*비교|가격변동|와우할인).*$", "", t)
     t = re.sub(r"[\d,]+원.*", "", t)
     t = re.sub(r"[|/·•].*$", "", t)
+    t = re.sub(r"\s*새\s*창\s*열림\s*", "", t)
     t = re.sub(r"\s+", " ", t).strip(" ,.-")
     if len(t) > 50:
         return ""
@@ -1118,6 +1155,35 @@ def send_telegram(
         return False
 
 
+def send_telegram_photo_bytes(
+    chat_id: str,
+    png_bytes: bytes,
+    caption: str,
+    inline_keyboard: Optional[List[List[Dict[str, Any]]]] = None,
+) -> bool:
+    """메모리 내 렌더링된 PNG 전단지 이미지를 멀티파트 sendPhoto로 전송"""
+    data: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if inline_keyboard:
+        data["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard}, ensure_ascii=False)
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+            data=data,
+            files={"photo": ("hotdeal_flyer.png", png_bytes, "image/png")},
+            timeout=15,
+        ).json()
+        if res.get("ok"):
+            return True
+        logger.warning(f"전단지 sendPhoto 응답 실패: {res.get('description') or res}")
+    except Exception as e:
+        logger.error(f"전단지 sendPhoto 전송 예외: {e}")
+    return False
+
+
 # ==========================================
 # 1. 루리웹 핫딜 수집기
 # ==========================================
@@ -1694,11 +1760,11 @@ def is_quality_hotdeal(
         return True, "ok"
 
     # Tier 2: 20~39% 구간은 커뮤니티 화력 검증 시 통과
-    if source_name == "arca" and (votes >= 2 or comments >= 5):
+    if source_name == "arca" and (votes >= 1 or comments >= 3):
         return True, "ok"
-    if source_name == "ruliweb" and (votes >= 1 or comments >= 3 or hits >= 1000):
+    if source_name == "ruliweb" and (votes >= 1 or comments >= 2 or hits >= 700):
         return True, "ok"
-    if source_name == "ppomppu" and (votes >= 2 or comments >= 5):
+    if source_name == "ppomppu" and (votes >= 1 or comments >= 3):
         return True, "ok"
 
     combined = f"{base_title}\n{body_text}"
@@ -1708,7 +1774,13 @@ def is_quality_hotdeal(
     return False, "wait"
 
 
-def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[str]) -> bool:
+def process_deal(
+    d: Dict[str, Any],
+    detail_parser,
+    source_name: str,
+    seen: Set[str],
+    flyer_queue: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
         return False
@@ -1786,6 +1858,39 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         logger.error(f"딥링크 생성 실패: {e}")
         return False
 
+    # 전단지 큐 모드: 검증 완료 즉시 큐에 적재하고 중복 방지를 위해 seen 기록
+    if flyer_queue is not None:
+        item = {
+            "deal_id": deal_id,
+            "product_id": product_id,
+            "source": source_name,
+            "clean_title": clean_title,
+            "short_title": shorten_card_title(clean_title),
+            "orig_price": int(p_info["orig_price"]),
+            "sale_price": int(p_info["final_price"]),
+            "discount_rate": int(p_info["discount_rate"]),
+            "unit_info": p_info.get("unit_info", ""),
+            "chip": build_card_chip(
+                clean_title,
+                int(p_info["orig_price"]),
+                int(p_info["final_price"]),
+                p_info.get("unit_info", ""),
+            ),
+            "deeplink": deeplink,
+            "img_url": img_url,
+            "queued_at": int(time.time()),
+        }
+        flyer_queue.append(item)
+        seen.add(deal_id)
+        mark_product_seen(product_id, seen)
+        save_seen(seen)
+        save_flyer_queue(flyer_queue)
+        logger.info(
+            f"📥 [{source_name}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
+            f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%)"
+        )
+        return True
+
     msg = format_deal_message(clean_title, p_info, deal_url=deeplink)
     btn_price = p_info["final_price"]
     btn_text = f"🛒 쿠팡에서 {btn_price:,}원에 구매하기 ↗" if btn_price >= 1000 else "🛒 쿠팡 특가 바로가기 ↗"
@@ -1811,6 +1916,134 @@ def process_deal(d: Dict[str, Any], detail_parser, source_name: str, seen: Set[s
         return True
 
     return False
+
+
+def _prune_flyer_queue(queue: List[Dict[str, Any]], cur_ts: float) -> bool:
+    """만료(TTL 초과) 또는 중복 product_id 항목 정리. 변경 시 True 반환"""
+    cutoff = cur_ts - FLYER_ITEM_TTL_HOURS * 3600
+    kept: List[Dict[str, Any]] = []
+    seen_pids: Set[str] = set()
+    seen_dids: Set[str] = set()
+    changed = False
+    for it in queue:
+        q_ts = int(it.get("queued_at", cur_ts) or cur_ts)
+        did = str(it.get("deal_id") or "")
+        pid = str(it.get("product_id") or "")
+        if q_ts < cutoff:
+            changed = True
+            continue
+        if (did and did in seen_dids) or (pid and pid in seen_pids):
+            changed = True
+            continue
+        if did:
+            seen_dids.add(did)
+        if pid:
+            seen_pids.add(pid)
+        kept.append(it)
+    if changed:
+        queue[:] = kept
+    return changed
+
+
+def should_flush_partial_queue(
+    queue: List[Dict[str, Any]],
+    now_dt: Optional[datetime] = None,
+    now_ts: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """4건 미만 부분 큐를 시간/긴급도/야간 진입 직전 조건에 따라 송출할지 판별"""
+    if not queue:
+        return False, "empty"
+    cur_dt = now_dt or datetime.now(KST)
+    cur_ts = time.time() if now_ts is None else now_ts
+
+    if len(queue) >= FLYER_BATCH_SIZE:
+        return True, "full_batch"
+    if cur_dt.hour == 23 and cur_dt.minute >= 30:
+        return True, "pre_quiet_flush"
+
+    oldest_ts = min(int(it.get("queued_at", cur_ts) or cur_ts) for it in queue)
+    age_sec = max(0.0, cur_ts - oldest_ts)
+
+    if any(int(it.get("discount_rate", 0) or 0) >= FLYER_URGENT_DISCOUNT_RATE for it in queue):
+        if age_sec >= FLYER_URGENT_WAIT_MINUTES * 60:
+            return True, "urgent_timeout"
+
+    if len(queue) >= 2 and age_sec >= FLYER_MAX_WAIT_MINUTES * 60:
+        return True, "multi_wait_timeout"
+
+    if len(queue) == 1 and age_sec >= FLYER_SOLO_WAIT_MINUTES * 60:
+        return True, "solo_wait_timeout"
+
+    return False, "waiting"
+
+
+def flush_flyer_queue(
+    queue: List[Dict[str, Any]],
+    quota: Dict[str, Any],
+    now_dt: Optional[datetime] = None,
+    now_ts: Optional[float] = None,
+) -> int:
+    """전단지 큐를 확인해 4건 묶음 또는 대기 초과분을 v5 빅타이포 전단지로 송출하고 송출 상품 수 반환"""
+    cur_dt = now_dt or datetime.now(KST)
+    cur_ts = time.time() if now_ts is None else now_ts
+
+    if _prune_flyer_queue(queue, cur_ts):
+        save_flyer_queue(queue)
+
+    if not queue:
+        return 0
+    if is_quiet_hours(cur_dt):
+        logger.info(f"🌙 [야간 대기] 전단지 큐 {len(queue)}건 오전 {QUIET_HOURS_END}시 송출 예정")
+        return 0
+
+    sent_deals = 0
+    while queue:
+        comm_cnt = int(quota.get("community_sent", 0) or 0)
+        gb_cnt = int(quota.get("goldbox_sent", 0) or 0)
+        budget = min(DAILY_MAX_COMMUNITY_DEALS - comm_cnt, DAILY_MAX_TOTAL_DEALS - comm_cnt - gb_cnt)
+        if budget <= 0:
+            logger.info("⏸️ [송출 제한] 일일 상한 도달로 전단지 송출 중단")
+            break
+
+        should_flush, flush_reason = should_flush_partial_queue(queue, now_dt=cur_dt, now_ts=cur_ts)
+        if not should_flush:
+            logger.info(f"📦 [전단지 대기] 현재 {len(queue)}/{FLYER_BATCH_SIZE}건 대기 중 (사유={flush_reason})")
+            break
+
+        take_n = min(FLYER_BATCH_SIZE, len(queue), budget)
+        ordered = sorted(
+            queue,
+            key=lambda x: (-int(x.get("discount_rate", 0) or 0), int(x.get("queued_at", 0) or 0)),
+        )
+        batch = ordered[:take_n]
+
+        try:
+            png_bytes = render_hotdeal_flyer(batch, coupang_api=coupang_api)
+            caption, inline_kb = format_flyer_caption_and_buttons(batch)
+        except Exception as e:
+            logger.error(f"전단지 렌더링 오류: {e}")
+            break
+
+        ok = send_telegram_photo_bytes(CHANNEL_ID, png_bytes, caption, inline_kb)
+        if not ok:
+            logger.warning("전단지 텔레그램 전송 실패 — 큐 유지 후 다음 회차 재시도")
+            break
+
+        batch_ids = {id(it) for it in batch}
+        queue[:] = [it for it in queue if id(it) not in batch_ids]
+        save_flyer_queue(queue)
+
+        quota["community_sent"] = comm_cnt + len(batch)
+        quota["last_community_ts"] = int(cur_ts)
+        save_post_quota(quota)
+
+        sent_deals += len(batch)
+        logger.info(
+            f"🖼️ [전단지 {len(batch)}선 송출 완료] (사유={flush_reason}, 금일={quota['community_sent']}/{DAILY_MAX_COMMUNITY_DEALS}, 잔여큐={len(queue)})"
+        )
+        time.sleep(2)
+
+    return sent_deals
 
 
 # ==========================================
@@ -2182,11 +2415,14 @@ def sync_git_state():
 
 
 def sync_git_push():
-    """로컬에서 신규 딜 송출 완료 시 깃허브로 즉시 push 동기화"""
+    """로컬에서 신규 딜 적재·송출 완료 시 깃허브로 즉시 push 동기화"""
     if os.getenv("GITHUB_ACTIONS"):
         return
     try:
-        subprocess.run(["git", "add", "seen_deals.json", "sales_tracker.json", "post_quota.json"], cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
+        files = [f for f in ("seen_deals.json", "sales_tracker.json", "post_quota.json", "flyer_queue.json") if os.path.exists(os.path.join(BASE_DIR, f))]
+        if not files:
+            return
+        subprocess.run(["git", "add"] + files, cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
         subprocess.run(
             ["git", "commit", "-m", "chore: sync seen deals from local runner [skip ci]"],
             cwd=BASE_DIR,
@@ -2211,17 +2447,24 @@ def main():
     update_pc_heartbeat()
     sync_git_state()
 
-    logger.info("🚀 핫딜 수집 및 송출 작업 시작 (20%+ 정밀 검증 · 일일 수량 제한 엔진)...")
+    logger.info("🚀 핫딜 수집 및 전단지 송출 작업 시작 (20%+ 정밀 검증 · 골드박스 제외 · v5 빅타이포 전단지)...")
     seen = load_seen()
     quota = load_post_quota()
+    flyer_queue = load_flyer_queue()
     total_sent = 0
-    comm_sent_this_run = 0
+    queued_this_run = 0
 
-    ok_comm, cap_reason = can_send_community_now(quota, comm_sent_this_run)
-    if not ok_comm:
+    daily_comm_room = min(
+        DAILY_MAX_COMMUNITY_DEALS - int(quota.get("community_sent", 0) or 0),
+        DAILY_MAX_TOTAL_DEALS - int(quota.get("community_sent", 0) or 0) - int(quota.get("goldbox_sent", 0) or 0),
+    )
+
+    if is_quiet_hours():
+        logger.info("🌙 [야간 방해금지] 00:00~07:00 구간 — 커뮤니티 수집 및 송출 생략")
+    elif daily_comm_room <= len(flyer_queue):
         logger.info(
-            f"⏸️ [송출 제한] 사유={cap_reason} (금일 커뮤니티={quota['community_sent']}/{DAILY_MAX_COMMUNITY_DEALS}, "
-            f"골드박스={quota['goldbox_sent']}) — 이번 회차 커뮤니티 송출 생략"
+            f"⏸️ [송출 제한] 금일 커뮤니티 한도 도달 또는 대기큐 포화 "
+            f"(송출={quota['community_sent']}/{DAILY_MAX_COMMUNITY_DEALS}, 큐={len(flyer_queue)})"
         )
     else:
         for collector, parser, source_name in (
@@ -2229,31 +2472,31 @@ def main():
             (collect_ppomppu_deals, parse_ppomppu_detail, "ppomppu"),
             (collect_arcalive_deals, parse_arcalive_detail, "arca"),
         ):
-            if not can_send_community_now(quota, comm_sent_this_run)[0]:
+            if queued_this_run >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= daily_comm_room:
                 break
             for d in collector():
-                if not can_send_community_now(quota, comm_sent_this_run)[0]:
+                if queued_this_run >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= daily_comm_room:
                     break
-                if process_deal(d, parser, source_name, seen):
-                    total_sent += 1
-                    comm_sent_this_run += 1
-                    quota["community_sent"] = int(quota.get("community_sent", 0) or 0) + 1
-                    quota["last_community_ts"] = int(time.time())
-                    save_post_quota(quota)
+                if process_deal(d, parser, source_name, seen, flyer_queue=flyer_queue):
+                    queued_this_run += 1
 
-    # 4. 시간대 분산 로켓 골드박스 (아침/점심/저녁 각 3건, 야간 차단)
-    total_sent += run_goldbox_staggered(seen, quota)
+    # 전단지 큐 플러시 (4건 모이면 즉시, 미만 시 대기 타임아웃/긴급할인 조건에 따라 송출)
+    total_sent += flush_flyer_queue(flyer_queue, quota)
 
-    # 6. 최근 4일 주문 집계 감지 및 마일스톤 알림
+    # 골드박스: 메리트 부족으로 기본 비활성화 (--force-goldbox 수동 호출 또는 ENABLE_GOLDBOX=True 시만 동작)
+    if ENABLE_GOLDBOX or "--force-goldbox" in sys.argv:
+        total_sent += run_goldbox_staggered(seen, quota)
+
+    # 최근 4일 주문 집계 감지 및 마일스톤 알림
     check_and_notify_sales()
 
-    # 7. 밤 23시 일일·월간 결산 리포트 (하루 1회만 발송)
+    # 밤 23시 일일·월간 결산 리포트 (하루 1회만 발송)
     total_sent += run_daily_report_if_night(seen)
 
-    if total_sent > 0:
+    if total_sent > 0 or queued_this_run > 0:
         sync_git_push()
 
-    logger.info(f"🎉 모든 작업 완료! (새로 송출된 핫딜 총 {total_sent}건)")
+    logger.info(f"🎉 모든 작업 완료! (금회 전단지 큐 적재 {queued_this_run}건 / 채널 송출 {total_sent}건)")
 
 
 if __name__ == "__main__":
