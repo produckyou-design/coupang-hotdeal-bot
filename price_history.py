@@ -124,11 +124,35 @@ _COUNT_UNIT_TIER2 = {"팩", "박스", "상자", "묶음", "세트"}
 _COUNT_UNIT_CANON = {"개입": "개", "입": "개", "봉지": "봉", "페트": "병"}
 _ALL_COUNT_UNITS = _COUNT_UNIT_TIER1 | _COUNT_UNIT_TIER2
 _ALL_COUNT_UNIT_ALT = "개입|개|봉지|봉|병|캔|팩|입|롤|매|정|캡슐|포|페트|알|통|박스|상자|묶음|세트"
+_NUM_COMMAS_RE = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
+
+_PURCHASE_LIMIT_INLINE_RE = re.compile(
+    rf"(?:"
+    rf"(?:1\s*인(?:\s*당)?|인당|계정당|아이디당|id\s*당|주문당|1\s*회당)\s*(?:(?:1\s*회|1\s*일|일일|당일|최대)\s*){{0,2}}\d+\s*(?:{_ALL_COUNT_UNIT_ALT})(?:\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하))?"
+    rf"|최대\s*\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하)"
+    rf"|\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:(?:구매|주문|수량)\s*(?:제한|한정)|제한)"
+    rf")",
+    re.IGNORECASE,
+)
+
+
+def strip_purchase_limit_phrases(text: str) -> str:
+    """'1인 2박스 구매 제한', '계정당 최대 2개 한정' 등 구매 수량 제한 절만 제거(괄호 내 정상 구성은 보존)."""
+    if not text:
+        return ""
+    s = _PURCHASE_LIMIT_INLINE_RE.sub(" ", text)
+    s = re.sub(r"\(\s*[,/·\-]+\s*", "(", s)
+    s = re.sub(r"\s*[,/·\-]+\s*\)", ")", s)
+    s = re.sub(r"\[\s*[,/·\-]+\s*", "[", s)
+    s = re.sub(r"\s*[,/·\-]+\s*\]", "]", s)
+    s = re.sub(r"\(\s*\)|\[\s*\]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 
 _AMBIGUOUS_OPTION_PATTERNS = (
     re.compile(r"(?:택\s*\d|택일|중\s*택|선택\s*가능|옵션\s*선택|옵션별|구성별|종류별|골라담기)"),
     re.compile(
-        rf"\d+(?:\.\d+)?\s*(?:{_ALL_COUNT_UNIT_ALT}|kg|g|ml|l|리터|킬로)\s*(?:또는|혹은|\bor\b)\s*\d+",
+        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:{_ALL_COUNT_UNIT_ALT}|kg|g|ml|l|리터|킬로)\s*(?:또는|혹은|\bor\b)\s*{_NUM_COMMAS_RE}",
         re.IGNORECASE,
     ),
     re.compile(
@@ -136,11 +160,11 @@ _AMBIGUOUS_OPTION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\d+(?:\.\d+)?\s*(?:ml|l|리터)\s*(?:~|/)\s*\d+(?:\.\d+)?\s*(?:ml|l|리터)\b",
+        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\d+(?:\.\d+)?\s*(?:kg|g|킬로)\s*(?:~|/)\s*\d+(?:\.\d+)?\s*(?:kg|g|킬로)\b",
+        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\b",
         re.IGNORECASE,
     ),
 )
@@ -151,10 +175,103 @@ _AMBIGUOUS_PRICE_RE = re.compile(
     r"|카드\s*(?:할인|청구)\s*(?:포함|적용|시)\s*[\d,]+\s*원"
 )
 
+_PAIR_NOISE_THRESHOLD_RE = re.compile(
+    r"\d[\d,]*\s*(?:원|만\s*원)\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?(?:무료배송|무배|배송비\s*무료|무료)",
+    re.IGNORECASE,
+)
+_PAIR_NOISE_UNIT_PRICE_RE = re.compile(
+    rf"(?:\d+(?:\.\d+)?\s*)?(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*당\s*(?:약\s*)?\d[\d,]*\s*원",
+    re.IGNORECASE,
+)
+_PAIR_NOISE_FORWARD_SHIP_RE = re.compile(
+    rf"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*(?:{_NUM_COMMAS_RE}[ \t]*원|무료|0[ \t]*원|없음|별도|착불|포함|제외|있음)",
+    re.IGNORECASE,
+)
+_PAIR_NOISE_REVERSE_SHIP_RE = re.compile(
+    rf"{_NUM_COMMAS_RE}[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)",
+    re.IGNORECASE,
+)
 
-def has_ambiguous_option_or_price(title: str, body_text: str = "") -> Tuple[bool, str]:
-    """제목 및 본문에서 다중 옵션 선택(택1/A 또는 B)이나 비확정 가격(~원부터/체감가)을 감지."""
-    text = re.sub(r"\s+", " ", f"{title or ''} {body_text or ''}").strip()
+_OPTION_PRICE_PAIR_RE = re.compile(
+    rf"(?:"
+    rf"(?<![0-9,.])(?P<wv_num>{_NUM_COMMAS_RE}(?:\.\d+)?)\s*(?P<wv_unit>kg|g|ml|l|리터|킬로)(?![a-zA-Z])"
+    rf"|(?<![0-9,.])(?P<cnt_num>\d{{1,4}})\s*(?P<cnt_unit>{_ALL_COUNT_UNIT_ALT})"
+    rf")"
+    rf"(?!\s*당)(?!\s*(?:무료|이상|미만|배송|택배|착불))"
+    rf"(?:(?:은|는|이|가|에|의|짜리|들이)?"
+    rf"(?:\s*(?:기준(?:으로)?|짜리|옵션|구성|가격|판매가|할인가|특가))?"
+    rf"(?:\s*(?:은|는|이|가|에))?"
+    rf"\s*(?:->|=>|→|➡️?|[:：=\-(\[~])?\s*)"
+    rf"(?P<price>\d{{1,3}}(?:,\d{{3}})+|\d{{4,7}})\s*원",
+    re.IGNORECASE,
+)
+
+
+def _canon_pair_spec_key(num_s: str, unit_s: str, is_wv: bool) -> Tuple[str, str, int]:
+    ul = unit_s.lower()
+    if is_wv:
+        val = float(num_s.replace(",", ""))
+        if ul in ("kg", "킬로"):
+            return f"wt:{_fmt_spec_num(val * 1000.0)}g", "wt", int(round(val * 1000))
+        if ul == "g":
+            return f"wt:{_fmt_spec_num(val)}g", "wt", int(round(val))
+        if ul in ("l", "리터"):
+            return f"vol:{_fmt_spec_num(val * 1000.0)}ml", "vol", int(round(val * 1000))
+        return f"vol:{_fmt_spec_num(val)}ml", "vol", int(round(val))
+    canon_u = _COUNT_UNIT_CANON.get(ul, ul)
+    n = int(num_s)
+    return f"cnt:{canon_u}:{n}", f"cnt_t{_unit_tier(canon_u)}", n
+
+
+def _extract_option_price_pairs(text: str) -> List[Tuple[str, str, int, int]]:
+    """텍스트에서 '(구성키, 단위군, 수치, 가격원)' 목록 추출 (배송비 선제거 후 역순 배송비 제거로 인접 상품값 보존)."""
+    if not text:
+        return []
+    cleaned = strip_purchase_limit_phrases(text)
+    cleaned = _PAIR_NOISE_THRESHOLD_RE.sub(" ", cleaned)
+    cleaned = _PAIR_NOISE_UNIT_PRICE_RE.sub(" ", cleaned)
+    cleaned = _PAIR_NOISE_FORWARD_SHIP_RE.sub(" ", cleaned)
+    cleaned = _PAIR_NOISE_REVERSE_SHIP_RE.sub(" ", cleaned)
+    pairs: List[Tuple[str, str, int, int]] = []
+    for m in _OPTION_PRICE_PAIR_RE.finditer(cleaned):
+        price = int(m.group("price").replace(",", ""))
+        if price < 1000:
+            continue
+        if m.group("wv_num"):
+            spec_k, fam, mag = _canon_pair_spec_key(m.group("wv_num"), m.group("wv_unit"), is_wv=True)
+        else:
+            spec_k, fam, mag = _canon_pair_spec_key(m.group("cnt_num"), m.group("cnt_unit"), is_wv=False)
+        pairs.append((spec_k, fam, mag, price))
+    return pairs
+
+
+def _extract_bundle_total_t1_count(clean_title: str) -> Optional[int]:
+    s = _PAREN_TOTAL_SUMMARY_RE.sub(" ", clean_title or "")
+    s = _DUP_PAREN_COUNT_RE.sub(r"\1\2", s)
+    s = re.sub(r"[\[\]\(\)]", " ", s)
+    toks = [
+        (int(m.group(1)), m.group(2), m.start(), m.end())
+        for m in _COUNT_ONLY_TOKEN_RE.finditer(s)
+        if int(m.group(1)) >= 2
+    ]
+    if len(toks) == 2:
+        (n1, u1, _s1, e1), (n2, u2, s2, _e2) = toks
+        if _unit_tier(u1) == 1 and _unit_tier(u2) == 2:
+            return n1 * n2
+        if re.match(r"^\s*[x×*]\s*$", s[e1:s2]):
+            return n1 * n2
+    return None
+
+
+def has_ambiguous_option_or_price(
+    title: str,
+    body_text: str = "",
+    sale_price: int = 0,
+) -> Tuple[bool, str]:
+    """제목 및 본문에서 다중 옵션 선택(택1/수량별 가격 쌍/제목-본문 불일치)이나 비확정 가격 감지."""
+    clean_title = strip_purchase_limit_phrases(title or "")
+    clean_body = strip_purchase_limit_phrases(body_text or "")
+    text = re.sub(r"\s+", " ", f"{clean_title} {clean_body}").strip()
     if not text:
         return False, ""
     if _AMBIGUOUS_PRICE_RE.search(text):
@@ -162,6 +279,38 @@ def has_ambiguous_option_or_price(title: str, body_text: str = "") -> Tuple[bool
     for pat in _AMBIGUOUS_OPTION_PATTERNS:
         if pat.search(text):
             return True, "ambiguous_option"
+
+    body_pairs = _extract_option_price_pairs(clean_body)
+    distinct_body = {(sk, pr) for sk, _fam, _mag, pr in body_pairs}
+    if len(distinct_body) >= 2:
+        return True, "ambiguous_option_price_pairs"
+
+    title_pairs = _extract_option_price_pairs(clean_title)
+    if not title_pairs and sale_price >= 1000:
+        cleaned_t = re.sub(r"[\[\]\(\)]", " ", _PAREN_TOTAL_SUMMARY_RE.sub(" ", clean_title))
+        for cm in _COUNT_ONLY_TOKEN_RE.finditer(cleaned_t):
+            cnt = int(cm.group(1))
+            if cnt >= 2:
+                sk, fam, mag = _canon_pair_spec_key(cm.group(1), cm.group(2), is_wv=False)
+                title_pairs.append((sk, fam, mag, int(sale_price)))
+        for wm in _WEIGHT_VOL_SPEC_RE.finditer(cleaned_t):
+            sk, fam, mag = _canon_pair_spec_key(wm.group(1), wm.group(2), is_wv=True)
+            title_pairs.append((sk, fam, mag, int(sale_price)))
+
+    bundle_total = _extract_bundle_total_t1_count(clean_title)
+    if bundle_total is not None:
+        ref_price = int(sale_price) if sale_price >= 1000 else (title_pairs[0][3] if title_pairs else 0)
+        if ref_price >= 1000:
+            title_pairs.append((f"cnt:total:{bundle_total}", "cnt_t1", bundle_total, ref_price))
+
+    if body_pairs and title_pairs:
+        for b_sk, b_fam, b_mag, b_pr in body_pairs:
+            for t_sk, t_fam, t_mag, t_pr in title_pairs:
+                if b_fam == t_fam and b_mag == t_mag and b_pr != t_pr:
+                    return True, "title_body_price_conflict"
+                if b_fam == t_fam and b_mag != t_mag and b_pr == t_pr:
+                    return True, "title_body_option_conflict"
+
     return False, ""
 
 
@@ -177,7 +326,7 @@ def normalize_observed_shipping_type(shipping_type: str, shipping_fee: int = 0) 
 
 
 _PAREN_TOTAL_SUMMARY_RE = re.compile(
-    rf"\(\s*(?:총|합계|전체|약)\s*[\d.,]+\s*(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*\)",
+    rf"\(\s*(?:총|합계|전체|약)\s*(?:{_NUM_COMMAS_RE}(?:\.\d+)?)\s*(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*\)",
     re.IGNORECASE,
 )
 _DUP_PAREN_COUNT_RE = re.compile(
@@ -185,16 +334,16 @@ _DUP_PAREN_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _WEIGHT_VOL_SPEC_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)\b",
+    rf"(?<![0-9,])({_NUM_COMMAS_RE}(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)\b",
     re.IGNORECASE,
 )
 _PACK_MULTI_TOKEN_RE = re.compile(
-    rf"(?:([x×*])\s*(\d+)(?:\s*({_ALL_COUNT_UNIT_ALT}))?"
-    rf"|(\d+)\s*({_ALL_COUNT_UNIT_ALT}))\b",
+    rf"(?:([x×*])\s*(\d+)(?:\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))?"
+    rf"|(\d+)\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))",
     re.IGNORECASE,
 )
 _COUNT_ONLY_TOKEN_RE = re.compile(
-    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})\b",
+    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣])",
     re.IGNORECASE,
 )
 
@@ -215,7 +364,8 @@ def _unit_tier(u: str) -> int:
 
 
 def _clean_title_for_unit_parse(title: str) -> Tuple[str, List[Tuple[int, int]]]:
-    s = _PAREN_TOTAL_SUMMARY_RE.sub(" ", title or "")
+    s = strip_purchase_limit_phrases(title or "")
+    s = _PAREN_TOTAL_SUMMARY_RE.sub(" ", s)
     s = _DUP_PAREN_COUNT_RE.sub(r"\1\2", s)
     paren_spans = [(m.start(), m.end()) for m in re.finditer(r"\([^\)]*\)|\[[^\]]*\]", s)]
     spaced = re.sub(r"[\[\]\(\)]", " ", s)
@@ -235,7 +385,7 @@ def compute_effective_unit_metrics(
     if not title or not isinstance(total_price, (int, float)) or total_price < 1000:
         return {}
 
-    is_ambig, _ = has_ambiguous_option_or_price(title, body_text)
+    is_ambig, _ = has_ambiguous_option_or_price(title, body_text, sale_price=0)
     if is_ambig:
         return {}
 
@@ -245,7 +395,7 @@ def compute_effective_unit_metrics(
     specs: List[Tuple[str, float, re.Match]] = []
     seen_specs = set()
     for m in _WEIGHT_VOL_SPEC_RE.finditer(text):
-        val = float(m.group(1))
+        val = float(m.group(1).replace(",", ""))
         unit = m.group(2).lower()
         if unit in ("kg", "킬로"):
             fam, base_val = "wt", round(val * 1000.0, 3)

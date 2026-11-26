@@ -10,6 +10,12 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    from price_history import strip_purchase_limit_phrases
+except Exception:
+    def strip_purchase_limit_phrases(text: str) -> str:
+        return text or ""
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
@@ -302,9 +308,10 @@ def extract_unit_part(clean_title: str, unit_info: str = "") -> str:
         return ""
     m_first = re.match(r"^([^\(]+)", clean_unit)
     part = (m_first.group(1) if m_first else clean_unit).replace("약 ", "").strip()
+    clean_for_cnt = strip_purchase_limit_phrases(clean_title or "")
     counts = re.findall(
         r"(\d+)\s*(개입|개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|정|캡슐)(?![a-zA-Z])",
-        clean_title,
+        clean_for_cnt,
     )
     if counts:
         c_val, c_u = counts[-1]

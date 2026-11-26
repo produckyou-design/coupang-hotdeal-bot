@@ -53,6 +53,7 @@ from price_history import (
     has_ambiguous_option_or_price,
     is_comparable_option_key,
     normalize_observed_shipping_type,
+    strip_purchase_limit_phrases,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -704,7 +705,9 @@ def clean_display_title(raw_title: str) -> str:
         )
     # 슬래시 구분 가격 꼬리표 제거: / 9,370원(로켓 무료배송) / 11% 세일, /17,220원 와우 무료배송
     t = re.sub(r"\s*/\s*[\d,]+\s*원.*$", "", t)
-    # 끝에 단독으로 붙은 가격+무배 꼬리표 제거: 66030원
+    # 끝에 단독으로 붙은 배송비·가격 꼬리표 제거: 17,900원 배송비 3,000원 / 66030원
+    t = re.sub(r"\s*(?:유료배송|배송비|택배비|배송료)\s*[:：\+\-]?\s*\d[\d,]*\s*원\s*$", "", t)
+    t = re.sub(r"\s+\d[\d,]*\s*원\s*(?:배송비|택배비|배송료)\s*$", "", t)
     t = re.sub(r"\s+\d[\d,]{3,}\s*원(?:\s*(?:와우|무료|무배|로켓)\S*)*\s*$", "", t)
     t = re.sub(r"\s+", " ", t).strip(" /,-")
     return t if len(t) >= 2 else raw_title.strip()
@@ -788,14 +791,15 @@ def compute_unit_pricing(name: str, price: int) -> str:
     if re.search(r"\d+\s*(?:gb|tb|mah|wh|w|hz)\b", low_name):
         return ""
 
+    clean_name = strip_purchase_limit_phrases(name)
     counts = re.findall(
         r"(\d+)\s*(개입|개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|정|캡슐|알)(?![a-zA-Z])",
-        name,
+        clean_name,
         re.IGNORECASE,
     )
     weights = re.findall(
-        r"(\d+(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)(?![a-zA-Z])",
-        name,
+        r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)(?![a-zA-Z])",
+        clean_name,
         re.IGNORECASE,
     )
 
@@ -821,7 +825,7 @@ def compute_unit_pricing(name: str, price: int) -> str:
     total_amount = 0.0
     amount_unit = "g"
     if weights:
-        w_val = float(weights[0][0])
+        w_val = float(weights[0][0].replace(",", ""))
         w_u = weights[0][1].lower()
         if w_u in ("kg", "킬로"):
             single_amount = w_val * 1000
@@ -902,9 +906,12 @@ _SHIPPING_THRESHOLD_SPAN_RE = re.compile(
     r"(?:\s*(?:구매|주문)?\s*(?:시\s*)?(?:무료배송|무배|배송비\s*무료|무료|할인|적용)?)?",
     re.IGNORECASE,
 )
-_SHIPPING_FEE_SPAN_RE = re.compile(
-    r"(?:(?:유료배송|배송비|택배비|배송료|운송비)\s*[:：\s+\-]*\d[\d,\.\s]*원"
-    r"|\d[\d,\.\s]*원\s*(?:배송비|택배비|배송료))",
+_SHIPPING_FEE_FORWARD_RE = re.compile(
+    r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*\d[\d,\. \t]*원",
+    re.IGNORECASE,
+)
+_SHIPPING_FEE_REVERSE_RE = re.compile(
+    r"\d[\d,\. \t]*원[ \t]*(?:배송비(?![ \t]*(?:무료|0[ \t]*원|없음))|택배비|배송료|운송비)",
     re.IGNORECASE,
 )
 
@@ -925,9 +932,11 @@ def _strip_pair_ship_fee(m: re.Match) -> str:
 
 
 def _strip_shipping_and_threshold_phrases(text: str) -> str:
-    """배송비·무료배송 기준 금액('29,800원 이상 무료배송', '배송비 3,000원', '(12,000/3,000)') 제거"""
+    """배송비·무료배송 기준 금액('29,800원 이상 무료배송', '배송비 3,000원', '(3,000원 배송비)', '(12,000/3,000)') 순차 제거"""
     s = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", text or "")
-    s = _SHIPPING_FEE_SPAN_RE.sub(" ", s)
+    s = _SHIPPING_FEE_FORWARD_RE.sub(" ", s)
+    s = re.sub(r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:무료|0[ \t]*원|없음|별도|착불)", " ", s)
+    s = _SHIPPING_FEE_REVERSE_RE.sub(" ", s)
     s = re.sub(
         r"([\(\[])([^\)\]/\r\n]+)(\s*/\s*)([^\)\]/\r\n]*\d[\d,]*\s*원?[^\)\]/\r\n]*)([\)\]])",
         _strip_pair_ship_fee,
@@ -1076,7 +1085,8 @@ def parse_shipping_details(
     uncond_scan = _MEMBER_FREE_SPAN_RE.sub(" ", uncond_scan)
     uncond_scan = _RESTRICTED_FREE_RE.sub(" ", uncond_scan)
     uncond_scan = _QTY_FREE_RE.sub(" ", uncond_scan)
-    uncond_scan = _SHIPPING_FEE_SPAN_RE.sub(" ", uncond_scan)
+    uncond_scan = _SHIPPING_FEE_FORWARD_RE.sub(" ", uncond_scan)
+    uncond_scan = _SHIPPING_FEE_REVERSE_RE.sub(" ", uncond_scan)
     has_unconditional_free = (shipping_fee == 0 and not has_paid_text and not has_negated_free) and bool(
         re.search(r"로켓\s*무료배송|로켓\s*무배|로켓무배|무료배송|무배|배송비\s*무료|배송비\s*0\s*원|/\s*무료(?:\s*[\)\]]|$)|\(\s*무료\s*\)", uncond_scan)
     )
@@ -2487,7 +2497,7 @@ def evaluate_deal_quality(
     ship_type = str(p_info.get("shipping_type") or "")
     total_p = final_p + ship_fee if ship_fee > 0 else final_p
 
-    is_ambig, _ = has_ambiguous_option_or_price(base_title, body_text)
+    is_ambig, _ = has_ambiguous_option_or_price(base_title, body_text, sale_price=final_p)
     obs_ship_type = normalize_observed_shipping_type(ship_type, ship_fee)
     unit_metrics = compute_effective_unit_metrics(base_title, total_p, body_text=body_text)
     effective_unit_display = str(unit_metrics.get("display_unit") or "")
