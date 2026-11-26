@@ -9,7 +9,7 @@ import socket
 import sys
 import time as _time
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Windows 콘솔 utf-8 설정
 sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding="utf-8", errors="replace")
@@ -180,6 +180,21 @@ def status_text() -> str:
     )
 
 
+def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
+    """할인율 구간별 강조 이모지 및 문구 반환"""
+    if disc_rate >= 60:
+        return "🚨", "폭탄할인"
+    if disc_rate >= 50:
+        return "💥", "반값특가"
+    if disc_rate >= 40:
+        return "⚡", "파격할인"
+    if disc_rate >= 30:
+        return "🔥", "특가할인"
+    if disc_rate >= 20:
+        return "🏷️", "알뜰할인"
+    return "🏷️", "할인"
+
+
 def format_deal_message(
     title: str,
     price: int,
@@ -199,11 +214,13 @@ def format_deal_message(
         header_parts.append(f"📂 {category}")
     header_str = " | ".join(header_parts)
 
-    discount_text = ""
     discount_rate = 0
+    disc_html = ""
     if original_price and original_price > price:
         discount_rate = round((original_price - price) / original_price * 100)
-        discount_text = f" 🔥 **{discount_rate}% 파격할인!** (~{original_price:,}원~)"
+        badge_emoji, badge_label = get_discount_badge(discount_rate)
+        suffix = "" if badge_label == "할인" else "!"
+        disc_html = f" {badge_emoji} <b>{discount_rate}% {badge_label}{suffix}</b> (<s>{original_price:,}원</s>)"
 
     # 배송 혜택
     shipping_badges = []
@@ -223,7 +240,6 @@ def format_deal_message(
 
     # shipping 뱃지 HTML 변환
     ship_html = esc(shipping_str)
-    disc_html = f" 🔥 <b>{discount_rate}% 파격할인!</b> (<s>{original_price:,}원</s>)" if (original_price and original_price > price) else ""
 
     msg = (
         f"{header_str}\n\n"

@@ -1557,6 +1557,21 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 # 4. 핫딜 송출 엔진
 # ==========================================
+def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
+    """할인율 구간별 강조 이모지 및 문구 반환"""
+    if disc_rate >= 60:
+        return "🚨", "폭탄할인"
+    if disc_rate >= 50:
+        return "💥", "반값특가"
+    if disc_rate >= STRONG_HOTDEAL_DISCOUNT_RATE:
+        return "⚡", "파격할인"
+    if disc_rate >= 30:
+        return "🔥", "특가할인"
+    if disc_rate >= MIN_HOTDEAL_DISCOUNT_RATE:
+        return "🏷️", "알뜰할인"
+    return "🏷️", "할인"
+
+
 def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
     """검증된 가격 정보만으로 텔레그램 HTML 메시지 생성"""
     orig_p = p_info["orig_price"]
@@ -1575,7 +1590,8 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
 
     header_line = "🔥 <b>[실시간 검증 특가]</b>"
     if MIN_HOTDEAL_DISCOUNT_RATE <= disc_rate <= 85 and orig_p > best_price > 0:
-        header_line = f"🔥 <b>[{disc_rate}% 파격할인] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {best_price:,}원!</b>"
+        badge_emoji, badge_label = get_discount_badge(disc_rate)
+        header_line = f"{badge_emoji} <b>[{disc_rate}% {badge_label}] 정상가 <s>{orig_p:,}원</s> ➡️ 특가 {best_price:,}원!</b>"
 
     price_lines = []
     if orig_p > best_price > 0:
@@ -1583,7 +1599,11 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any]) -> str:
         price_lines.append(f"• <b>정상가격</b>: <s>{orig_p:,}원</s> (<b>{save_amt:,}원 절약!</b>)")
 
     if best_price > 0:
-        disc_text = f" (🔥 <b>{disc_rate}% 할인</b>)" if (3 <= disc_rate <= 85 and orig_p > best_price) else ""
+        if 3 <= disc_rate <= 85 and orig_p > best_price:
+            badge_emoji, _ = get_discount_badge(disc_rate)
+            disc_text = f" ({badge_emoji} <b>{disc_rate}% 할인</b>)"
+        else:
+            disc_text = ""
         price_lines.append(f"• <b>최종특가</b>: <b>{best_price:,}원</b>{disc_text}")
     else:
         price_lines.append("• <b>최종특가</b>: <b>한정수량 최저가</b>")
