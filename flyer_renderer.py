@@ -313,15 +313,96 @@ def extract_unit_part(clean_title: str, unit_info: str = "") -> str:
     return part
 
 
-def build_card_chip(clean_title: str, orig_price: int, sale_price: int, unit_info: str = "") -> str:
-    """전단지 카드용 굵은 초록 칩 문구 (단가 우선, 없으면 절약금액/로켓 무료배송)"""
+def resolve_shipping_label(deal: Dict[str, Any]) -> str:
+    """원문 근거가 확인된 배송 라벨 반환 (근거 없는 기존 큐/미확인 항목은 빈 문자열)"""
+    lbl = str(deal.get("shipping_label") or "").strip()
+    if lbl:
+        return lbl
+    fee = int(deal.get("shipping_fee", 0) or 0)
+    cond = str(deal.get("shipping_condition") or "").strip()
+    if fee > 0 and cond:
+        return f"배송비 {fee:,}원 ({cond.replace('무료배송', '무료')})"
+    if cond:
+        return cond
+    if fee > 0:
+        return f"배송비 {fee:,}원"
+    return ""
+
+
+_CONDITIONAL_SHIP_TOKENS = ("이상", "와우", "회원", "만", "전용", "한정", "제외", "일부")
+_NON_FREE_SHIP_TOKENS = ("배송비", "착불", "별도") + _CONDITIONAL_SHIP_TOKENS
+
+
+def _shipping_pill_colors(label: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    if any(k in label for k in ("배송비", "착불", "별도")):
+        return (254, 243, 199), (180, 83, 9)
+    if any(k in label for k in _CONDITIONAL_SHIP_TOKENS):
+        return (238, 242, 255), (67, 56, 202)
+    return (219, 234, 254), (29, 78, 216)
+
+
+def _draw_row_badges(
+    draw: ImageDraw.ImageDraw,
+    x1: int,
+    y: int,
+    max_x2: int,
+    ship_label: str,
+    extra_chip: str,
+    extra_bg: Tuple[int, int, int],
+    extra_fg: Tuple[int, int, int],
+    hv_font: Optional[str],
+    base_sz: int = 30,
+    pad_x: int = 18,
+    pad_y: int = 10,
+    radius: int = 12,
+) -> bool:
+    """배송 배지(있는 경우만)와 단가/절약 배지를 겹침 없이 한 줄에 배치"""
+    cur_x = x1
+    avail = max(80, max_x2 - cur_x)
+    if ship_label:
+        s_bg, s_fg = _shipping_pill_colors(ship_label)
+        f_ship = _fit_font(draw, ship_label, hv_font, base_sz, avail - pad_x * 2, min_size=20)
+        pw_ship, _ = _draw_pill(draw, cur_x, y, ship_label, f_ship, bg=s_bg, fg=s_fg, pad_x=pad_x, pad_y=pad_y, radius=radius)
+        cur_x += pw_ship + 12
+
+    if extra_chip:
+        rem = (max_x2 - cur_x) - pad_x * 2
+        if rem >= 80:
+            f_ex = _load_font(hv_font, base_sz)
+            if cur_x == x1:
+                f_ex = _fit_font(draw, extra_chip, hv_font, base_sz, rem, min_size=22)
+                _draw_pill(draw, cur_x, y, extra_chip, f_ex, bg=extra_bg, fg=extra_fg, pad_x=pad_x, pad_y=pad_y, radius=radius)
+                return True
+            if _text_size(draw, extra_chip, f_ex)[0] <= rem:
+                _draw_pill(draw, cur_x, y, extra_chip, f_ex, bg=extra_bg, fg=extra_fg, pad_x=pad_x, pad_y=pad_y, radius=radius)
+            elif rem >= 120:
+                f_ex_fit = _fit_font(draw, extra_chip, hv_font, base_sz - 2, rem, min_size=20)
+                if _text_size(draw, extra_chip, f_ex_fit)[0] <= rem:
+                    _draw_pill(draw, cur_x, y, extra_chip, f_ex_fit, bg=extra_bg, fg=extra_fg, pad_x=pad_x, pad_y=pad_y, radius=radius)
+    return cur_x > x1 or bool(extra_chip)
+
+
+def build_card_chip(
+    clean_title: str,
+    orig_price: int,
+    sale_price: int,
+    unit_info: str = "",
+    shipping_label: str = "",
+) -> str:
+    """전단지 카드용 굵은 보조 칩 문구 (단가 우선, 배송 정보는 원문 근거가 있을 때만 표시)"""
     unit_part = extract_unit_part(clean_title, unit_info)
+    ship = (shipping_label or "").strip()
+    is_paid_or_cond = bool(ship) and any(k in ship for k in _NON_FREE_SHIP_TOKENS)
+    if unit_part and is_paid_or_cond:
+        return f"{unit_part} · {ship}"
     if unit_part:
         return unit_part
     save_amt = max(0, orig_price - sale_price)
+    if save_amt >= 1000 and ship:
+        return f"{save_amt:,}원 절약 · {ship}"
     if save_amt >= 1000:
-        return f"{save_amt:,}원 절약 · 로켓 무료배송"
-    return "로켓 무료배송 특가"
+        return f"{save_amt:,}원 절약"
+    return ship
 
 
 def _tier_badge(rate: int) -> Tuple[str, Tuple[int, int, int]]:
@@ -601,9 +682,8 @@ def _draw_single_rich_card(
     rw = rx2 - rx1
     cur_y = cy1 + 32
 
-    # 1) Delivery + Unit/Savings pills
-    f_chip = _load_font(hv_font, 32)
-    pw_ship, _ = _draw_pill(draw, rx1, cur_y, "로켓 무료배송", f_chip, bg=(219, 234, 254), fg=(29, 78, 216), pad_x=22, pad_y=11, radius=14)
+    # 1) Delivery (only when verified) + Unit/Savings pills
+    ship_label = resolve_shipping_label(deal)
     unit_part = extract_unit_part(str(deal.get("clean_title") or ""), str(deal.get("unit_info") or ""))
     if theme == "vip" and save_p >= 10000:
         extra_chip = f"{_format_save_kor(save_p)} 할인"
@@ -615,11 +695,8 @@ def _draw_single_rich_card(
         extra_chip = unit_part or (f"{orig_p - sale_p:,}원 절약" if orig_p > sale_p >= 1000 else "")
         ex_bg, ex_fg = (220, 252, 231), (4, 120, 87)
 
-    if extra_chip:
-        next_x = rx1 + pw_ship + 14
-        if next_x + _text_size(draw, extra_chip, f_chip)[0] + 44 <= rx2:
-            _draw_pill(draw, next_x, cur_y, extra_chip, f_chip, bg=ex_bg, fg=ex_fg, pad_x=22, pad_y=11, radius=14)
-    cur_y += 82
+    if _draw_row_badges(draw, rx1, cur_y, rx2, ship_label, extra_chip, ex_bg, ex_fg, hv_font, base_sz=32, pad_x=22, pad_y=11, radius=14):
+        cur_y += 82
 
     # 2) Full product title (up to 3 lines cleanly wrapped, zero harsh truncation)
     full_title = str(deal.get("clean_title") or "쿠팡 핫딜").strip()
@@ -643,7 +720,8 @@ def _draw_single_rich_card(
             _draw_pill(draw, rx1, cur_y + 10, "조기 품절·가격 변동 가능", f_react, bg=(255, 241, 242), fg=(190, 18, 60), pad_x=18, pad_y=10, radius=12)
         elif theme == "vip":
             f_react = _load_font(hv_font, 28)
-            _draw_pill(draw, rx1, cur_y + 10, "고가 상품 할인 · 로켓 무료배송", f_react, bg=(254, 249, 195), fg=(113, 63, 18), pad_x=18, pad_y=10, radius=12)
+            vip_note = f"고가 상품 할인 · {ship_label}" if ship_label else "고가 상품 할인"
+            _draw_pill(draw, rx1, cur_y + 10, vip_note, f_react, bg=(254, 249, 195), fg=(113, 63, 18), pad_x=18, pad_y=10, radius=12)
 
     # 4) Rich Price Story Box
     _draw_price_box(draw, (rx1, box_y1, rx2, cy2 - 26), orig_p, sale_p, disc_r, hv_font, eb_font, orig_prefix="정상가 ", theme=theme)
@@ -713,22 +791,20 @@ def _draw_grid_card_item(
     orig_p = int(deal.get("orig_price", 0) or 0)
     sale_p = int(deal.get("sale_price", 0) or 0)
     unit_part = extract_unit_part(full_title, str(deal.get("unit_info") or ""))
+    ship_label = resolve_shipping_label(deal)
 
     if rich_mode:
-        # 2건 모드: 파란 [로켓 무료배송] + [단가/절약] 배지 모두 노출
-        f_chip = _load_font(hv_font, 30)
-        pw_ship, _ = _draw_pill(draw, cx1 + 22, chip_y, "로켓 무료배송", f_chip, bg=(219, 234, 254), fg=(29, 78, 216), pad_x=18, pad_y=10, radius=12)
+        # 2건·하단 2열 모드: 근거가 확인된 배송 배지 + [단가/절약] 배지 노출
         extra_chip = unit_part or (f"{orig_p - sale_p:,}원 절약" if orig_p > sale_p >= 1000 else "")
-        if extra_chip:
-            nx = cx1 + 22 + pw_ship + 10
-            if nx + _text_size(draw, extra_chip, f_chip)[0] + 36 <= cx2 - 22:
-                _draw_pill(draw, nx, chip_y, extra_chip, f_chip, bg=(220, 252, 231), fg=(4, 120, 87), pad_x=18, pad_y=10, radius=12)
+        _draw_row_badges(draw, cx1 + 22, chip_y, cx2 - 22, ship_label, extra_chip, (220, 252, 231), (4, 120, 87), hv_font, base_sz=30, pad_x=18, pad_y=10, radius=12)
     else:
-        chip_txt = build_card_chip(full_title, orig_p, sale_p, str(deal.get("unit_info") or ""))
-        f_chip = _fit_font(draw, chip_txt, hv_font, 34, avail_title_w - 40, min_size=24)
-        chip_bg = (254, 243, 199) if theme == "vip" else ((255, 228, 230) if theme == "half" else (220, 252, 231))
-        chip_fg = (146, 64, 14) if theme == "vip" else ((190, 18, 60) if theme == "half" else (4, 120, 87))
-        _draw_pill(draw, cx1 + 22, chip_y, chip_txt, f_chip, bg=chip_bg, fg=chip_fg, pad_x=20, pad_y=10, radius=12)
+        chip_txt = build_card_chip(full_title, orig_p, sale_p, str(deal.get("unit_info") or ""), shipping_label=ship_label)
+        if chip_txt:
+            f_chip = _fit_font(draw, chip_txt, hv_font, 34, avail_title_w - 40, min_size=22)
+            has_paid_or_cond = any(k in chip_txt for k in _NON_FREE_SHIP_TOKENS)
+            chip_bg = (254, 243, 199) if (theme == "vip" or (theme == "normal" and has_paid_or_cond)) else ((255, 228, 230) if theme == "half" else (220, 252, 231))
+            chip_fg = (146, 64, 14) if (theme == "vip" or (theme == "normal" and has_paid_or_cond)) else ((190, 18, 60) if theme == "half" else (4, 120, 87))
+            _draw_pill(draw, cx1 + 22, chip_y, chip_txt, f_chip, bg=chip_bg, fg=chip_fg, pad_x=20, pad_y=10, radius=12)
 
     _draw_price_box(draw, (box_x1, box_y1, box_x2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font, theme=theme)
 
@@ -783,9 +859,7 @@ def _draw_wide_card_item(
     badge_x = rx2 - badge_w
     _draw_pill(draw, badge_x, cy1 + 24, t_lbl, f_tag, bg=t_bg, fg=t_fg, pad_x=20, pad_y=10, radius=16, outline=t_bd, outline_width=2)
 
-    f_chip = _load_font(hv_font, 30)
-    pw_ship, _ = _draw_pill(draw, rx1, cy1 + 26, "로켓 무료배송", f_chip, bg=(219, 234, 254), fg=(29, 78, 216), pad_x=18, pad_y=10, radius=12)
-
+    ship_label = resolve_shipping_label(deal)
     full_title = str(deal.get("clean_title") or "").strip()
     unit_part = extract_unit_part(full_title, str(deal.get("unit_info") or ""))
     if theme == "vip" and save_p >= 10000:
@@ -798,10 +872,7 @@ def _draw_wide_card_item(
         extra_chip = unit_part or (f"{orig_p - sale_p:,}원 절약" if orig_p > sale_p >= 1000 else "")
         ex_bg, ex_fg = (220, 252, 231), (4, 120, 87)
 
-    if extra_chip:
-        nx = rx1 + pw_ship + 12
-        if nx + _text_size(draw, extra_chip, f_chip)[0] + 36 <= badge_x - 16:
-            _draw_pill(draw, nx, cy1 + 26, extra_chip, f_chip, bg=ex_bg, fg=ex_fg, pad_x=18, pad_y=10, radius=12)
+    _draw_row_badges(draw, rx1, cy1 + 26, badge_x - 16, ship_label, extra_chip, ex_bg, ex_fg, hv_font, base_sz=30, pad_x=18, pad_y=10, radius=12)
 
     # Wrapped 2-line title
     cur_y = cy1 + 98
@@ -993,7 +1064,9 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
             rate_part = f"{tag_prefix}{emo} "
             extra = f" · {html.escape(unit_raw, quote=False)}" if unit_raw else ""
 
-        lines.append(f"   {rate_part}{orig_part}{price_str}{extra} · 로켓 무료배송")
+        ship_label = resolve_shipping_label(d)
+        ship_part = f" · {html.escape(ship_label, quote=False)}" if ship_label else ""
+        lines.append(f"   {rate_part}{orig_part}{price_str}{extra}{ship_part}")
         lines.append("")
 
     lines.append("<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>")

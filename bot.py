@@ -53,12 +53,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def parse_admin_chat_id(raw_value: Optional[str]) -> Optional[int]:
+    """TELEGRAM_ADMIN_CHAT_ID 파싱 (비어있음/0/비숫자 설정 시 None 반환 및 설정명만 로깅)"""
+    raw_s = "" if raw_value is None else str(raw_value).strip()
+    if not raw_s:
+        logger.error("TELEGRAM_ADMIN_CHAT_ID 설정이 비어 있어 관리자 기능을 차단합니다.")
+        return None
+    try:
+        parsed = int(raw_s)
+    except ValueError:
+        logger.error("TELEGRAM_ADMIN_CHAT_ID 설정이 올바른 숫자가 아니어서 관리자 기능을 차단합니다.")
+        return None
+    if parsed == 0:
+        logger.error("TELEGRAM_ADMIN_CHAT_ID 설정이 0이므로 관리자 기능을 차단합니다.")
+        return None
+    return parsed
+
+
 # 설정값
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-try:
-    ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_ADMIN_CHAT_ID", "0") or "0")
-except ValueError:
-    ADMIN_CHAT_ID = 0
+ADMIN_CHAT_ID: Optional[int] = parse_admin_chat_id(os.getenv("TELEGRAM_ADMIN_CHAT_ID"))
 PUBLIC_CHANNEL_ID = os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID", "@HOTpang911")
 REPORT_CHANNEL_ID = os.getenv("TELEGRAM_REPORT_CHANNEL_ID", "-1003981511629")
 
@@ -115,20 +129,32 @@ def clean_cache():
         POST_CACHE.pop(k, None)
 
 
+def _valid_admin_chat_id() -> Optional[int]:
+    if isinstance(ADMIN_CHAT_ID, bool) or not isinstance(ADMIN_CHAT_ID, int) or ADMIN_CHAT_ID == 0:
+        return None
+    return ADMIN_CHAT_ID
+
+
 def is_admin(user_id: int) -> bool:
-    """관리자 권한 확인"""
-    # ADMIN_CHAT_ID가 0이면 누구나 허용(초기 세팅용)
-    if ADMIN_CHAT_ID == 0:
-        return True
-    return user_id == ADMIN_CHAT_ID
+    """관리자 권한 확인 (설정 오류 시 무조건 차단)"""
+    admin_id = _valid_admin_chat_id()
+    if admin_id is None:
+        logger.error("TELEGRAM_ADMIN_CHAT_ID 설정 오류로 관리자 요청을 차단합니다.")
+        return False
+    return user_id == admin_id
 
 
 def is_admin_update(update: Update) -> bool:
-    """DM/그룹 모두 대응: user id 기준"""
+    """DM/그룹 모두 대응: user id 기준 (TELEGRAM_ADMIN_CHAT_ID 미설정/오류 시 전면 차단)"""
     u = update.effective_user
+    c = update.effective_chat
+    if _valid_admin_chat_id() is None:
+        logger.error(
+            f"TELEGRAM_ADMIN_CHAT_ID 설정 오류로 접근 차단: user={u.id if u else 'N/A'}, chat={c.id if c else 'N/A'}"
+        )
+        return False
     if u and is_admin(u.id):
         return True
-    c = update.effective_chat
     if c and is_admin(c.id):
         return True
     logger.warning(f"권한 없는 사용자 접근: user={u.id if u else 'N/A'}, chat={c.id if c else 'N/A'}")
@@ -175,12 +201,14 @@ def status_text() -> str:
     up = datetime.now() - START_TIME
     h, rem = divmod(int(up.total_seconds()), 3600)
     m, _ = divmod(rem, 60)
+    admin_id = _valid_admin_chat_id()
+    admin_disp = str(admin_id) if admin_id is not None else "미설정/오류(차단됨)"
     return (
         f"📡 <b>봇 상태</b>\n\n"
         f"• 가동시간: {h}시간 {m}분\n"
         f"• 자동송출: {'✅ ON' if AUTO_ENABLED else '⏸ OFF'} (매일 07:05 상위 {AUTO_GOLDBOX_LIMIT}개 + 60분마다 검증핫딜)\n"
         f"• 송출 채널: <code>{esc(PUBLIC_CHANNEL_ID)}</code>\n"
-        f"• 관리자 ID: <code>{ADMIN_CHAT_ID}</code>\n\n"
+        f"• 관리자 ID: <code>{esc(admin_disp)}</code>\n\n"
         f"버튼이나 명령어(/menu)로 조작하세요."
     )
 
@@ -907,8 +935,9 @@ async def scheduled_morning_goldbox(bot):
         res = coupang_api.get_goldbox_products(sub_id="tggoldauto")
         if str(res.get("rCode", "0")) != "0":
             logger.error(f"골드박스 API 오류: {res.get('rCode')} {res.get('rMessage')}")
-            if ADMIN_CHAT_ID:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ 골드박스 API 오류: {esc(res.get('rCode'))} {esc(res.get('rMessage'))}")
+            admin_id = _valid_admin_chat_id()
+            if admin_id is not None:
+                await bot.send_message(chat_id=admin_id, text=f"⚠️ 골드박스 API 오류: {esc(res.get('rCode'))} {esc(res.get('rMessage'))}")
             return
         items = res.get("data", [])
         if not items:
@@ -965,18 +994,20 @@ async def scheduled_morning_goldbox(bot):
             await asyncio.sleep(1.5)
 
         save_seen_deals(seen)
-        if ADMIN_CHAT_ID:
+        admin_id = _valid_admin_chat_id()
+        if admin_id is not None:
             await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
+                chat_id=admin_id,
                 text=f"📢 <b>[골드박스 자동 송출 완료]</b> 오늘자 상위 <b>{success_count}개</b> 송출, 중복스킵 {skipped_dup}개 → <code>{esc(PUBLIC_CHANNEL_ID)}</code>",
                 parse_mode=ParseMode.HTML,
             )
 
     except Exception as e:
         logger.error(f"아침 자동 송출 오류: {e}")
-        if ADMIN_CHAT_ID:
+        admin_id = _valid_admin_chat_id()
+        if admin_id is not None:
             await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
+                chat_id=admin_id,
                 text=f"⚠️ 아침 골드박스 자동 송출 중 오류 발생: {esc(e)}",
             )
 
@@ -1055,9 +1086,10 @@ async def check_and_publish_community_deals(bot) -> int:
             published_count += 1
             logger.info(f"🎉 커뮤니티 핫딜 송출 성공: {title}")
 
-            if ADMIN_CHAT_ID:
+            admin_id = _valid_admin_chat_id()
+            if admin_id is not None:
                 await bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
+                    chat_id=admin_id,
                     text=f"📢 <b>[검증 핫딜 자동 송출]</b>\n{esc(title)}\n<code>{esc(reason)}</code>",
                     parse_mode=ParseMode.HTML,
                 )
@@ -1135,7 +1167,8 @@ def main():
     app.add_handler(CallbackQueryHandler(publish_callback, pattern="^publish:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
-    print(f"🚀 봇 가동 시작! 송출 채널: {PUBLIC_CHANNEL_ID}, 관리자 ID: {ADMIN_CHAT_ID}")
+    admin_disp = _valid_admin_chat_id()
+    print(f"🚀 봇 가동 시작! 송출 채널: {PUBLIC_CHANNEL_ID}, 관리자 설정: {'OK' if admin_disp is not None else 'INVALID'}")
     app.run_polling()
 
 

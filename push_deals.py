@@ -1,3 +1,4 @@
+import hashlib
 import html
 import io
 import json
@@ -46,8 +47,10 @@ from flyer_renderer import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 파일 로깅 및 콘솔 로깅 동시 지원 (배경 실행 시에도 deal_pusher.log에 실시간 기록)
-log_file = os.path.join(BASE_DIR, "deal_pusher.log")
-handlers: List[logging.Handler] = [logging.FileHandler(log_file, encoding="utf-8")]
+log_file = os.getenv("DEAL_PUSHER_LOG_FILE", os.path.join(BASE_DIR, "deal_pusher.log"))
+handlers: List[logging.Handler] = []
+if log_file:
+    handlers.append(logging.FileHandler(log_file, encoding="utf-8", delay=True))
 if sys.stderr is not None:
     handlers.append(logging.StreamHandler(sys.stderr))
 
@@ -69,6 +72,10 @@ SEEN_FILE = os.path.join(BASE_DIR, "seen_deals.json")
 TRACKER_FILE = os.path.join(BASE_DIR, "sales_tracker.json")
 QUOTA_FILE = os.path.join(BASE_DIR, "post_quota.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "flyer_queue.json")
+OCR_CACHE_FILE = os.path.join(BASE_DIR, "ocr_cache.json")
+OCR_CACHE_TTL_HOURS = 24
+OCR_CACHE_MAX_ENTRIES = 300
+_LAST_OCR_HAD_ERROR = False
 LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
@@ -235,6 +242,78 @@ def save_flyer_queue(queue: List[Dict[str, Any]]):
         os.replace(tmp_path, QUEUE_FILE)
     except Exception as e:
         logger.error(f"flyer_queue 저장 에러: {e}")
+
+
+def _is_transient_http_status(status_code: int) -> bool:
+    return status_code in (403, 408, 429) or status_code >= 500
+
+
+def load_ocr_cache() -> Dict[str, Any]:
+    """실행 간 OCR 가격 헤더 캐시 로드 (만료 항목 자동 제외)"""
+    if not os.path.exists(OCR_CACHE_FILE):
+        return {}
+    try:
+        with open(OCR_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        now_ts = int(time.time())
+        cutoff = now_ts - OCR_CACHE_TTL_HOURS * 3600
+        cleaned: Dict[str, Any] = {}
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            upd = int(v.get("updated_at", 0) or 0)
+            ocr_txt = v.get("ocr_text")
+            fp = v.get("fingerprint")
+            if upd >= cutoff and isinstance(ocr_txt, str) and ocr_txt.strip() and isinstance(fp, str) and fp:
+                cleaned[str(k)] = v
+        return cleaned
+    except Exception:
+        return {}
+
+
+def save_ocr_cache(cache: Dict[str, Any]):
+    """OCR 캐시를 TTL/최대 개수 상한으로 정리해 원자적으로 저장"""
+    try:
+        now_ts = int(time.time())
+        cutoff = now_ts - OCR_CACHE_TTL_HOURS * 3600
+        valid_items = [
+            (str(k), v)
+            for k, v in cache.items()
+            if isinstance(v, dict)
+            and int(v.get("updated_at", 0) or 0) >= cutoff
+            and isinstance(v.get("ocr_text"), str)
+            and v["ocr_text"].strip()
+        ]
+        valid_items.sort(key=lambda kv: int(kv[1].get("updated_at", 0) or 0), reverse=True)
+        trimmed = dict(valid_items[:OCR_CACHE_MAX_ENTRIES])
+        cache.clear()
+        cache.update(trimmed)
+
+        tmp_path = OCR_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(trimmed, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, OCR_CACHE_FILE)
+    except Exception as e:
+        logger.error(f"ocr_cache 저장 에러: {e}")
+
+
+def _build_price_evidence_fingerprint(
+    pricing_title: str,
+    body_text: str,
+    ocr_imgs: List[str],
+    extra_shipping: str = "",
+) -> str:
+    """추천/댓글 수를 제외한 제목·본문·배송·이미지 URL 기반 가격 근거 지문 생성"""
+    payload = {
+        "title": re.sub(r"\s+", " ", (pricing_title or "").strip()),
+        "body": (body_text or "").strip(),
+        "imgs": [str(u).strip() for u in (ocr_imgs or [])[:2] if u],
+        "shipping": (extra_shipping or "").strip(),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def is_quiet_hours(now: Optional[datetime] = None) -> bool:
@@ -408,6 +487,7 @@ def _preprocess_image_for_price_ocr(img):
 
 def _ocr_single_image_lines(pil_img) -> List[str]:
     """단일 PIL 이미지에서 Y좌표(위->아래) 정렬된 텍스트 라인 리스트 추출"""
+    global _LAST_OCR_HAD_ERROR
     # 1) Windows 환경: winocr (단어 바운딩박스 기준 정확한 상->하 정렬)
     try:
         import winocr
@@ -417,7 +497,9 @@ def _ocr_single_image_lines(pil_img) -> List[str]:
             return await winocr.recognize_pil(pil_img, lang="ko")
 
         res_obj = asyncio.run(_winocr())
-        if res_obj and getattr(res_obj, "lines", None):
+        if res_obj is not None:
+            if not getattr(res_obj, "lines", None):
+                return []
             items = []
             for line in res_obj.lines:
                 txt = (line.text or "").strip()
@@ -440,8 +522,9 @@ def _ocr_single_image_lines(pil_img) -> List[str]:
         text = pytesseract.image_to_string(pil_img, lang="kor+eng")
         if text:
             return [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return []
     except Exception:
-        pass
+        _LAST_OCR_HAD_ERROR = True
 
     return []
 
@@ -482,6 +565,8 @@ def extract_ocr_text(img_urls: Optional[Union[str, List[str]]]) -> str:
     첨부된 이미지(최대 2장)에서 원본 패스 + 취소선/배지 복원 패스 듀얼 OCR 수행 후
     가격 헤더 영역 텍스트만 반환.
     """
+    global _LAST_OCR_HAD_ERROR
+    _LAST_OCR_HAD_ERROR = False
     if not img_urls:
         return ""
     urls = [img_urls] if isinstance(img_urls, str) else list(img_urls)
@@ -495,6 +580,7 @@ def extract_ocr_text(img_urls: Optional[Union[str, List[str]]]) -> str:
         try:
             res = requests.get(u, headers=HEADERS, timeout=7)
             if res.status_code != 200:
+                _LAST_OCR_HAD_ERROR = True
                 continue
             img = Image.open(io.BytesIO(res.content))
             if img.width < 120 or img.height < 80:
@@ -509,9 +595,63 @@ def extract_ocr_text(img_urls: Optional[Union[str, List[str]]]) -> str:
                 block = "\n".join(raw_lines) + "\n---OCR_ENHANCED---\n" + "\n".join(enh_lines)
                 collected_blocks.append(block)
         except Exception as e:
+            _LAST_OCR_HAD_ERROR = True
             logger.debug(f"OCR 추출 실패 ({u}): {e}")
 
     return "\n===NEXT_IMAGE===\n".join(collected_blocks)
+
+
+def get_or_extract_ocr_text(
+    deal_id: str,
+    pricing_title: str,
+    body_text: str,
+    ocr_imgs: List[str],
+    ocr_cache: Dict[str, Any],
+    extra_shipping: str = "",
+) -> Tuple[str, bool]:
+    """가격 근거가 동일하면 이전 실행의 OCR 결과를 재사용하고, 실패 시 재시도 가능하도록 캐시 제외"""
+    global _LAST_OCR_HAD_ERROR
+    if not ocr_imgs:
+        return "", False
+
+    fp = _build_price_evidence_fingerprint(pricing_title, body_text, ocr_imgs, extra_shipping=extra_shipping)
+    now_ts = int(time.time())
+    entry = ocr_cache.get(deal_id)
+    if (
+        isinstance(entry, dict)
+        and entry.get("fingerprint") == fp
+        and (now_ts - int(entry.get("updated_at", 0) or 0)) <= OCR_CACHE_TTL_HOURS * 3600
+        and isinstance(entry.get("ocr_text"), str)
+        and entry["ocr_text"].strip()
+    ):
+        logger.info(f"♻️ [OCR 캐시 재사용] {deal_id}")
+        return entry["ocr_text"], False
+
+    _LAST_OCR_HAD_ERROR = False
+    try:
+        ocr_text = extract_ocr_text(ocr_imgs)
+    except Exception as e:
+        logger.warning(f"⚠️ [OCR 실패] {deal_id}: {e}")
+        if deal_id in ocr_cache:
+            ocr_cache.pop(deal_id, None)
+            save_ocr_cache(ocr_cache)
+        return "", True
+
+    had_err = bool(_LAST_OCR_HAD_ERROR)
+    clean_ocr = (ocr_text or "").strip()
+    if clean_ocr and not had_err:
+        ocr_cache[deal_id] = {
+            "fingerprint": fp,
+            "ocr_text": ocr_text,
+            "updated_at": now_ts,
+        }
+        save_ocr_cache(ocr_cache)
+        return ocr_text, False
+
+    if deal_id in ocr_cache:
+        ocr_cache.pop(deal_id, None)
+        save_ocr_cache(ocr_cache)
+    return ocr_text or "", had_err
 
 
 # ==========================================
@@ -726,9 +866,254 @@ def _strip_inline_non_prices(text: str) -> str:
     return s
 
 
+_SHIPPING_THRESHOLD_SPAN_RE = re.compile(
+    r"(?:(?:로켓(?:와우|배송|직구|프레시)?|와우|일반)?\s*(?:무료)?배송\s*)?"
+    r"(?:\d[\d,\.\s]*원|\d+(?:\.\d+)?\s*만\s*원)\s*(?:이상|미만)"
+    r"(?:\s*(?:구매|주문)?\s*(?:시\s*)?(?:무료배송|무배|배송비\s*무료|무료|할인|적용)?)?",
+    re.IGNORECASE,
+)
+_SHIPPING_FEE_SPAN_RE = re.compile(
+    r"(?:(?:유료배송|배송비|택배비|배송료|운송비)\s*[:：\s+\-]*\d[\d,\.\s]*원"
+    r"|\d[\d,\.\s]*원\s*(?:배송비|택배비|배송료))",
+    re.IGNORECASE,
+)
+
+
+def _strip_pair_ship_fee(m: re.Match) -> str:
+    open_b, left_s, _sep, right_s, close_b = m.groups()
+    if re.search(r"판매가|할인가|특가|정가|정상가|쿠팡가|와우가|실구매가", right_s):
+        return m.group(0)
+    l_nums = re.findall(r"\d[\d,]*", left_s)
+    r_nums = re.findall(r"\d[\d,]*", right_s)
+    if not l_nums or not r_nums:
+        return m.group(0)
+    lv = int(l_nums[-1].replace(",", ""))
+    rv = int(r_nums[0].replace(",", ""))
+    if 1000 <= rv <= 10000 and rv < lv:
+        return f"{open_b}{left_s.strip()}{close_b}"
+    return m.group(0)
+
+
+def _strip_shipping_and_threshold_phrases(text: str) -> str:
+    """배송비·무료배송 기준 금액('29,800원 이상 무료배송', '배송비 3,000원', '(12,000/3,000)') 제거"""
+    s = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", text or "")
+    s = _SHIPPING_FEE_SPAN_RE.sub(" ", s)
+    s = re.sub(
+        r"([\(\[])([^\)\]/\r\n]+)(\s*/\s*)([^\)\]/\r\n]*\d[\d,]*\s*원?[^\)\]/\r\n]*)([\)\]])",
+        _strip_pair_ship_fee,
+        s,
+    )
+    return s
+
+
+_NEGATED_FREE_SHIPPING_RE = re.compile(
+    r"(?:(?:로켓|와우)\s*)?(?:무료배송|무배|배송비\s*무료|무료)\s*(?:아님|아니[며고라]?|불가|제외|미적용|없음|안\s*됨|안됨|X|x|×)",
+    re.IGNORECASE,
+)
+_NEGATED_ROCKET_RE = re.compile(
+    r"로켓\s*(?:와우|배송|프레시|직구)?\s*(?:아님|아니[며고라]?|불가|제외|미적용|없음|안\s*됨|안됨|X|x|×)",
+    re.IGNORECASE,
+)
+_WOW_FREE_SPAN_RE = re.compile(
+    r"(?:로켓\s*)?와우\s*(?:멤버십\s*)?(?:회원\s*)?(?:만|전용|한정|기준|시)?\s*"
+    r"(?:(?:[\d,]+\s*원|\d+(?:\.\d+)?\s*만\s*원)\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?)?"
+    r"(?:무료배송|무배|배송비\s*무료|무료)",
+    re.IGNORECASE,
+)
+_MEMBER_FREE_SPAN_RE = re.compile(
+    r"(?:유료\s*회원|멤버십\s*회원?|회원\s*(?:만|전용|한정))\s*"
+    r"(?:(?:[\d,]+\s*원|\d+(?:\.\d+)?\s*만\s*원)\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?)?"
+    r"(?:무료배송|무배|배송비\s*무료|무료)",
+    re.IGNORECASE,
+)
+_RESTRICTED_FREE_RE = re.compile(
+    r"([가-힣a-zA-Z0-9·]+(?:/[가-힣a-zA-Z0-9·]+)?(?:\s*(?:전용|한정|제외|일부)|만))"
+    r"(?:\s+|(?=무료배송|무배|배송비))"
+    r"(?:(?:[\d,]+\s*원|\d+(?:\.\d+)?\s*만\s*원)\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?)?"
+    r"(?:무료배송|무배|배송비\s*무료)",
+    re.IGNORECASE,
+)
+_QTY_FREE_RE = re.compile(
+    r"(\d+\s*(?:개|팩|박스|병|캔|세트|통|봉|포)\s*이상)\s*(?:구매\s*(?:시\s*)?)?(?:무료배송|무배|배송비\s*무료)",
+    re.IGNORECASE,
+)
+
+
+def parse_shipping_details(
+    title: str,
+    body: str = "",
+    ocr_text: str = "",
+    extra_shipping: str = "",
+) -> Dict[str, Any]:
+    """원문(제목·본문·OCR·아카라이브 배송란)에서 근거가 확인된 배송비/배송유형 및 복합 조건까지 정밀 추출"""
+    parts = [p for p in (extra_shipping, title, body, ocr_text) if p]
+    combined = "\n".join(parts)
+    if not combined.strip():
+        return {"shipping_fee": 0, "shipping_type": "", "shipping_condition": "", "shipping_label": ""}
+
+    # 부정 표현 먼저 감지·제거해 '무료배송 아님' / '로켓배송 아님' 오탐 방지
+    has_negated_free = bool(_NEGATED_FREE_SHIPPING_RE.search(combined))
+    clean_for_pos = _NEGATED_FREE_SHIPPING_RE.sub(" ", combined)
+    clean_for_rocket = _NEGATED_ROCKET_RE.sub(" ", clean_for_pos)
+
+    has_rocket = bool(re.search(r"로켓\s*(?:무료배송|무배|배송|와우|프레시|직구)|로켓배송|로켓와우", clean_for_rocket))
+    has_wow_free = bool(_WOW_FREE_SPAN_RE.search(clean_for_pos))
+    after_wow = _WOW_FREE_SPAN_RE.sub(" ", clean_for_pos)
+    has_member_free = bool(_MEMBER_FREE_SPAN_RE.search(after_wow))
+    after_member = _MEMBER_FREE_SPAN_RE.sub(" ", after_wow)
+
+    restricted_cond = ""
+    m_rest = _RESTRICTED_FREE_RE.search(after_member)
+    if m_rest:
+        cand_rest = re.sub(r"\s+", " ", m_rest.group(1)).strip()
+        # 상품명 일반 수식어/부정어 오탐 제외
+        if not any(bad in cand_rest for bad in ("오늘만", "이번만", "하루만")):
+            restricted_cond = cand_rest
+
+    qty_cond = ""
+    m_qty = _QTY_FREE_RE.search(clean_for_pos)
+    if m_qty:
+        qty_cond = re.sub(r"\s+", " ", m_qty.group(1)).strip()
+
+    # 무료배송 조건 금액 추출 (예: 29,800원 이상 무료배송 / 3만원 이상 무료배송)
+    threshold_cond = ""
+    m_thr = re.search(
+        r"([\d,]+)\s*원\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?(?:무료배송|무배|배송비\s*무료|무료)",
+        clean_for_pos,
+    )
+    if m_thr:
+        try:
+            thr_val = int(m_thr.group(1).replace(",", ""))
+            if thr_val >= 1000:
+                threshold_cond = f"{thr_val:,}원 이상 무료배송"
+        except Exception:
+            pass
+    if not threshold_cond:
+        m_man = re.search(
+            r"(\d+(?:\.\d+)?)\s*만\s*원\s*이상(?:\s*(?:구매|주문|결제)?\s*(?:시|일\s*때)?\s*)?(?:무료배송|무배|배송비\s*무료|무료)",
+            clean_for_pos,
+        )
+        if m_man:
+            try:
+                thr_val = int(round(float(m_man.group(1)) * 10000))
+                if thr_val >= 10000:
+                    threshold_cond = f"{thr_val:,}원 이상 무료배송"
+            except Exception:
+                pass
+
+    # 무료배송 기준 금액('29,800원 이상 무료배송' 등)을 먼저 걷어낸 뒤에만 유료 배송비 추출
+    combined_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", combined)
+    extra_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", extra_shipping or "")
+
+    shipping_fee = 0
+    for pat in (
+        r"(?:유료배송|배송비|택배비|배송료|운송비)\s*[:：\s+\-]*([\d,]+)\s*원",
+        r"([\d,]+)\s*원\s*(?:배송비|택배비|배송료)",
+    ):
+        for fm in re.finditer(pat, combined_no_thr):
+            val = int(fm.group(1).replace(",", ""))
+            if 500 <= val <= 50000:
+                shipping_fee = val
+                break
+        if shipping_fee:
+            break
+
+    if shipping_fee == 0 and extra_no_thr:
+        m_ex = re.search(r"([\d,]+)\s*원", extra_no_thr)
+        if m_ex:
+            val = int(m_ex.group(1).replace(",", ""))
+            if 500 <= val <= 50000:
+                shipping_fee = val
+
+    if shipping_fee == 0:
+        for pm in re.finditer(r"[\(\[][^\)\]/\r\n]*?(\d[\d,]*)\s*원?\s*/\s*(\d[\d,]*)\s*원?[^\)\]]*[\)\]]", combined_no_thr):
+            right_ctx = pm.group(0).split("/", 1)[1]
+            if re.search(r"판매가|할인가|특가|정가|정상가|쿠팡가|와우가|실구매가", right_ctx):
+                continue
+            lv = int(pm.group(1).replace(",", ""))
+            rv = int(pm.group(2).replace(",", ""))
+            if 1000 <= rv <= 10000 and rv < lv:
+                shipping_fee = rv
+                break
+
+    has_paid_text = bool(re.search(r"배송비\s*별도|착불|유료배송", combined))
+
+    # 부정/조건부/회원/지역제한/수량/배송비 문구를 모두 걷어낸 뒤에만 순수 무료배송 여부 판정
+    uncond_scan = _NEGATED_FREE_SHIPPING_RE.sub(" ", combined)
+    uncond_scan = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", uncond_scan)
+    uncond_scan = _WOW_FREE_SPAN_RE.sub(" ", uncond_scan)
+    uncond_scan = _MEMBER_FREE_SPAN_RE.sub(" ", uncond_scan)
+    uncond_scan = _RESTRICTED_FREE_RE.sub(" ", uncond_scan)
+    uncond_scan = _QTY_FREE_RE.sub(" ", uncond_scan)
+    uncond_scan = _SHIPPING_FEE_SPAN_RE.sub(" ", uncond_scan)
+    has_unconditional_free = (shipping_fee == 0 and not has_paid_text and not has_negated_free) and bool(
+        re.search(r"로켓\s*무료배송|로켓\s*무배|로켓무배|무료배송|무배|배송비\s*무료|배송비\s*0\s*원|/\s*무료(?:\s*[\)\]]|$)|\(\s*무료\s*\)", uncond_scan)
+    )
+
+    # 복합 무료배송 조건 조합 (예: 와우 회원 29,800원 이상 무료배송 / 수도권만 무료배송)
+    qualifiers: List[str] = []
+    if has_wow_free:
+        qualifiers.append("와우 회원")
+    elif has_member_free:
+        qualifiers.append("회원")
+    if restricted_cond:
+        qualifiers.append(restricted_cond)
+    if qty_cond:
+        qualifiers.append(qty_cond)
+
+    free_cond_str = ""
+    if threshold_cond and qualifiers:
+        free_cond_str = f"{' '.join(qualifiers)} {threshold_cond}"
+    elif threshold_cond:
+        free_cond_str = threshold_cond
+    elif qualifiers:
+        if qualifiers == ["와우 회원"] and has_rocket:
+            free_cond_str = "로켓와우 무료배송"
+        elif qualifiers == ["와우 회원"]:
+            free_cond_str = "와우 무료배송"
+        else:
+            free_cond_str = f"{' '.join(qualifiers)} 무료배송"
+
+    shipping_type = ""
+    shipping_condition = ""
+    shipping_label = ""
+    if shipping_fee > 0 and free_cond_str:
+        shipping_type = "conditional"
+        shipping_condition = free_cond_str
+        short_cond = free_cond_str.replace("무료배송", "무료")
+        shipping_label = f"배송비 {shipping_fee:,}원 ({short_cond})"
+    elif free_cond_str:
+        shipping_type = "conditional"
+        shipping_condition = free_cond_str
+        shipping_label = (
+            f"로켓배송 · {free_cond_str}"
+            if (has_rocket and "로켓" not in free_cond_str)
+            else free_cond_str
+        )
+    elif shipping_fee > 0:
+        shipping_type = "paid"
+        shipping_label = f"로켓배송 · 배송비 {shipping_fee:,}원" if has_rocket else f"배송비 {shipping_fee:,}원"
+    elif has_paid_text:
+        shipping_type = "paid"
+        shipping_label = "착불" if "착불" in combined else "배송비 별도"
+    elif has_unconditional_free:
+        shipping_type = "rocket_free" if has_rocket else "free"
+        shipping_label = "로켓 무료배송" if has_rocket else "무료배송"
+    elif has_rocket:
+        shipping_type = "rocket"
+        shipping_label = "로켓배송"
+
+    return {
+        "shipping_fee": shipping_fee,
+        "shipping_type": shipping_type,
+        "shipping_condition": shipping_condition,
+        "shipping_label": shipping_label,
+    }
+
+
 def _extract_clean_won_numbers(text: str, blacklisted_nums: Set[int]) -> List[int]:
     """정상 표기된 원화 금액 추출 (OCR 콤마 뒤 공백 '23, 100원' 포함)"""
-    s = _strip_inline_non_prices(text)
+    s = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(text))
     nums: List[int] = []
     for m in re.finditer(r"(?<![+\-\d월])(\d{1,3}(?:\s*,\s*\d{3})+|\d{4,8})\s*원", s):
         raw = re.sub(r"[\s,]", "", m.group(1))
@@ -744,7 +1129,7 @@ def _extract_strikethrough_candidates(text: str, blacklisted_nums: Set[int]) -> 
     취소선이 그어진 정상가 후보 추출 (예: '899;eee원' -> 899000, '60;000원' -> 60000).
     ※ 이 후보들은 단독 사용되지 않으며, 반드시 명시된 할인율(%) 또는 쿠폰차액과 수학적으로 일치할 때만 채택됨!
     """
-    s = _strip_inline_non_prices(text)
+    s = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(text))
     cands: List[int] = []
     for m in re.finditer(r"(?<![+\-\d월])(\d{1,3}(?:[\s,;]+\d{3}|\s*[;,]\s*[0eEoO]{3})+)\s*원", s):
         cleaned = re.sub(r"[\s,;]", "", m.group(1)).lower().replace("e", "0").replace("o", "0")
@@ -764,21 +1149,16 @@ def _coupang_rate_matches(orig_p: int, sale_p: int, written_rate: int) -> bool:
     return written_rate in (floor_r, round_r) or abs(floor_r - written_rate) <= 1
 
 
-def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str, Any]:
+def parse_pricing_details(title: str, body: str, ocr_text: str = "", extra_shipping: str = "") -> Dict[str, Any]:
     """
-    제목, 본문, 이미지 OCR 헤더에서 명시적으로 적힌 정상가·할인가·할인율만 정밀 추출.
+    제목, 본문, 이미지 OCR 헤더에서 명시적으로 적힌 정상가·할인가·할인율 및 배송 근거만 정밀 추출.
     [절대 원칙]
     1. 정가 역산(sale_price / (1 - r)) 절대 금지
     2. 임의 쿠폰 차감(sale_price - coupon) 절대 금지
-    3. 할부금(월 XXX원~), 적립금(쿠팡캐시), 보험료(AppleCare+/안심케어), 옵션추가금(+XXX원) 원천 배제
+    3. 할부금(월 XXX원~), 적립금(쿠팡캐시), 보험료(AppleCare+/안심케어), 옵션추가금(+XXX원), 배송비·기준금액 원천 배제
     """
-    # 0. 배송비 기준금액 블랙리스트
-    blacklisted_prices: Set[int] = {19800, 29800, 30000, 50000}
-    for sm in re.finditer(r"(?:로켓배송|배송|주문|무료배송)?\s*([\d,]+)\s*원\s*(?:이상|미만)", f"{body}\n{ocr_text}"):
-        try:
-            blacklisted_prices.add(int(sm.group(1).replace(",", "")))
-        except Exception:
-            pass
+    ship_info = parse_shipping_details(title, body, ocr_text, extra_shipping=extra_shipping)
+    blacklisted_prices: Set[int] = set()
 
     # OCR 패스 분리 및 유효 라인 필터링
     ocr_lines_all: List[str] = []
@@ -801,7 +1181,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
     sale_price = 0
 
     # 1-A) 제목에서 가격 최우선 추출 (작성자가 직접 명시한 핫딜가)
-    title_clean = _strip_inline_non_prices(title)
+    title_clean = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(title))
     # 제목에 화살표(10,570원 -> 9,370원)가 있으면 뒤쪽 가격이 할인가
     m_title_arrow = re.search(r"([\d,]+)\s*원?\s*(?:에서|->|→|~>)\s*([\d,]+)\s*원", title_clean)
     if m_title_arrow:
@@ -810,9 +1190,25 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
             sale_price = p_to
 
     if sale_price == 0:
+        m_title_lbl = re.search(
+            r"(?<!일반)(?:최종가|최종특가|실구매가|와우할인가|와우가|쿠팡가|할인가|판매가|특가|혜택가|가격)\s*[:：\s]*([\d,]+)\s*원",
+            title_clean,
+        )
+        if m_title_lbl:
+            val = int(m_title_lbl.group(1).replace(",", ""))
+            if val >= 1000 and val not in blacklisted_prices:
+                sale_price = val
+
+    if sale_price == 0:
+        t_sale_scan = re.sub(
+            r"(?:정가|정상가|기존가|소비자가|출고가|시중가|일반판매가)\s*[:：\s]*[\d,]+\s*원",
+            " ",
+            title_clean,
+        )
+        t_sale_scan = re.sub(r"[\d,]+\s*원\s*(?:할인|절약|쿠폰|적립)", " ", t_sale_scan)
         t_won = [
             int(p.replace(",", ""))
-            for p in re.findall(r"(?<![+\-\d월])([\d,]+)\s*원", title_clean)
+            for p in re.findall(r"(?<![+\-\d월])([\d,]+)\s*원", t_sale_scan)
             if int(p.replace(",", "")) >= 1000 and int(p.replace(",", "")) not in blacklisted_prices
         ]
         if t_won:
@@ -831,7 +1227,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
                 break
 
     # 1-B) 본문(body)에서 명시적 판매가 추출
-    body_clean = _strip_inline_non_prices(body)
+    body_clean = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(body))
     m_body_arrow = re.search(r"([\d,]+)\s*원?\s*(?:에서|->|→|~>)\s*([\d,]+)\s*원", body_clean)
     if sale_price == 0 and m_body_arrow:
         p_to = int(m_body_arrow.group(2).replace(",", ""))
@@ -840,7 +1236,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
 
     if sale_price == 0:
         for pat in (
-            r"(?:가격|특가|판매가|할인가|쿠팡가|와우가|실구매가)\s*[:\s]*([\d,]+)\s*원",
+            r"(?<!일반)(?:최종가|최종특가|실구매가|와우할인가|와우가|쿠팡가|할인가|판매가|특가|혜택가|가격)\s*[:：\s]*([\d,]+)\s*원",
             r"([\d,]+)\s*원에\s*(?:판매|구매|구입)",
         ):
             m_lbl = re.search(pat, body_clean)
@@ -855,10 +1251,14 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         for line in body_clean.splitlines():
             if _BLACKLIST_LINE_RE.search(line):
                 continue
-            if re.search(r"(?:정가|정상가|기존가|출고가|시중가|쿠폰할인|원\s*할인|체감)", line):
+            line_for_sale = re.sub(
+                r"(?:정가|정상가|기존가|소비자가|출고가|시중가|일반판매가)\s*[:：\s]*[\d,]+\s*원",
+                " ",
+                line,
+            )
+            if re.search(r"(?:쿠폰할인|원\s*할인|체감)", line_for_sale):
                 continue
-            b_nums = _extract_clean_won_numbers(line, blacklisted_prices)
-            b_nums = [n for n in b_nums if n not in (2500, 3000)]
+            b_nums = _extract_clean_won_numbers(line_for_sale, blacklisted_prices)
             if b_nums:
                 sale_price = b_nums[0]
                 break
@@ -1107,6 +1507,10 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "") -> Dict[str
         "discount_rate": discount_rate,
         "unit_info": unit_info,
         "reaction_text": reaction_text,
+        "shipping_fee": int(ship_info.get("shipping_fee", 0) or 0),
+        "shipping_type": str(ship_info.get("shipping_type") or ""),
+        "shipping_condition": str(ship_info.get("shipping_condition") or ""),
+        "shipping_label": str(ship_info.get("shipping_label") or ""),
     }
 
 
@@ -1259,6 +1663,9 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
         if res.status_code != 200:
+            if _is_transient_http_status(res.status_code):
+                logger.warning(f"⏳ 루리웹 상세 일시 오류 (HTTP {res.status_code}): {url}")
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
             return None
         soup = BeautifulSoup(res.text, "html.parser")
 
@@ -1302,6 +1709,12 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
             "img_url": img_urls[0] if img_urls else None,
             "ocr_img_urls": img_urls[:2],
         }
+    except requests.Timeout as e:
+        logger.warning(f"⏳ 루리웹 상세 타임아웃 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "timeout"}
+    except requests.RequestException as e:
+        logger.warning(f"⏳ 루리웹 상세 네트워크 일시 오류 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "request_error"}
     except Exception as e:
         logger.error(f"루리웹 상세 파싱 오류 ({url}): {e}")
         return None
@@ -1400,6 +1813,9 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
         time.sleep(0.25)
         res = requests.get(url, headers=HEADERS, timeout=7)
         if res.status_code != 200:
+            if _is_transient_http_status(res.status_code):
+                logger.warning(f"⏳ 뽐뿌 상세 일시 오류 (HTTP {res.status_code}): {url}")
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
             return None
         res.encoding = "euc-kr"
         soup = BeautifulSoup(res.text, "html.parser")
@@ -1449,6 +1865,12 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
             "img_url": photo_url,
             "ocr_img_urls": content_imgs[:2],
         }
+    except requests.Timeout as e:
+        logger.warning(f"⏳ 뽐뿌 상세 타임아웃 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "timeout"}
+    except requests.RequestException as e:
+        logger.warning(f"⏳ 뽐뿌 상세 네트워크 일시 오류 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "request_error"}
     except Exception as e:
         logger.error(f"뽐뿌 상세 파싱 오류 ({url}): {e}")
         return None
@@ -1554,6 +1976,9 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
         if res.status_code != 200:
+            if _is_transient_http_status(res.status_code):
+                logger.warning(f"⏳ 아카라이브 상세 일시 오류 (HTTP {res.status_code}): {url}")
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
             return None
         soup = BeautifulSoup(res.text, "html.parser")
 
@@ -1565,6 +1990,7 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
         cp_url = None
         extracted_title = ""
         extracted_price = 0
+        extracted_shipping = ""
 
         for tr in soup.select("table.article-options tr, table.article-info tr"):
             th = tr.select_one("th, td:first-child")
@@ -1581,8 +2007,11 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
                         cp_url = h
                 elif "상품명" in lbl and val:
                     extracted_title = val
+                elif "배송" in lbl and val:
+                    extracted_shipping = val
                 elif "가격" in lbl and val:
-                    m = re.search(r"([\d,]+)\s*원?", val)
+                    clean_val = _strip_shipping_and_threshold_phrases(val)
+                    m = re.search(r"([\d,]+)\s*원?", clean_val)
                     if m:
                         p_val = int(m.group(1).replace(",", ""))
                         if p_val >= 1000:
@@ -1634,7 +2063,14 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
             "ocr_img_urls": img_urls[:2],
             "extracted_title": extracted_title,
             "extracted_price": extracted_price,
+            "extracted_shipping": extracted_shipping,
         }
+    except requests.Timeout as e:
+        logger.warning(f"⏳ 아카라이브 상세 타임아웃 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "timeout"}
+    except requests.RequestException as e:
+        logger.warning(f"⏳ 아카라이브 상세 네트워크 일시 오류 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "request_error"}
     except Exception as e:
         logger.error(f"아카라이브 상세 파싱 오류 ({url}): {e}")
         return None
@@ -1709,6 +2145,9 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any], deal_url: str 
         else ""
     )
 
+    ship_lbl = str(p_info.get("shipping_label") or "").strip()
+    shipping_block = f"🚚 <b>{esc(ship_lbl)}</b>\n" if ship_lbl else ""
+
     return (
         f"{header_line}\n\n"
         f"📌 <b>{esc(clean_title)}</b>\n\n"
@@ -1716,7 +2155,7 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any], deal_url: str 
         f"{price_block}\n\n"
         f"{link_block}"
         f"{reaction_block}"
-        f"🚚 🚀 <b>로켓배송 / 무료배송</b>\n"
+        f"{shipping_block}"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <i>핫딜 특성상 가격 변동 및 조기 품절될 수 있습니다.</i>\n"
         f"※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
@@ -1779,6 +2218,12 @@ def is_quality_hotdeal(
     return False, "wait"
 
 
+def _drop_ocr_cache_entry(ocr_cache: Dict[str, Any], deal_id: str) -> None:
+    if deal_id in ocr_cache:
+        ocr_cache.pop(deal_id, None)
+        save_ocr_cache(ocr_cache)
+
+
 def process_deal(
     d: Dict[str, Any],
     detail_parser,
@@ -1787,15 +2232,31 @@ def process_deal(
     flyer_queue: Optional[List[Dict[str, Any]]] = None,
     quota: Optional[Dict[str, Any]] = None,
     run_stats: Optional[Dict[str, int]] = None,
+    ocr_cache: Optional[Dict[str, Any]] = None,
 ) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
         return False
 
-    detail = detail_parser(d["link"])
+    if ocr_cache is None:
+        ocr_cache = load_ocr_cache()
+
+    try:
+        detail = detail_parser(d["link"])
+    except requests.RequestException as e:
+        logger.warning(f"⏳ [{source_name}] 상세 조회 일시 오류 (다음 회차 재시도): {deal_id} ({e})")
+        return False
+
+    if isinstance(detail, dict) and detail.get("transient_error"):
+        logger.warning(
+            f"⏳ [{source_name}] 상세 조회 일시 실패 ({detail.get('error_reason', 'unknown')}) — 다음 회차 재시도: {deal_id}"
+        )
+        return False
+
     if not detail or not detail.get("coupang_url"):
         seen.add(deal_id)
         save_seen(seen)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         return False
 
     raw_url = detail["coupang_url"]
@@ -1804,16 +2265,19 @@ def process_deal(
         logger.info(f"⏭️ [중복상품 스킵] 최근 3일 내 동일 productId({product_id}) 이미 송출됨: {d['title'][:40]}")
         seen.add(deal_id)
         save_seen(seen)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         return False
 
     body_text = detail.get("body_text", "")
     img_url = detail.get("img_url")
     ocr_imgs = detail.get("ocr_img_urls") or ([img_url] if img_url else [])
+    extra_shipping = str(detail.get("extracted_shipping") or "")
 
     base_title = detail.get("extracted_title") or d["title"]
     if is_closed_deal(base_title) or any(kw in base_title for kw in PROMO_SKIP_KEYWORDS):
         seen.add(deal_id)
         save_seen(seen)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         return False
 
     pricing_title = base_title
@@ -1823,14 +2287,25 @@ def process_deal(
 
     clean_title = clean_display_title(base_title)
 
-    # 이미지 OCR 가격 헤더 추출 및 팩트 기반 가격 분석
-    ocr_text = extract_ocr_text(ocr_imgs)
-    p_info = parse_pricing_details(pricing_title, body_text, ocr_text)
+    # 이미지 OCR 가격 헤더 추출(캐시 재사용) 및 팩트 기반 가격·배송 분석
+    ocr_text, ocr_failed = get_or_extract_ocr_text(
+        deal_id,
+        pricing_title,
+        body_text,
+        ocr_imgs,
+        ocr_cache,
+        extra_shipping=extra_shipping,
+    )
+    p_info = parse_pricing_details(pricing_title, body_text, ocr_text, extra_shipping=extra_shipping)
 
     if p_info["sale_price"] < 1000:
+        if ocr_failed and ocr_imgs:
+            logger.warning(f"⏳ [OCR 일시 실패] 이미지 판독 미완료로 다음 회차 재시도: {base_title}")
+            return False
         logger.info(f"⏭️ [스킵] 유효 가격 식별 불가: {base_title}")
         seen.add(deal_id)
         save_seen(seen)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         return False
 
     ok_q, reason = is_quality_hotdeal(d, source_name, p_info, base_title, body_text)
@@ -1839,12 +2314,20 @@ def process_deal(
             logger.info(f"🚫 [영구제외] 비핫딜/비추천 과다: {clean_title}")
             seen.add(deal_id)
             save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
         elif reason == "low_discount":
+            if ocr_failed and ocr_imgs and (
+                p_info["orig_price"] <= p_info["final_price"]
+                or p_info["discount_rate"] < MIN_HOTDEAL_DISCOUNT_RATE
+            ):
+                logger.warning(f"⏳ [OCR 일시 실패] 정상가/할인 근거 미확보로 다음 회차 재시도: {clean_title}")
+                return False
             logger.info(
                 f"⏭️ [할인율 미달 스킵] 최소 {MIN_HOTDEAL_DISCOUNT_RATE}% 미만({p_info['discount_rate']}%): {clean_title}"
             )
             seen.add(deal_id)
             save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
         else:
             logger.info(
                 f"⏳ [검증대기] 핫딜 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
@@ -1859,6 +2342,7 @@ def process_deal(
         if not items:
             seen.add(deal_id)
             save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
             return False
         deeplink = items[0].get("shortenUrl") or items[0].get("landingUrl")
     except Exception as e:
@@ -1878,11 +2362,16 @@ def process_deal(
             "discount_rate": int(p_info["discount_rate"]),
             "unit_info": p_info.get("unit_info", ""),
             "reaction_text": p_info.get("reaction_text", ""),
+            "shipping_fee": int(p_info.get("shipping_fee", 0) or 0),
+            "shipping_type": str(p_info.get("shipping_type") or ""),
+            "shipping_condition": str(p_info.get("shipping_condition") or ""),
+            "shipping_label": str(p_info.get("shipping_label") or ""),
             "chip": build_card_chip(
                 clean_title,
                 int(p_info["orig_price"]),
                 int(p_info["final_price"]),
                 p_info.get("unit_info", ""),
+                shipping_label=str(p_info.get("shipping_label") or ""),
             ),
             "deeplink": deeplink,
             "img_url": img_url,
@@ -1897,16 +2386,17 @@ def process_deal(
                     seen.add(deal_id)
                     mark_product_seen(product_id, seen)
                     save_seen(seen)
+                    _drop_ocr_cache_entry(ocr_cache, deal_id)
                     if quota is not None:
                         quota["community_sent"] = int(quota.get("community_sent", 0) or 0) + 1
                         quota["last_community_ts"] = int(time.time())
                         save_post_quota(quota)
                     if run_stats is not None:
                         run_stats["sent"] = run_stats.get("sent", 0) + 1
-                    tag = "반값폭락" if is_half_off_mega(item) else "100만+고가"
+                    tag = "반값 특가" if is_half_off_mega(item) else "100만+ 고가"
                     logger.info(
                         f"🚨 [{source_name}] {tag} 단독 리치전단지 즉시 송출 완료: {clean_title} "
-                        f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%)"
+                        f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
                     )
                     time.sleep(2)
                     return True
@@ -1918,11 +2408,12 @@ def process_deal(
         mark_product_seen(product_id, seen)
         save_seen(seen)
         save_flyer_queue(flyer_queue)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         if run_stats is not None:
             run_stats["queued"] = run_stats.get("queued", 0) + 1
         logger.info(
             f"📥 [{source_name}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
-            f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%)"
+            f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
         )
         return True
 
@@ -1943,6 +2434,7 @@ def process_deal(
         seen.add(deal_id)
         mark_product_seen(product_id, seen)
         save_seen(seen)
+        _drop_ocr_cache_entry(ocr_cache, deal_id)
         logger.info(
             f"✅ [{source_name}] 송출 완료: {clean_title} "
             f"(정가={p_info['orig_price']:,}원, 특가={p_info['final_price']:,}원, 할인율={p_info['discount_rate']}%)"
@@ -2231,10 +2723,13 @@ def check_and_notify_sales():
 
         tracker = load_sales_tracker()
         is_first_migration = "notified_order_keys" not in tracker
+        tracker_changed = False
 
         if tracker.get("month") != month_str:
             tracker["month"] = month_str
             tracker["month_milestone_step"] = 0
+            tracker.pop("milestone_retry_pending", None)
+            tracker_changed = True
 
         if is_first_migration:
             seeded_keys: List[str] = []
@@ -2258,73 +2753,110 @@ def check_and_notify_sales():
         notified_set = set(notified_list)
 
         new_items: List[Dict[str, Any]] = []
+        new_keys: List[str] = []
         for it in items:
             k = f"{it.get('date')}_{it.get('orderId')}_{it.get('productId')}"
             if k not in notified_set:
                 new_items.append(it)
-                notified_list.append(k)
+                new_keys.append(k)
                 notified_set.add(k)
 
-        if not new_items:
+        need_milestone_check = bool(new_items) or bool(tracker.get("milestone_retry_pending"))
+        if not need_milestone_check:
+            if tracker_changed:
+                save_sales_tracker(tracker)
             return
-
-        new_gmv = sum(int(round(float(it.get("gmv", 0) or 0))) for it in new_items)
-        new_comm = sum(int(round(float(it.get("commission", 0) or 0))) for it in new_items)
 
         # 이번 달 누적 확정 실적 조회
         m_orders, m_gmv, m_comm, m_clicks = 0, 0, 0, 0
+        comm_ok = False
         try:
             comm_res = coupang_api.get_commission_report(start_date=month_start, end_date=today_str)
-            comm_rows = comm_res.get("data", []) or []
+            if (
+                not isinstance(comm_res, dict)
+                or str(comm_res.get("rCode")) != "0"
+                or not isinstance(comm_res.get("data"), list)
+                or not all(isinstance(r, dict) for r in comm_res["data"])
+            ):
+                raise RuntimeError(f"커미션 리포트 비정상 응답: {comm_res}")
+            comm_rows = comm_res["data"]
             m_clicks = sum(int(r.get("click", 0) or 0) for r in comm_rows)
             m_orders = sum(int(r.get("order", 0) or 0) for r in comm_rows)
             m_gmv = sum(int(round(float(r.get("gmv", 0) or 0))) for r in comm_rows)
             m_comm = sum(int(round(float(r.get("commission", 0) or 0))) for r in comm_rows)
-        except Exception:
-            pass
+            comm_ok = True
+        except Exception as e:
+            logger.warning(f"월 누적 커미션 조회 실패: {e}")
 
-        item_lines = []
-        for it in new_items[:5]:
-            d_raw = str(it.get("date") or "")
-            d_fmt = f"{d_raw[4:6]}/{d_raw[6:8]}" if len(d_raw) == 8 else d_raw
-            pname = str(it.get("productName") or "상품")[:30]
-            qty = int(it.get("quantity", 1) or 1)
-            g = int(round(float(it.get("gmv", 0) or 0)))
-            c = int(round(float(it.get("commission", 0) or 0)))
-            src_badge = format_order_source_badge(it.get("subId"))
-            item_lines.append(f"• [{d_fmt}·{esc(src_badge)}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수수료 <b>{c:,}원</b>)")
-        if len(new_items) > 5:
-            item_lines.append(f"• 외 {len(new_items) - 5}건 추가")
-        items_block = "\n".join(item_lines)
+        # 1) 새 주문 알림: 전송 성공 시에만 notified_order_keys에 기록
+        if new_items:
+            new_gmv = sum(int(round(float(it.get("gmv", 0) or 0))) for it in new_items)
+            new_comm = sum(int(round(float(it.get("commission", 0) or 0))) for it in new_items)
+            item_lines = []
+            for it in new_items[:5]:
+                d_raw = str(it.get("date") or "")
+                d_fmt = f"{d_raw[4:6]}/{d_raw[6:8]}" if len(d_raw) == 8 else d_raw
+                pname = str(it.get("productName") or "상품")[:30]
+                qty = int(it.get("quantity", 1) or 1)
+                g = int(round(float(it.get("gmv", 0) or 0)))
+                c = int(round(float(it.get("commission", 0) or 0)))
+                src_badge = format_order_source_badge(it.get("subId"))
+                item_lines.append(f"• [{d_fmt}·{esc(src_badge)}] {esc(pname)} x{qty} (<b>{g:,}원</b> / 수수료 <b>{c:,}원</b>)")
+            if len(new_items) > 5:
+                item_lines.append(f"• 외 {len(new_items) - 5}건 추가")
+            items_block = "\n".join(item_lines)
 
-        msg = (
-            f"🔔 <b>[쿠팡 파트너스 새 주문 집계!]</b> (+{len(new_items)}건)\n\n"
-            f"{items_block}\n\n"
-            f"• 신규 결제액 / 확정 수익: <b>{new_gmv:,}원</b> / <b>{new_comm:,}원</b>\n"
-            f"• {now.month}월 누적: <b>{m_orders:,}건</b> | <b>{m_gmv:,}원</b> | 수익 <b>{m_comm:,}원</b> (클릭 {m_clicks:,}회)\n"
-            f"※ <i>쿠팡 API는 D+1~D+2 지연 집계 기준입니다.</i>"
-        )
-        send_telegram(chat_id=target_channel, text=msg)
-        logger.info(f"📢 새 주문 알림 발송: +{len(new_items)}건 ({new_gmv:,}원 / 수수료 {new_comm:,}원)")
-
-        cur_step = m_gmv // 100000
-        last_step = int(tracker.get("month_milestone_step", 0) or 0)
-        if cur_step > last_step and cur_step > 0:
-            target_amount = cur_step * 100000
-            milestone_msg = (
-                f"🏆 <b>[월 누적 판매액 마일스톤 달성!]</b>\n\n"
-                f"💰 {now.month}월 누적 결제액 <b>{target_amount:,}원</b>을 돌파했습니다!\n"
-                f"• {now.month}월 누적 결제액: <b>{m_gmv:,}원</b>\n"
-                f"• {now.month}월 확정 수익: <b>{m_comm:,}원</b>\n"
-                f"• 총 주문 건수: <b>{m_orders:,}건</b>\n\n"
-                f"📈 다음 목표({(cur_step+1)*10:,}만원)를 향해 순항 중! 🔥"
+            msg = (
+                f"🔔 <b>[쿠팡 파트너스 새 주문 집계!]</b> (+{len(new_items)}건)\n\n"
+                f"{items_block}\n\n"
+                f"• 신규 결제액 / 확정 수익: <b>{new_gmv:,}원</b> / <b>{new_comm:,}원</b>\n"
+                f"• {now.month}월 누적: <b>{m_orders:,}건</b> | <b>{m_gmv:,}원</b> | 수익 <b>{m_comm:,}원</b> (클릭 {m_clicks:,}회)\n"
+                f"※ <i>쿠팡 API는 D+1~D+2 지연 집계 기준입니다.</i>"
             )
-            send_telegram(chat_id=target_channel, text=milestone_msg)
-            logger.info(f"🏆 월 누적 마일스톤 알림 발송: {target_amount:,}원 돌파")
-            tracker["month_milestone_step"] = cur_step
+            order_ok = bool(target_channel) and bool(send_telegram(chat_id=target_channel, text=msg))
+            if order_ok:
+                notified_list.extend(new_keys)
+                tracker["notified_order_keys"] = notified_list[-500:]
+                tracker_changed = True
+                logger.info(f"📢 새 주문 알림 발송: +{len(new_items)}건 ({new_gmv:,}원 / 수수료 {new_comm:,}원)")
+            else:
+                logger.warning(f"⚠️ 새 주문 알림 전송 실패 ({len(new_items)}건) — 다음 회차 재시도")
 
-        tracker["notified_order_keys"] = notified_list[-500:]
-        save_sales_tracker(tracker)
+        # 2) 매출 마일스톤 알림: 자기 전송 결과에 따라 독립적으로 단계/재시도 플래그 갱신
+        if comm_ok:
+            cur_step = m_gmv // 100000
+            last_step = int(tracker.get("month_milestone_step", 0) or 0)
+            if cur_step > last_step and cur_step > 0:
+                target_amount = cur_step * 100000
+                milestone_msg = (
+                    f"🏆 <b>[월 누적 판매액 마일스톤 달성!]</b>\n\n"
+                    f"💰 {now.month}월 누적 결제액 <b>{target_amount:,}원</b>을 돌파했습니다!\n"
+                    f"• {now.month}월 누적 결제액: <b>{m_gmv:,}원</b>\n"
+                    f"• {now.month}월 확정 수익: <b>{m_comm:,}원</b>\n"
+                    f"• 총 주문 건수: <b>{m_orders:,}건</b>\n\n"
+                    f"📈 다음 목표({(cur_step+1)*10:,}만원)를 향해 순항 중! 🔥"
+                )
+                milestone_ok = bool(target_channel) and bool(send_telegram(chat_id=target_channel, text=milestone_msg))
+                if milestone_ok:
+                    logger.info(f"🏆 월 누적 마일스톤 알림 발송: {target_amount:,}원 돌파")
+                    tracker["month_milestone_step"] = cur_step
+                    tracker.pop("milestone_retry_pending", None)
+                    tracker_changed = True
+                else:
+                    logger.warning(f"⚠️ 월 누적 마일스톤 알림 전송 실패 ({target_amount:,}원) — 다음 회차 재시도")
+                    if not tracker.get("milestone_retry_pending"):
+                        tracker["milestone_retry_pending"] = True
+                        tracker_changed = True
+            elif tracker.pop("milestone_retry_pending", None) is not None:
+                tracker_changed = True
+        else:
+            if not tracker.get("milestone_retry_pending"):
+                tracker["milestone_retry_pending"] = True
+                tracker_changed = True
+            logger.warning("⚠️ 월 누적 실적 조회 실패로 마일스톤 확인을 다음 회차에 재시도합니다.")
+
+        if tracker_changed:
+            save_sales_tracker(tracker)
 
     except Exception as e:
         logger.error(f"판매 모니터링 오류: {e}")
@@ -2486,6 +3018,7 @@ def main():
     seen = load_seen()
     quota = load_post_quota()
     flyer_queue = load_flyer_queue()
+    ocr_cache = load_ocr_cache()
     run_stats = {"queued": 0, "sent": 0}
 
     def _remaining_daily_room() -> int:
@@ -2519,6 +3052,7 @@ def main():
                     flyer_queue=flyer_queue,
                     quota=quota,
                     run_stats=run_stats,
+                    ocr_cache=ocr_cache,
                 )
 
     queued_this_run = run_stats["queued"]
