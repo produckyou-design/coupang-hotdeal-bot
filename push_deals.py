@@ -28,6 +28,8 @@ if sys.stderr is not None and hasattr(sys.stderr, "detach"):
 
 load_dotenv()
 
+from urllib.parse import parse_qs, unquote, urlparse
+
 from coupang_api import (
     CoupangPartnersAPI,
     classify_sub_id,
@@ -42,6 +44,12 @@ from flyer_renderer import (
     is_high_ticket_mega,
     render_hotdeal_flyer,
     shorten_card_title,
+)
+from price_history import (
+    PriceHistoryDB,
+    build_option_key,
+    classify_deal_category,
+    compute_effective_unit_metrics,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,9 +81,11 @@ TRACKER_FILE = os.path.join(BASE_DIR, "sales_tracker.json")
 QUOTA_FILE = os.path.join(BASE_DIR, "post_quota.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "flyer_queue.json")
 OCR_CACHE_FILE = os.path.join(BASE_DIR, "ocr_cache.json")
+PRICE_DB_FILE = os.path.join(BASE_DIR, "price_history.db")
 OCR_CACHE_TTL_HOURS = 24
 OCR_CACHE_MAX_ENTRIES = 300
 _LAST_OCR_HAD_ERROR = False
+_PRICE_DB_CACHE: Dict[str, PriceHistoryDB] = {}
 LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
@@ -86,15 +96,31 @@ DAILY_MAX_COMMUNITY_DEALS = 200
 GOLDBOX_PER_SLOT = 3
 DAILY_MAX_TOTAL_DEALS = 200
 MAX_COMMUNITY_PER_RUN = 20
+MAX_PER_SOURCE_PER_RUN = 6
 MIN_COMMUNITY_INTERVAL_MINUTES = 0
 FLYER_BATCH_SIZE = 4
-FLYER_MAX_WAIT_MINUTES = 45
-FLYER_SOLO_WAIT_MINUTES = 90
+FLYER_MAX_WAIT_MINUTES = 20
+FLYER_SOLO_WAIT_MINUTES = 60
 FLYER_URGENT_DISCOUNT_RATE = 50
 FLYER_URGENT_WAIT_MINUTES = 10
 FLYER_ITEM_TTL_HOURS = 6
 QUIET_HOURS_START = 0
 QUIET_HOURS_END = 7
+
+WAIT_EXPIRE_MINUTES = 120
+WAIT_RECHECK_MIN_MINUTES = 8
+SOURCE_429_DEFAULT_COOLDOWN_MINUTES = 30
+SOURCE_403_COOLDOWN_MINUTES = 120
+PRICE_DROP_REENTRY_PCT = 5.0
+
+CATEGORY_MIN_DISCOUNT_MAP = {
+    "food": 15,
+    "living": 18,
+    "it": 20,
+    "general": 20,
+}
+IT_HIGH_SAVINGS_MIN_RATE = 12
+IT_HIGH_SAVINGS_MIN_WON = 50000
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
@@ -104,6 +130,7 @@ SOURCE_SUB_ID_MAP = {
     "arca": "tgarca",
     "ruliweb": "tgruli",
     "ppomppu": "tgppom",
+    "dealbada": "tgdealbada",
 }
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
@@ -1001,14 +1028,15 @@ def parse_shipping_details(
             except Exception:
                 pass
 
-    # 무료배송 기준 금액('29,800원 이상 무료배송' 등)을 먼저 걷어낸 뒤에만 유료 배송비 추출
+    # 무료배송 기준 금액('29,800원 이상 무료배송' 등) 및 '배송비 무료/0원'을 먼저 걷어낸 뒤에만 유료 배송비 추출
     combined_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", combined)
+    combined_no_thr = re.sub(r"배송비[ \t]*(?:무료|0[ \t]*원|없음)", " ", combined_no_thr)
     extra_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", extra_shipping or "")
 
     shipping_fee = 0
     for pat in (
-        r"(?:유료배송|배송비|택배비|배송료|운송비)\s*[:：\s+\-]*([\d,]+)\s*원",
-        r"([\d,]+)\s*원\s*(?:배송비|택배비|배송료)",
+        r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*([\d,]+)[ \t]*원",
+        r"([\d,]+)[ \t]*원[ \t]*(?:배송비|택배비|배송료)",
     ):
         for fm in re.finditer(pat, combined_no_thr):
             val = int(fm.group(1).replace(",", ""))
@@ -2077,6 +2105,204 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
 
 
 # ==========================================
+# 3-B. 딜바다 국내핫딜 수집기 및 출처 쿨다운 헬퍼
+# ==========================================
+def get_price_db() -> PriceHistoryDB:
+    """현재 설정된 PRICE_DB_FILE 경로에 대한 SQLite DB 인스턴스 반환"""
+    db_path = os.path.abspath(PRICE_DB_FILE)
+    db = _PRICE_DB_CACHE.get(db_path)
+    if db is None:
+        db = PriceHistoryDB(db_path)
+        _PRICE_DB_CACHE[db_path] = db
+    return db
+
+
+def _resolve_sub_id(source_name: str, track: str = "A") -> str:
+    base = SOURCE_SUB_ID_MAP.get(source_name, f"tg{re.sub(r'[^a-zA-Z0-9]', '', source_name)}")
+    return f"{base}np" if str(track).upper() == "B" else base
+
+
+def _parse_retry_after_minutes(res: Any, default_minutes: int = SOURCE_429_DEFAULT_COOLDOWN_MINUTES) -> int:
+    try:
+        raw = str((getattr(res, "headers", None) or {}).get("Retry-After") or "").strip()
+        if raw.isdigit():
+            secs = max(60, int(raw))
+            return max(1, (secs + 59) // 60)
+    except Exception:
+        pass
+    return default_minutes
+
+
+def _record_source_http_block(source_name: str, res: Any) -> None:
+    status = int(getattr(res, "status_code", 0) or 0)
+    if status == 429:
+        mins = _parse_retry_after_minutes(res)
+        get_price_db().set_source_cooldown(source_name, 429, mins, reason="http_429")
+        logger.warning(f"⏸️ [{source_name}] HTTP 429 수신 — {mins}분 쿨다운 설정")
+    elif status == 403:
+        get_price_db().set_source_cooldown(source_name, 403, SOURCE_403_COOLDOWN_MINUTES, reason="http_403")
+        logger.warning(f"🛑 [{source_name}] HTTP 403 차단 감지 — {SOURCE_403_COOLDOWN_MINUTES}분 쿨다운 설정")
+
+
+def _extract_coupang_url_from_href_or_text(raw: str) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if "unsafelink.com/" in s:
+        s = s.split("unsafelink.com/")[-1]
+    if "coupang.com" in s.lower() and not ("tu=" in s and "linkprice" in s.lower()):
+        m = re.search(r"https?://(?:www\.|m\.|link\.)?coupang\.com[^\s\"'<>]*", s, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    try:
+        qs = parse_qs(urlparse(s).query or "")
+        for key in ("tu", "url", "target"):
+            for val in qs.get(key, []):
+                decoded = unquote(val)
+                if "coupang.com" in decoded.lower():
+                    return decoded
+    except Exception:
+        pass
+    return None
+
+
+def collect_dealbada_deals() -> List[Dict[str, Any]]:
+    """딜바다 국내핫딜 게시판 1페이지 쿠팡 핫딜 수집"""
+    deals: List[Dict[str, Any]] = []
+    url = "https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            _record_source_http_block("dealbada", r)
+            return deals
+        soup = BeautifulSoup(r.text, "html.parser")
+        for row in soup.select("table tbody tr"):
+            row_cls = row.get("class") or []
+            if "bo_notice" in row_cls or "notice" in row_cls:
+                continue
+            if row.select_one(".deal_end, del, s, strike"):
+                continue
+
+            subj_a = row.select_one("td.td_subject a[href*='wr_id='], a[href*='bo_table=deal_domestic'][href*='wr_id=']")
+            if not subj_a:
+                continue
+            href = str(subj_a.get("href") or "").strip()
+            m_id = re.search(r"wr_id=(\d+)", href)
+            if not m_id:
+                continue
+
+            row_txt = " ".join(row.get_text(" ", strip=True).split())
+            raw_t = " ".join(subj_a.get_text(" ", strip=True).split())
+            if not raw_t:
+                continue
+            if "쿠팡" not in raw_t and "쿠팡" not in row_txt and "coupang" not in row_txt.lower():
+                continue
+
+            comments = 0
+            cmt_el = row.select_one(".cnt_cmt")
+            if cmt_el:
+                m_c = re.search(r"\d+", cmt_el.get_text(strip=True))
+                if m_c:
+                    comments = int(m_c.group(0))
+
+            title = re.sub(r"\s*\[\d+\]\s*$", "", raw_t).strip()
+            if not title or is_closed_deal(title):
+                continue
+
+            votes = 0
+            good_el = row.select_one("td.td_num:last-of-type, .bo_v_good")
+            if good_el:
+                m_v = re.search(r"\d+", good_el.get_text(strip=True))
+                if m_v:
+                    votes = int(m_v.group(0))
+
+            wr_id = m_id.group(1)
+            deal_id = f"dealbada_{wr_id}"
+            full_url = f"https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id={wr_id}"
+            if not any(d["id"] == deal_id for d in deals):
+                deals.append({
+                    "id": deal_id,
+                    "title": title,
+                    "link": full_url,
+                    "votes": votes,
+                    "downvotes": 0,
+                    "comments": comments,
+                    "hits": 0,
+                })
+    except Exception as e:
+        logger.error(f"딜바다 수집 오류: {e}")
+    return deals
+
+
+def parse_dealbada_detail(url: str) -> Optional[Dict[str, Any]]:
+    """딜바다 국내핫딜 본문 파싱 (#bo_v_link 직접 쿠팡 URL + linkprice tu 디코딩)"""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        if res.status_code != 200:
+            _record_source_http_block("dealbada", res)
+            if _is_transient_http_status(res.status_code):
+                logger.warning(f"⏳ 딜바다 상세 일시 오류 (HTTP {res.status_code}): {url}")
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
+            return None
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        title_el = soup.select_one("#bo_v_title, .bo_v_tit")
+        extracted_title = " ".join(title_el.get_text(" ", strip=True).split()) if title_el else ""
+        if title_el and (title_el.select_one(".deal_end, del, s, strike") or is_closed_deal(extracted_title)):
+            return None
+
+        cp_url: Optional[str] = None
+        for a in soup.select("#bo_v_link a, #bo_v_atc a, #bo_v_con a, a"):
+            cand = _extract_coupang_url_from_href_or_text(a.get("href", ""))
+            if not cand:
+                cand = _extract_coupang_url_from_href_or_text(a.get_text(" ", strip=True))
+            if cand:
+                cp_url = cand
+                break
+
+        if not cp_url:
+            m_raw = re.search(r"https?://(?:www\.|m\.|link\.)?coupang\.com/(?:vp/products/\d+|re/[^\s\"'<>]+|go/[^\s\"'<>]+)[^\s\"'<>]*", res.text)
+            if m_raw:
+                cp_url = m_raw.group(0)
+
+        if not cp_url:
+            return None
+
+        body_el = soup.select_one("#bo_v_con") or soup.select_one("#bo_v_atc")
+        img_urls: List[str] = []
+        body_text = ""
+        if body_el:
+            for img in body_el.select("img"):
+                iu = str(img.get("src") or "").strip()
+                if not iu or iu.endswith(".svg") or "emoticon" in iu.lower() or "twemoji" in iu.lower():
+                    continue
+                if iu.startswith("//"):
+                    iu = "https:" + iu
+                elif iu.startswith("/"):
+                    iu = "https://www.dealbada.com" + iu
+                if iu not in img_urls:
+                    img_urls.append(iu)
+            body_text = body_el.get_text("\n", strip=True)
+
+        return {
+            "coupang_url": cp_url,
+            "body_text": body_text,
+            "img_url": img_urls[0] if img_urls else None,
+            "ocr_img_urls": img_urls[:2],
+            "extracted_title": extracted_title,
+        }
+    except requests.Timeout as e:
+        logger.warning(f"⏳ 딜바다 상세 타임아웃 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "timeout"}
+    except requests.RequestException as e:
+        logger.warning(f"⏳ 딜바다 상세 네트워크 일시 오류 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "request_error"}
+    except Exception as e:
+        logger.error(f"딜바다 상세 파싱 오류 ({url}): {e}")
+        return None
+
+
+# ==========================================
 # 4. 핫딜 송출 엔진
 # ==========================================
 def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
@@ -2162,6 +2388,195 @@ def format_deal_message(clean_title: str, p_info: Dict[str, Any], deal_url: str 
     )
 
 
+_AMBIGUOUS_TRACK_B_RE = re.compile(
+    r"\d[\d,]*\s*원\s*(?:부터|~)|최대\s*할인|체감가|적립\s*(?:포함|후)\s*[\d,]+\s*원"
+)
+
+
+def _has_verified_reaction(
+    d: Dict[str, Any],
+    source_name: str,
+    base_title: str,
+    body_text: str,
+) -> bool:
+    votes = int(d.get("votes", 0) or 0)
+    downvotes = int(d.get("downvotes", 0) or 0)
+    comments = int(d.get("comments", 0) or 0)
+    hits = int(d.get("hits", 0) or 0)
+
+    if source_name == "arca" and (votes >= 1 or comments >= 3):
+        return True
+    if source_name == "ruliweb" and (votes >= 1 or comments >= 2 or hits >= 700):
+        return True
+    if source_name == "ppomppu" and (votes >= 1 or comments >= 3):
+        return True
+    if source_name == "dealbada" and (votes >= 2 or comments >= 2):
+        return True
+
+    combined = f"{base_title}\n{body_text}"
+    if downvotes < 2 and any(kw in combined for kw in ("역대가", "역대", "대란", "꿀딜")):
+        return True
+    return False
+
+
+def _has_track_b_food_reaction(
+    d: Dict[str, Any],
+    source_name: str,
+    base_title: str,
+    body_text: str,
+) -> bool:
+    votes = int(d.get("votes", 0) or 0)
+    downvotes = int(d.get("downvotes", 0) or 0)
+    comments = int(d.get("comments", 0) or 0)
+    if downvotes >= 3 and votes < 3:
+        return False
+    if votes >= 3:
+        return True
+    if comments >= 2 and votes >= 1:
+        return True
+    combined = f"{base_title}\n{body_text}"
+    if comments >= 2 and any(kw in combined for kw in ("구매", "주문", "단가", "최저가", "역대", "역대가", "가성비")):
+        return True
+    if source_name == "dealbada" and (votes >= 2 and comments >= 1):
+        return True
+    return False
+
+
+def evaluate_deal_quality(
+    d: Dict[str, Any],
+    source_name: str,
+    p_info: Dict[str, Any],
+    base_title: str,
+    body_text: str,
+    option_key: str = "",
+    price_db: Optional[PriceHistoryDB] = None,
+) -> Dict[str, Any]:
+    """
+    투트랙 + 카테고리별 품질 게이트 평가.
+    - Track A: 명시적 정상가 검증 + 카테고리별 최소 할인율(food 15%, living 18%, general/it 20%, it 5만원+ 절약 시 12%+)
+    - Track B1: 정상가 미확인 딜 중 30일 DB 관측(5일+ 중앙값) 대비 카테고리 기준 할인율 이상 하락
+    - Track B2: 정상가 미확인 식품 딜 중 배송비 포함 유효 단가 산출 + 강한 반응 검증
+    반환 dict: {passed, reason, track, category, evidence_badge, evidence_note, baseline_price, observed_disc_rate, effective_unit_display}
+    """
+    category = classify_deal_category(base_title, body_text)
+    ship_fee = int(p_info.get("shipping_fee", 0) or 0)
+    final_p = int(p_info.get("final_price", 0) or 0)
+    orig_p = int(p_info.get("orig_price", 0) or 0)
+    disc_rate = int(p_info.get("discount_rate", 0) or 0)
+    ship_type = str(p_info.get("shipping_type") or "")
+    total_p = final_p + ship_fee if ship_fee > 0 else final_p
+
+    unit_metrics = compute_effective_unit_metrics(base_title, total_p)
+    effective_unit_display = str(unit_metrics.get("display_unit") or "")
+
+    base_res: Dict[str, Any] = {
+        "passed": False,
+        "reason": "low_discount",
+        "track": "",
+        "category": category,
+        "evidence_badge": "",
+        "evidence_note": "",
+        "baseline_price": 0,
+        "observed_disc_rate": 0,
+        "effective_unit_display": effective_unit_display,
+        "total_price": total_p,
+        "unit_metrics": unit_metrics,
+    }
+
+    low_title = base_title.lower()
+    if any(kw in low_title for kw in PROMO_SKIP_KEYWORDS):
+        base_res["reason"] = "permanent"
+        return base_res
+
+    votes = int(d.get("votes", 0) or 0)
+    downvotes = int(d.get("downvotes", 0) or 0)
+    if votes < 0 or (downvotes >= 4 and votes == 0) or (downvotes >= 6 and downvotes >= votes * 2):
+        base_res["reason"] = "permanent"
+        return base_res
+
+    # Track A: 명시적 정상가 + 판매가 검증 구간
+    if orig_p > final_p >= 1000:
+        min_rate = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
+        save_amt = orig_p - final_p
+        it_high_save = (category == "it" and save_amt >= IT_HIGH_SAVINGS_MIN_WON and disc_rate >= IT_HIGH_SAVINGS_MIN_RATE)
+
+        if disc_rate < min_rate and not it_high_save:
+            base_res["reason"] = "low_discount"
+            return base_res
+
+        if disc_rate >= STRONG_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
+            base_res.update({"passed": True, "reason": "ok", "track": "A"})
+            return base_res
+        if (orig_p >= 1_000_000 or final_p >= 1_000_000) and disc_rate >= MIN_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
+            base_res.update({"passed": True, "reason": "ok", "track": "A"})
+            return base_res
+        if it_high_save and (downvotes < 3 or votes >= 2):
+            base_res.update({"passed": True, "reason": "ok", "track": "A"})
+            return base_res
+        if _has_verified_reaction(d, source_name, base_title, body_text):
+            base_res.update({"passed": True, "reason": "ok", "track": "A"})
+            return base_res
+
+        base_res["reason"] = "wait"
+        return base_res
+
+    # Track B: 정상가 미확인 딜 (판매가 >= 1,000원 필수)
+    if final_p < 1000:
+        base_res["reason"] = "low_discount"
+        return base_res
+
+    if _AMBIGUOUS_TRACK_B_RE.search(base_title):
+        base_res["reason"] = "wait"
+        return base_res
+
+    # Track B1: 동일 옵션 30일(5일 이상 관측) 중앙값 대비 할인 검증
+    if price_db is not None and option_key:
+        obs_ship_type = (
+            "paid"
+            if (ship_fee > 0 or ship_type == "paid")
+            else ("conditional" if ship_type == "conditional" else "free")
+        )
+        baseline = price_db.get_observed_baseline(
+            option_key,
+            shipping_type=obs_ship_type,
+            days=30,
+            min_days=5,
+        )
+        if baseline and baseline["median_price"] > total_p:
+            med_p = int(baseline["median_price"])
+            obs_disc = (med_p - total_p) * 100 // med_p
+            req_obs_disc = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
+            if obs_disc >= req_obs_disc:
+                base_res.update({
+                    "passed": True,
+                    "reason": "ok",
+                    "track": "B",
+                    "evidence_badge": f"30일 관측가 {obs_disc}%↓",
+                    "evidence_note": f"30일 기준 {med_p:,}원 ({baseline['distinct_days']}일 관측)",
+                    "baseline_price": med_p,
+                    "observed_disc_rate": obs_disc,
+                })
+                return base_res
+
+    # Track B2: 식품/반복소비재 단가 + 반응 게이트
+    if category == "food" and effective_unit_display:
+        if _has_track_b_food_reaction(d, source_name, base_title, body_text):
+            ship_note = f"배송포함 {effective_unit_display}" if ship_fee > 0 else effective_unit_display
+            base_res.update({
+                "passed": True,
+                "reason": "ok",
+                "track": "B",
+                "evidence_badge": "단가·반응 검증",
+                "evidence_note": f"{ship_note} · 반응 확인",
+            })
+            return base_res
+        base_res["reason"] = "wait"
+        return base_res
+
+    base_res["reason"] = "low_discount"
+    return base_res
+
+
 def is_quality_hotdeal(
     d: Dict[str, Any],
     source_name: str,
@@ -2169,59 +2584,41 @@ def is_quality_hotdeal(
     base_title: str,
     body_text: str,
 ) -> Tuple[bool, str]:
-    """
-    2단계 '진짜 핫딜' 판별 품질 게이트:
-    - 1차(40%+): 명시적 40% 이상 파격 할인이며 업자 비추 스팸이 아니면 즉시 송출
-    - 2차(20~39%): 커뮤니티 추천·댓글·조회수 또는 역대가/대란 신호가 검증된 경우에만 송출 (미달 시 'wait'로 대기)
-    - 20% 미만 및 미식별(0%), 프로모션/비추천 스팸은 원천 배제
-    반환: (통과 여부, 거절 사유 'ok' | 'permanent' | 'low_discount' | 'wait')
-    """
-    low_title = base_title.lower()
-    if any(kw in low_title for kw in PROMO_SKIP_KEYWORDS):
-        return False, "permanent"
-
-    votes = int(d.get("votes", 0) or 0)
-    downvotes = int(d.get("downvotes", 0) or 0)
-    comments = int(d.get("comments", 0) or 0)
-    hits = int(d.get("hits", 0) or 0)
-
-    if votes < 0:
-        return False, "permanent"
-    if (downvotes >= 4 and votes == 0) or (downvotes >= 6 and downvotes >= votes * 2):
-        return False, "permanent"
-
-    disc_rate = int(p_info.get("discount_rate", 0) or 0)
-    orig_p = int(p_info.get("orig_price", 0) or 0)
-    final_p = int(p_info.get("final_price", 0) or 0)
-
-    if disc_rate < MIN_HOTDEAL_DISCOUNT_RATE or not (orig_p > final_p >= 1000):
-        return False, "low_discount"
-
-    # Tier 1: 40%+ 파격 할인 또는 백만원 이상 20%+ 고가 대박 딜은 업자 스팸 신호만 없으면 즉시 통과
-    if disc_rate >= STRONG_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
-        return True, "ok"
-    if (orig_p >= 1_000_000 or final_p >= 1_000_000) and disc_rate >= MIN_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
-        return True, "ok"
-
-    # Tier 2: 20~39% 구간은 커뮤니티 화력 검증 시 통과
-    if source_name == "arca" and (votes >= 1 or comments >= 3):
-        return True, "ok"
-    if source_name == "ruliweb" and (votes >= 1 or comments >= 2 or hits >= 700):
-        return True, "ok"
-    if source_name == "ppomppu" and (votes >= 1 or comments >= 3):
-        return True, "ok"
-
-    combined = f"{base_title}\n{body_text}"
-    if downvotes < 2 and any(kw in combined for kw in ("역대가", "역대", "대란", "꿀딜")):
-        return True, "ok"
-
-    return False, "wait"
+    """기존 2-튜플 시그니처 호환 래퍼"""
+    res = evaluate_deal_quality(d, source_name, p_info, base_title, body_text)
+    return bool(res["passed"]), str(res["reason"])
 
 
 def _drop_ocr_cache_entry(ocr_cache: Dict[str, Any], deal_id: str) -> None:
     if deal_id in ocr_cache:
         ocr_cache.pop(deal_id, None)
         save_ocr_cache(ocr_cache)
+
+
+def _can_reenter_recent_product(
+    product_id: str,
+    option_key: str,
+    total_price: int,
+    price_db: PriceHistoryDB,
+) -> Tuple[bool, float]:
+    """최근 3일 내 동일 product_id라도 같은 옵션 5%+ 추가 하락 또는 별도 옵션이면 재진입 허용"""
+    last_pub = price_db.get_last_published(option_key)
+    if last_pub is not None:
+        return price_db.should_reenter_price_drop(
+            option_key,
+            total_price,
+            drop_pct=PRICE_DROP_REENTRY_PCT,
+            window_days=3,
+        )
+    if (":vid:" in option_key or ":iid:" in option_key) and product_id:
+        with price_db._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM published_prices WHERE product_id = ? LIMIT 1",
+                (str(product_id),),
+            ).fetchone()
+        if row is not None:
+            return True, 0.0
+    return False, 0.0
 
 
 def process_deal(
@@ -2236,6 +2633,19 @@ def process_deal(
 ) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
+        return False
+
+    price_db = get_price_db()
+    wait_key = f"{source_name}:{deal_id}"
+    skip_wait, skip_reason = price_db.should_skip_wait_recheck(wait_key, WAIT_RECHECK_MIN_MINUTES)
+    if skip_wait:
+        if skip_reason == "expired":
+            logger.info(f"⏰ [대기 만료 제외] 120분 초과로 재확인 종료: {d.get('title', '')[:40]}")
+            seen.add(deal_id)
+            save_seen(seen)
+            if ocr_cache is not None:
+                _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
         return False
 
     if ocr_cache is None:
@@ -2257,17 +2667,11 @@ def process_deal(
         seen.add(deal_id)
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
+        price_db.delete_pending_wait(wait_key)
         return False
 
     raw_url = detail["coupang_url"]
     clean_url, product_id = clean_coupang_url(raw_url)
-    if is_product_recently_seen(product_id, seen):
-        logger.info(f"⏭️ [중복상품 스킵] 최근 3일 내 동일 productId({product_id}) 이미 송출됨: {d['title'][:40]}")
-        seen.add(deal_id)
-        save_seen(seen)
-        _drop_ocr_cache_entry(ocr_cache, deal_id)
-        return False
-
     body_text = detail.get("body_text", "")
     img_url = detail.get("img_url")
     ocr_imgs = detail.get("ocr_img_urls") or ([img_url] if img_url else [])
@@ -2278,14 +2682,32 @@ def process_deal(
         seen.add(deal_id)
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
+        price_db.delete_pending_wait(wait_key)
         return False
 
+    option_key = build_option_key(product_id=product_id, url=clean_url, title=base_title)
     pricing_title = base_title
     if detail.get("extracted_price") and detail["extracted_price"] >= 1000:
         if f"{detail['extracted_price']:,}" not in pricing_title and str(detail["extracted_price"]) not in pricing_title:
             pricing_title = f"{pricing_title} ({detail['extracted_price']:,}원)"
 
     clean_title = clean_display_title(base_title)
+
+    # 최근 3일 동일 상품 중복 확인 (단, 동일 옵션 5%+ 추가 하락 또는 별도 옵션은 재진입 판단)
+    recently_seen = is_product_recently_seen(product_id, seen)
+    quick_p = parse_pricing_details(pricing_title, body_text, "", extra_shipping=extra_shipping)
+    quick_total = int(quick_p["final_price"]) + int(quick_p.get("shipping_fee", 0) or 0)
+    if recently_seen and quick_total >= 1000:
+        can_reenter, drop_pct = _can_reenter_recent_product(product_id, option_key, quick_total, price_db)
+        if not can_reenter:
+            logger.info(f"⏭️ [중복상품 스킵] 최근 3일 내 동일 productId({product_id}) 이미 송출됨: {d['title'][:40]}")
+            seen.add(deal_id)
+            save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
+            return False
+        if drop_pct > 0:
+            logger.info(f"📉 [가격하락 재진입 후보] {option_key} 추가 {drop_pct}%↓: {clean_title[:35]}")
 
     # 이미지 OCR 가격 헤더 추출(캐시 재사용) 및 팩트 기반 가격·배송 분석
     ocr_text, ocr_failed = get_or_extract_ocr_text(
@@ -2297,6 +2719,27 @@ def process_deal(
         extra_shipping=extra_shipping,
     )
     p_info = parse_pricing_details(pricing_title, body_text, ocr_text, extra_shipping=extra_shipping)
+    total_price = int(p_info["final_price"]) + int(p_info.get("shipping_fee", 0) or 0)
+
+    if recently_seen:
+        if p_info["sale_price"] < 1000:
+            if ocr_failed and ocr_imgs:
+                return False
+            seen.add(deal_id)
+            save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
+            return False
+        can_reenter, drop_pct = _can_reenter_recent_product(product_id, option_key, total_price, price_db)
+        if not can_reenter:
+            logger.info(f"⏭️ [중복상품 스킵] 최근 3일 내 동일 productId({product_id}) 이미 송출됨: {d['title'][:40]}")
+            seen.add(deal_id)
+            save_seen(seen)
+            _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
+            return False
+        if drop_pct > 0:
+            logger.info(f"📉 [가격하락 재진입 확정] {option_key} 추가 {drop_pct}%↓ ({total_price:,}원)")
 
     if p_info["sale_price"] < 1000:
         if ocr_failed and ocr_imgs:
@@ -2306,37 +2749,88 @@ def process_deal(
         seen.add(deal_id)
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
+        price_db.delete_pending_wait(wait_key)
         return False
 
-    ok_q, reason = is_quality_hotdeal(d, source_name, p_info, base_title, body_text)
+    # 유효 가격 관측 이력 적재 (1일 1옵션 1배송조건 최저가)
+    eval_res = evaluate_deal_quality(
+        d,
+        source_name,
+        p_info,
+        base_title,
+        body_text,
+        option_key=option_key,
+        price_db=price_db,
+    )
+    if eval_res["reason"] != "permanent" and not _AMBIGUOUS_TRACK_B_RE.search(base_title):
+        ship_t = str(p_info.get("shipping_type") or "")
+        obs_ship_type = (
+            "paid"
+            if (int(p_info.get("shipping_fee", 0) or 0) > 0 or ship_t == "paid")
+            else ("conditional" if ship_t == "conditional" else "free")
+        )
+        um = eval_res.get("unit_metrics") or {}
+        price_db.record_observation(
+            option_key=option_key,
+            product_id=product_id,
+            total_price=total_price,
+            sale_price=int(p_info["final_price"]),
+            shipping_fee=int(p_info.get("shipping_fee", 0) or 0),
+            orig_price=int(p_info["orig_price"]),
+            shipping_type=obs_ship_type,
+            category=str(eval_res["category"]),
+            source=source_name,
+            metric_type=str(um.get("metric_type") or ""),
+            metric_value=um.get("metric_value"),
+        )
+
+    ok_q = bool(eval_res["passed"])
+    reason = str(eval_res["reason"])
     if not ok_q:
         if reason == "permanent":
             logger.info(f"🚫 [영구제외] 비핫딜/비추천 과다: {clean_title}")
             seen.add(deal_id)
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
         elif reason == "low_discount":
+            min_cat_rate = CATEGORY_MIN_DISCOUNT_MAP.get(eval_res["category"], MIN_HOTDEAL_DISCOUNT_RATE)
             if ocr_failed and ocr_imgs and (
                 p_info["orig_price"] <= p_info["final_price"]
-                or p_info["discount_rate"] < MIN_HOTDEAL_DISCOUNT_RATE
+                or p_info["discount_rate"] < min_cat_rate
             ):
                 logger.warning(f"⏳ [OCR 일시 실패] 정상가/할인 근거 미확보로 다음 회차 재시도: {clean_title}")
                 return False
             logger.info(
-                f"⏭️ [할인율 미달 스킵] 최소 {MIN_HOTDEAL_DISCOUNT_RATE}% 미만({p_info['discount_rate']}%): {clean_title}"
+                f"⏭️ [기준 미달 스킵] cat={eval_res['category']}, 할인={p_info['discount_rate']}% (<{min_cat_rate}%): {clean_title}"
             )
             seen.add(deal_id)
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
+            price_db.delete_pending_wait(wait_key)
         else:
+            price_db.upsert_pending_wait(
+                wait_key=wait_key,
+                source=source_name,
+                post_id=deal_id,
+                option_key=option_key,
+                url=d["link"],
+                title=clean_title,
+                category=str(eval_res["category"]),
+                reason="wait",
+                max_wait_minutes=WAIT_EXPIRE_MINUTES,
+            )
             logger.info(
-                f"⏳ [검증대기] 핫딜 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
+                f"⏳ [검증대기/{eval_res['category']}] 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
             )
         return False
 
-    # 파트너스 딥링크 생성 (제3자 lptag 제거된 정규 URL 사용, 영숫자 subId 부여)
+    price_db.delete_pending_wait(wait_key)
+    track = str(eval_res["track"] or "A")
+
+    # 파트너스 딥링크 생성 (제3자 lptag 제거된 정규 URL 사용, Track B는 *np subId 분리)
     try:
-        sub_id = SOURCE_SUB_ID_MAP.get(source_name, f"tg{re.sub(r'[^a-zA-Z0-9]', '', source_name)}")
+        sub_id = _resolve_sub_id(source_name, track=track)
         res = coupang_api.create_deeplink([clean_url], sub_id=sub_id)
         items = res.get("data", [])
         if not items:
@@ -2349,18 +2843,28 @@ def process_deal(
         logger.error(f"딥링크 생성 실패: {e}")
         return False
 
+    display_unit = str(p_info.get("unit_info") or "")
+    eff_unit = str(eval_res.get("effective_unit_display") or "")
+    if eff_unit and (not display_unit or int(p_info.get("shipping_fee", 0) or 0) > 0):
+        display_unit = f"{eff_unit} (배송포함)" if int(p_info.get("shipping_fee", 0) or 0) > 0 else eff_unit
+
     # 전단지 큐 모드: 검증 완료 즉시 큐에 적재하고 중복 방지를 위해 seen 기록
     if flyer_queue is not None:
         item = {
             "deal_id": deal_id,
             "product_id": product_id,
+            "option_key": option_key,
             "source": source_name,
+            "track": track,
+            "category": eval_res["category"],
+            "evidence_badge": eval_res["evidence_badge"],
+            "evidence_note": eval_res["evidence_note"],
             "clean_title": clean_title,
             "short_title": shorten_card_title(clean_title),
             "orig_price": int(p_info["orig_price"]),
             "sale_price": int(p_info["final_price"]),
             "discount_rate": int(p_info["discount_rate"]),
-            "unit_info": p_info.get("unit_info", ""),
+            "unit_info": display_unit,
             "reaction_text": p_info.get("reaction_text", ""),
             "shipping_fee": int(p_info.get("shipping_fee", 0) or 0),
             "shipping_type": str(p_info.get("shipping_type") or ""),
@@ -2370,7 +2874,7 @@ def process_deal(
                 clean_title,
                 int(p_info["orig_price"]),
                 int(p_info["final_price"]),
-                p_info.get("unit_info", ""),
+                display_unit,
                 shipping_label=str(p_info.get("shipping_label") or ""),
             ),
             "deeplink": deeplink,
@@ -2387,6 +2891,7 @@ def process_deal(
                     mark_product_seen(product_id, seen)
                     save_seen(seen)
                     _drop_ocr_cache_entry(ocr_cache, deal_id)
+                    price_db.record_published(option_key, product_id, total_price, int(p_info["final_price"]), track=track)
                     if quota is not None:
                         quota["community_sent"] = int(quota.get("community_sent", 0) or 0) + 1
                         quota["last_community_ts"] = int(time.time())
@@ -2409,10 +2914,11 @@ def process_deal(
         save_seen(seen)
         save_flyer_queue(flyer_queue)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
+        price_db.record_published(option_key, product_id, total_price, int(p_info["final_price"]), track=track)
         if run_stats is not None:
             run_stats["queued"] = run_stats.get("queued", 0) + 1
         logger.info(
-            f"📥 [{source_name}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
+            f"📥 [{source_name}/Track{track}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
             f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
         )
         return True
@@ -2435,8 +2941,9 @@ def process_deal(
         mark_product_seen(product_id, seen)
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
+        price_db.record_published(option_key, product_id, total_price, int(p_info["final_price"]), track=track)
         logger.info(
-            f"✅ [{source_name}] 송출 완료: {clean_title} "
+            f"✅ [{source_name}/Track{track}] 송출 완료: {clean_title} "
             f"(정가={p_info['orig_price']:,}원, 특가={p_info['final_price']:,}원, 할인율={p_info['discount_rate']}%)"
         )
         time.sleep(2)
@@ -3014,11 +3521,15 @@ def main():
     update_pc_heartbeat()
     sync_git_state()
 
-    logger.info("🚀 핫딜 수집 및 전단지 송출 작업 시작 (20%+ 정밀 검증 · 골드박스 제외 · v5 빅타이포 전단지)...")
+    logger.info("🚀 핫딜 수집 및 전단지 송출 작업 시작 (투트랙 선별 · 딜바다 포함 4개 출처 라운드로빈 · v5 빅타이포 전단지)...")
     seen = load_seen()
     quota = load_post_quota()
     flyer_queue = load_flyer_queue()
     ocr_cache = load_ocr_cache()
+    price_db = get_price_db()
+    expired_waits = price_db.cleanup_expired_waits()
+    if expired_waits > 0:
+        logger.info(f"🧹 [대기열 정리] 만료된 대기 딜 {expired_waits}건 정리 완료")
     run_stats = {"queued": 0, "sent": 0}
 
     def _remaining_daily_room() -> int:
@@ -3034,26 +3545,72 @@ def main():
             f"(송출={quota['community_sent']}/{DAILY_MAX_COMMUNITY_DEALS}, 큐={len(flyer_queue)})"
         )
     else:
-        for collector, parser, source_name in (
+        sources = (
             (collect_ruliweb_deals, parse_ruliweb_detail, "ruliweb"),
             (collect_ppomppu_deals, parse_ppomppu_detail, "ppomppu"),
             (collect_arcalive_deals, parse_arcalive_detail, "arca"),
-        ):
+            (collect_dealbada_deals, parse_dealbada_detail, "dealbada"),
+        )
+        collected_by_source: List[Tuple[str, Any, List[Dict[str, Any]]]] = []
+        for collector, parser, source_name in sources:
+            cd = price_db.get_source_cooldown(source_name)
+            if cd:
+                logger.info(
+                    f"⏸️ [{source_name}] 쿨다운 중 (HTTP {cd.get('status_code')}, ~{cd.get('cooldown_until')}) — 목록 수집 생략"
+                )
+                continue
+            try:
+                rows = collector()
+            except Exception as e:
+                logger.error(f"[{source_name}] 목록 수집 오류: {e}")
+                rows = []
+            collected_by_source.append((source_name, parser, rows))
+
+        iterators = {
+            src: [row for row in rows if row.get("id") not in seen]
+            for src, _, rows in collected_by_source
+        }
+        parser_map = {src: parser for src, parser, _ in collected_by_source}
+        attempts_by_source = {src: 0 for src, _, _ in collected_by_source}
+        active_sources = [src for src, _, _ in collected_by_source if iterators.get(src)]
+
+        while active_sources:
             if (run_stats["queued"] + run_stats["sent"]) >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= _remaining_daily_room():
                 break
-            for d in collector():
+            next_active: List[str] = []
+            for src in active_sources:
                 if (run_stats["queued"] + run_stats["sent"]) >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= _remaining_daily_room():
                     break
-                process_deal(
-                    d,
-                    parser,
-                    source_name,
-                    seen,
-                    flyer_queue=flyer_queue,
-                    quota=quota,
-                    run_stats=run_stats,
-                    ocr_cache=ocr_cache,
-                )
+                if attempts_by_source[src] >= MAX_PER_SOURCE_PER_RUN:
+                    continue
+                q_rows = iterators[src]
+                processed_one = False
+                while q_rows and not processed_one:
+                    cand = q_rows.pop(0)
+                    wait_key = f"{src}:{cand['id']}"
+                    skip_wait, skip_reason = price_db.should_skip_wait_recheck(wait_key, WAIT_RECHECK_MIN_MINUTES)
+                    if skip_wait:
+                        if skip_reason == "expired":
+                            seen.add(cand["id"])
+                            save_seen(seen)
+                            _drop_ocr_cache_entry(ocr_cache, cand["id"])
+                            price_db.delete_pending_wait(wait_key)
+                        continue
+                    attempts_by_source[src] += 1
+                    process_deal(
+                        cand,
+                        parser_map[src],
+                        src,
+                        seen,
+                        flyer_queue=flyer_queue,
+                        quota=quota,
+                        run_stats=run_stats,
+                        ocr_cache=ocr_cache,
+                    )
+                    processed_one = True
+                if q_rows and attempts_by_source[src] < MAX_PER_SOURCE_PER_RUN:
+                    next_active.append(src)
+            active_sources = next_active
 
     queued_this_run = run_stats["queued"]
     total_sent = run_stats["sent"]

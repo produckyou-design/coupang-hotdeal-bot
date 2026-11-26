@@ -430,8 +430,10 @@ def _tier_emoji(rate: int) -> str:
 
 
 def is_half_off_mega(deal: Dict[str, Any]) -> bool:
-    """50% 이상 반값 초특가 여부"""
-    return int(deal.get("discount_rate", 0) or 0) >= 50
+    """50% 이상 반값 초특가 여부 (명시적 정상가·판매가 검증 시에만)"""
+    orig_p = int(deal.get("orig_price", 0) or 0)
+    sale_p = int(deal.get("sale_price", 0) or 0)
+    return orig_p > sale_p >= 1000 and int(deal.get("discount_rate", 0) or 0) >= 50
 
 
 def is_high_ticket_mega(deal: Dict[str, Any]) -> bool:
@@ -439,7 +441,7 @@ def is_high_ticket_mega(deal: Dict[str, Any]) -> bool:
     orig_p = int(deal.get("orig_price", 0) or 0)
     sale_p = int(deal.get("sale_price", 0) or 0)
     disc_r = int(deal.get("discount_rate", 0) or 0)
-    return (orig_p >= 1_000_000 or sale_p >= 1_000_000) and disc_r >= 20
+    return orig_p > sale_p >= 1000 and (orig_p >= 1_000_000 or sale_p >= 1_000_000) and disc_r >= 20
 
 
 def _deal_theme(deal: Dict[str, Any]) -> str:
@@ -474,7 +476,10 @@ def _deal_badge_style(
     if theme == "vip":
         save_str = _format_save_kor(save_p) if save_p >= 10000 else f"{disc_r}%"
         return f"고가 특가 · {save_str}↓", (15, 23, 42), (253, 224, 71), (245, 158, 11)
-    lbl, col = _tier_badge(disc_r) if disc_r >= 20 else ("검증특가", (37, 99, 235))
+    ev_badge = str(deal.get("evidence_badge") or "").strip()
+    if ev_badge and disc_r <= 0:
+        return ev_badge, (5, 150, 105), (255, 255, 255), None
+    lbl, col = _tier_badge(disc_r) if disc_r >= 12 else ("단가·반응 선별" if not ev_badge else ev_badge, (5, 150, 105))
     return lbl, col, (255, 255, 255), None
 
 
@@ -518,6 +523,7 @@ def _draw_price_box(
     eb_font: Optional[str],
     orig_prefix: str = "",
     theme: str = "normal",
+    evidence_note: str = "",
 ) -> None:
     box_x1, box_y1, box_x2, box_y2 = box
     if theme == "half":
@@ -584,8 +590,10 @@ def _draw_price_box(
         sb = draw.textbbox((0, 0), save_txt, font=f_s)
         draw.text((arr_x + 44 - sb[0], l1_y - sb[1]), save_txt, font=f_s, fill=save_col)
     else:
-        f_sub = _load_font(eb_font, 34)
-        draw.text((l1_x, l1_y), "커뮤니티 실시간 검증 특가", font=f_sub, fill=orig_col)
+        ev_txt = (evidence_note or "").strip() or "실시간 커뮤니티 검증 특가"
+        f_sub = _fit_font(draw, ev_txt, eb_font, 32, avail_box_w, min_size=20)
+        sb = draw.textbbox((0, 0), ev_txt, font=f_sub)
+        draw.text((l1_x - sb[0], l1_y - sb[1]), ev_txt, font=f_sub, fill=orig_col)
 
     l2_y = box_y1 + 80
     r_str = f"{disc_r}%" if disc_r > 0 else "특가"
@@ -642,7 +650,8 @@ def _draw_single_rich_card(
     else:
         _draw_vertical_gradient(canvas, (0, 0, W, header_h), (11, 18, 33), (30, 41, 59))
         hdr_title = "쿠팡 실시간 특가"
-        hdr_badge_txt = f"{disc_r}%↓ 특가" if disc_r > 0 else "실시간 특가"
+        ev_badge = str(deal.get("evidence_badge") or "").strip()
+        hdr_badge_txt = f"{disc_r}%↓ 특가" if disc_r > 0 else (ev_badge or "단가·반응 선별")
         hb_bg, hb_fg, hb_bd = (225, 29, 72), (255, 255, 255), None
         card_bd, card_bd_w = (226, 232, 240), 3
 
@@ -724,7 +733,10 @@ def _draw_single_rich_card(
             _draw_pill(draw, rx1, cur_y + 10, vip_note, f_react, bg=(254, 249, 195), fg=(113, 63, 18), pad_x=18, pad_y=10, radius=12)
 
     # 4) Rich Price Story Box
-    _draw_price_box(draw, (rx1, box_y1, rx2, cy2 - 26), orig_p, sale_p, disc_r, hv_font, eb_font, orig_prefix="정상가 ", theme=theme)
+    _draw_price_box(
+        draw, (rx1, box_y1, rx2, cy2 - 26), orig_p, sale_p, disc_r, hv_font, eb_font,
+        orig_prefix="정상가 ", theme=theme, evidence_note=str(deal.get("evidence_note") or ""),
+    )
 
     final = canvas.resize((780, 490), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
@@ -806,7 +818,10 @@ def _draw_grid_card_item(
             chip_fg = (146, 64, 14) if (theme == "vip" or (theme == "normal" and has_paid_or_cond)) else ((190, 18, 60) if theme == "half" else (4, 120, 87))
             _draw_pill(draw, cx1 + 22, chip_y, chip_txt, f_chip, bg=chip_bg, fg=chip_fg, pad_x=20, pad_y=10, radius=12)
 
-    _draw_price_box(draw, (box_x1, box_y1, box_x2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font, theme=theme)
+    _draw_price_box(
+        draw, (box_x1, box_y1, box_x2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font,
+        theme=theme, evidence_note=str(deal.get("evidence_note") or ""),
+    )
 
 
 def _draw_wide_card_item(
@@ -895,7 +910,10 @@ def _draw_wide_card_item(
         r_lines = _wrap_title_lines(draw, f"반응: {reaction}", f_react, rw - 32, max_lines=1)
         _draw_pill(draw, rx1, cur_y + 10, r_lines[0], f_react, bg=(241, 245, 249), fg=(71, 85, 105), pad_x=18, pad_y=10, radius=12)
 
-    _draw_price_box(draw, (rx1, box_y1, rx2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font, orig_prefix="정상가 ", theme=theme)
+    _draw_price_box(
+        draw, (rx1, box_y1, rx2, box_y2), orig_p, sale_p, disc_r, hv_font, eb_font,
+        orig_prefix="정상가 ", theme=theme, evidence_note=str(deal.get("evidence_note") or ""),
+    )
 
 
 def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -> bytes:
@@ -953,7 +971,7 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     draw.text((44, (header_h - (hb[3] - hb[1])) // 2 - hb[1]), hdr_title, font=f_hdr, fill=(255, 255, 255))
 
     max_rate = max(int(d.get("discount_rate", 0) or 0) for d in batch)
-    badge_txt = f"최대 {max_rate}%↓"
+    badge_txt = f"최대 {max_rate}%↓" if max_rate > 0 else "단가·반응 선별"
     btw, _ = _text_size(draw, badge_txt, f_hdr_badge)
     b_bg, b_fg = ((15, 23, 42), (254, 240, 138)) if has_half else ((225, 29, 72), (255, 255, 255))
     _draw_pill(draw, W - 44 - (btw + 60), 28, badge_txt, f_hdr_badge, bg=b_bg, fg=b_fg, pad_x=30, pad_y=18)
@@ -1048,8 +1066,9 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
             tags.append(f"💎<b>[{_format_save_kor(save_amt)} 할인]</b>")
         tag_prefix = (" ".join(tags) + " ") if tags else ""
 
-        emo = _tier_emoji(disc_r) if disc_r >= 20 else "🔥"
+        emo = _tier_emoji(disc_r) if disc_r >= 20 else ("🏷️" if disc_r >= 12 else "💡")
         price_str = f"<b>{sale_p:,}원</b>" if sale_p >= 1000 else "<b>특가 확인</b>"
+        ev_badge = str(d.get("evidence_badge") or "").strip()
         if orig_p > sale_p >= 1000 and disc_r >= 3:
             orig_part = f"<s>{orig_p:,}원</s> → "
             rate_part = f"{tag_prefix}{emo}<b>{disc_r}%↓</b> "
@@ -1061,7 +1080,10 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
                 extra = f" ({save_amt:,}원 절약)"
         else:
             orig_part = ""
-            rate_part = f"{tag_prefix}{emo} "
+            if ev_badge:
+                rate_part = f"{tag_prefix}{emo}[{html.escape(ev_badge, quote=False)}] "
+            else:
+                rate_part = f"{tag_prefix}{emo} "
             extra = f" · {html.escape(unit_raw, quote=False)}" if unit_raw else ""
 
         ship_label = resolve_shipping_label(d)
