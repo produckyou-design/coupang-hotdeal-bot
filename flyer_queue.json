@@ -1,1 +1,27 @@
-[]
+[
+  {
+    "deal_id": "ppomppu_752130",
+    "product_id": "9537835535",
+    "option_key": "pid:9537835535:vid:95399374994",
+    "source": "ppomppu",
+    "track": "A",
+    "category": "general",
+    "evidence_badge": "",
+    "evidence_note": "",
+    "clean_title": "테이프클리너 원터치 휴대용 먼지제거 롤러세트",
+    "short_title": "테이프클리너 원터치 휴대용",
+    "orig_price": 18800,
+    "sale_price": 13600,
+    "discount_rate": 27,
+    "unit_info": "",
+    "reaction_text": "작은거 5개짜리보다 면적큰 4개짜리가 가성비 좋은 것 같네요.",
+    "shipping_fee": 0,
+    "shipping_type": "conditional",
+    "shipping_condition": "와우 무료배송",
+    "shipping_label": "와우 무료배송",
+    "chip": "5,200원 절약 · 와우 무료배송",
+    "deeplink": "https://link.coupang.com/a/iZOkwSykLI",
+    "img_url": "https://cdn4.ppomppu.co.kr/zboard/data3/2026/1126/20261126221456_q5Ay5yTuG9.jpg",
+    "queued_at": 1795701741
+  }
+]
