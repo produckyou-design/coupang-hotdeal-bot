@@ -15,6 +15,16 @@ class TrackBParsingRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         tmp = self._tmp.name
+        self._orig_globals = {
+            "SEEN_FILE": push_deals.SEEN_FILE,
+            "QUOTA_FILE": push_deals.QUOTA_FILE,
+            "QUEUE_FILE": push_deals.QUEUE_FILE,
+            "TRACKER_FILE": push_deals.TRACKER_FILE,
+            "OCR_CACHE_FILE": push_deals.OCR_CACHE_FILE,
+            "PRICE_DB_FILE": push_deals.PRICE_DB_FILE,
+            "LOCK_FILE_PATH": push_deals.LOCK_FILE_PATH,
+            "BOT_TOKEN": push_deals.BOT_TOKEN,
+        }
         push_deals.SEEN_FILE = os.path.join(tmp, "seen_deals.json")
         push_deals.QUOTA_FILE = os.path.join(tmp, "post_quota.json")
         push_deals.QUEUE_FILE = os.path.join(tmp, "flyer_queue.json")
@@ -24,10 +34,21 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         push_deals.LOCK_FILE_PATH = os.path.join(tmp, "deal_pusher.lock")
         push_deals._PRICE_DB_CACHE.clear()
         push_deals.BOT_TOKEN = "test-token"
+        self._net_patches = [
+            patch.object(push_deals, "send_telegram_photo_bytes", return_value=True),
+            patch.object(push_deals, "send_telegram", return_value=True),
+            patch.object(push_deals.coupang_api, "search_products", return_value={"data": []}),
+        ]
+        for p in self._net_patches:
+            p.start()
         self.db = push_deals.get_price_db()
 
     def tearDown(self) -> None:
+        for p in reversed(self._net_patches):
+            p.stop()
         push_deals._PRICE_DB_CACHE.clear()
+        for k, v in self._orig_globals.items():
+            setattr(push_deals, k, v)
         self._tmp.cleanup()
 
     def _run_process_deal(
@@ -425,6 +446,189 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertTrue(ok_match)
         self.assertEqual(qm[0]["option_key"], "pid:30027:cfg:vol:500ml:n40")
         self.assertEqual(qm[0]["unit_info"], "1L당 645원")
+
+    def test_p0_shipping_parens_plus_newline_and_extra_free(self):
+        # (3,000원 배송비 별도) / 배송비 +3,000원 -> 판매가 17,900원 + 배송비 3,000원 보존
+        for did, pid, title in (
+            ("arca_ship_paren_byul", "40001", "생수 500ml 40병 17,900원 (3,000원 배송비 별도)"),
+            ("arca_ship_plus", "40002", "생수 500ml 40병 17,900원 배송비 +3,000원"),
+        ):
+            with self.subTest(did=did):
+                ok, _s, q = self._run_process_deal(
+                    deal_id=did,
+                    title=title,
+                    body_text="40병 기준 17,900원",
+                    product_id=pid,
+                    extra_shipping="",
+                )
+                self.assertTrue(ok)
+                self.assertEqual(q[0]["sale_price"], 17900)
+                self.assertEqual(q[0]["shipping_fee"], 3000)
+                self.assertEqual(q[0]["unit_info"], "1L당 1,045원 (배송포함)")
+                obs = self._fetch_observations(pid)
+                self.assertEqual(len(obs), 1)
+                self.assertEqual(obs[0]["total_price"], 20900)
+
+        p_byul = push_deals.parse_pricing_details("생수 500ml 40병 17,900원 배송비 별도", "")
+        self.assertEqual(p_byul["sale_price"], 17900)
+        self.assertEqual(p_byul["shipping_fee"], 0)
+        self.assertEqual(p_byul["shipping_type"], "paid")
+
+        p_nl = push_deals.parse_pricing_details("생수 500ml 40병 17,900원", "배송비\n3,000원")
+        self.assertEqual(p_nl["sale_price"], 17900)
+        self.assertEqual(p_nl["shipping_fee"], 3000)
+
+        s_free = push_deals.parse_shipping_details("생수 500ml 40병 17,900원", "", extra_shipping="무료")
+        self.assertEqual(s_free["shipping_type"], "free")
+
+    def test_p0_limited_stock_and_1in_single_serving_preserved(self):
+        ok1, _s1, q1 = self._run_process_deal(
+            deal_id="arca_stock_limit",
+            title="생수 500ml 20병 수량 한정 12,900원",
+            body_text="무료배송",
+            product_id="40003",
+            extra_shipping="무료배송",
+        )
+        self.assertTrue(ok1)
+        self.assertEqual(q1[0]["option_key"], "pid:40003:cfg:vol:500ml:n20")
+        self.assertEqual(q1[0]["unit_info"], "1L당 1,290원")
+
+        ok2, _s2, q2 = self._run_process_deal(
+            deal_id="arca_1in_serving",
+            title="육개장 1인 6봉 12,900원",
+            body_text="무료배송",
+            product_id="40004",
+            extra_shipping="무료배송",
+        )
+        self.assertTrue(ok2)
+        self.assertEqual(q2[0]["option_key"], "pid:40004:cfg:cnt:봉:n6")
+        self.assertEqual(q2[0]["unit_info"], "1봉당 2,150원")
+
+        for did, pid, title in (
+            ("arca_lim_v1", "40005", "생수 500ml 20병 (1회 최대 2박스) 12,900원"),
+            ("arca_lim_v2", "40006", "생수 500ml 20병 (1인: 2박스 제한) 12,900원"),
+        ):
+            with self.subTest(did=did):
+                ok_v, _sv, q_v = self._run_process_deal(did, title, "무료배송", pid, "무료배송")
+                self.assertTrue(ok_v)
+                self.assertEqual(q_v[0]["option_key"], f"pid:{pid}:cfg:vol:500ml:n20")
+
+    def test_p0_lookbehind_title_multipair_and_false_positive_guards(self):
+        self.assertEqual(price_history.compute_effective_unit_metrics("사과 1kg,2kg 15,000원", 15000), {})
+        ok_ms, _sms, q_ms = self._run_process_deal(
+            deal_id="arca_multispec_nospace",
+            title="사과 1kg,2kg 15,000원",
+            body_text="무료배송",
+            product_id="40007",
+            extra_shipping="무료배송",
+        )
+        self.assertFalse(ok_ms)
+        self.assertEqual(len(q_ms), 0)
+
+        for did, pid, title, body in (
+            ("arca_nospace_pairs", "40008", "생수 500ml 20병 9,900원", "20병 9,900원,40병 17,900원 무료배송"),
+            ("arca_title_pairs", "40009", "생수 500ml 20병 9,900원, 40병 17,900원", "무료배송"),
+        ):
+            with self.subTest(did=did):
+                ok_w, seen_w, q_w = self._run_process_deal(did, title, body, pid, "무료배송")
+                self.assertFalse(ok_w)
+                self.assertEqual(len(q_w), 0)
+                self.assertNotIn(did, seen_w)
+                self.assertEqual(len(self._fetch_observations(pid)), 0)
+                self.assertIsNotNone(self.db.get_pending_wait(f"arca:{did}"))
+
+        # 정상 딜 오탐 방지 ('1L에 1,045원', 할인쿠폰, Track A 할인 화살표)
+        ok_e, _se, qe = self._run_process_deal(
+            deal_id="arca_fp_per_e",
+            title="생수 500ml 40병 17,900원",
+            body_text="40병 17,900원, 1L에 1,045원 꼴 무료배송",
+            product_id="40010",
+            extra_shipping="무료배송",
+        )
+        self.assertTrue(ok_e)
+        self.assertEqual(qe[0]["option_key"], "pid:40010:cfg:vol:500ml:n40")
+
+        ok_cp, _sc, qcp = self._run_process_deal(
+            deal_id="arca_fp_coupon",
+            title="생수 500ml 40병 17,900원",
+            body_text="40병 2,000원 할인쿠폰 적용 무료배송",
+            product_id="40011",
+            extra_shipping="무료배송",
+        )
+        self.assertTrue(ok_cp)
+        self.assertEqual(qcp[0]["option_key"], "pid:40011:cfg:vol:500ml:n40")
+
+        ok_ta, _sta, qta = self._run_process_deal(
+            deal_id="arca_fp_track_a_arrow",
+            title="생수 500ml 40병",
+            body_text="40병 25,000원 -> 17,900원 무료배송 (28% 할인)",
+            product_id="40012",
+            extra_shipping="무료배송",
+            votes=3,
+            comments=3,
+        )
+        self.assertTrue(ok_ta)
+        self.assertEqual(qta[0]["track"], "A")
+        self.assertEqual(qta[0]["option_key"], "pid:40012:cfg:vol:500ml:n40")
+        self.assertEqual(qta[0]["unit_info"], "1L당 895원")
+
+    def test_p1_comma_counts_it_excl_wow_free_food_kw_and_dealbada_thumb(self):
+        import flyer_renderer
+        from unittest.mock import MagicMock
+
+        ok_m, _sm, qm = self._run_process_deal(
+            deal_id="arca_comma_1200",
+            title="믹스커피 1,200포 12,000원",
+            body_text="무료배송",
+            product_id="40013",
+            extra_shipping="무료배송",
+        )
+        self.assertTrue(ok_m)
+        self.assertEqual(qm[0]["option_key"], "pid:40013:cfg:cnt:포:n1200")
+        self.assertEqual(qm[0]["unit_info"], "1포당 10원")
+        self.assertEqual(qm[0]["chip"], "1포당 10원 · 1,200포")
+        self.assertEqual(flyer_renderer.extract_unit_part("물티슈 1,000매", "1매당 10원"), "1매당 10원 · 1,000매")
+
+        self.assertEqual(
+            price_history.compute_effective_unit_metrics("LG전자 2026 그램 AI 15 16G 1,515,700원", 1515700),
+            {},
+        )
+        self.assertEqual(price_history.classify_deal_category("오리온 미쯔 황치즈 6p, 222g, 2개"), "food")
+
+        # 호밍스 사골진곰탕 + 댓글 4개 무비추 -> Track B2 통과
+        ok_h, _sh, qh = self._run_process_deal(
+            deal_id="arca_homings_comments",
+            title="호밍스 사골진곰탕, 500g, 5개 9,900원",
+            body_text="와우 무료배송",
+            product_id="40014",
+            extra_shipping="와우 무료배송",
+            votes=0,
+            comments=4,
+        )
+        self.assertTrue(ok_h)
+        self.assertEqual(qh[0]["option_key"], "pid:40014:cfg:wt:500g:n5")
+        obs_h = self._fetch_observations("40014")
+        self.assertEqual(len(obs_h), 1)
+        self.assertEqual(obs_h[0]["shipping_type"], "wow_free")
+        # free 기준과 wow_free 기준 격리 확인
+        self.assertIsNone(self.db.get_observed_baseline("pid:40014:cfg:wt:500g:n5", shipping_type="free", min_days=1))
+
+        # 딜바다 빈 썸네일 <a>가 앞서는 HTML에서도 정상 수집 확인
+        html_thumb = """
+        <html><body><table><tbody>
+        <tr>
+          <td class="td_thumb"><a href="//www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id=573001&page=1"></a></td>
+          <td class="td_subject"><a href="//www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id=573001&page=1">[쿠팡] 케어웰 당뇨식 200ml 24개 (23,200원/무료)</a><span class="cnt_cmt">3</span></td>
+          <td class="td_num">2</td>
+        </tr>
+        </tbody></table></body></html>
+        """
+        r_ok = MagicMock(status_code=200, text=html_thumb)
+        r_empty = MagicMock(status_code=200, text="<html><body><table><tbody></tbody></table></body></html>")
+        with patch.object(push_deals.requests, "get", side_effect=[r_ok, r_empty]):
+            db_rows = push_deals.collect_dealbada_deals()
+        self.assertEqual(len(db_rows), 1)
+        self.assertEqual(db_rows[0]["id"], "dealbada_573001")
 
 
 if __name__ == "__main__":

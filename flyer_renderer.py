@@ -310,7 +310,7 @@ def extract_unit_part(clean_title: str, unit_info: str = "") -> str:
     part = (m_first.group(1) if m_first else clean_unit).replace("약 ", "").strip()
     clean_for_cnt = strip_purchase_limit_phrases(clean_title or "")
     counts = re.findall(
-        r"(\d+)\s*(개입|개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|정|캡슐)(?![a-zA-Z])",
+        r"(?<!\d)(?<!\d,)(\d{1,3}(?:,\d{3})+|\d+)\s*(개입|개|봉지|봉|팩|캔|병|포|박스|상자|묶음|롤|통|입|매|세트|정|캡슐|페트|알)(?![a-zA-Z])",
         clean_for_cnt,
     )
     if counts:

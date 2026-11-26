@@ -793,12 +793,12 @@ def compute_unit_pricing(name: str, price: int) -> str:
 
     clean_name = strip_purchase_limit_phrases(name)
     counts = re.findall(
-        r"(\d+)\s*(개입|개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|정|캡슐|알)(?![a-zA-Z])",
+        r"(?<!\d)(?<!\d,)(\d{1,3}(?:,\d{3})+|\d+)\s*(개입|개|봉|팩|캔|병|포|박스|롤|통|입|매|세트|정|캡슐|알)(?![a-zA-Z])",
         clean_name,
         re.IGNORECASE,
     )
     weights = re.findall(
-        r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)(?![a-zA-Z])",
+        r"(?<!\d)(?<!\d,)((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(kg|l|리터|킬로|g|ml|그램)(?![a-zA-Z])",
         clean_name,
         re.IGNORECASE,
     )
@@ -806,20 +806,20 @@ def compute_unit_pricing(name: str, price: int) -> str:
     count_val = 0
     count_unit = ""
     if len(counts) >= 2:
-        c1, u1 = int(counts[0][0]), counts[0][1]
-        c2, u2 = int(counts[-1][0]), counts[-1][1]
-        # 예: '5개입 1팩' -> 5개, '24개입 2개' -> 48개, '60정 2개' -> 120정
+        c1, u1 = int(counts[0][0].replace(",", "")), counts[0][1]
+        c2, u2 = int(counts[-1][0].replace(",", "")), counts[-1][1]
+        # 예: '5개입 1팩' -> 5개, '24개입 2개' -> 48개, '60정 2개' -> 120정, '20병 2박스' -> 40병
         if c2 == 1 and c1 > 1:
             count_val = c1
             count_unit = "개" if u1 == "개입" else u1
-        elif c1 > 1 and c2 > 1 and u1 in ("개입", "입", "매", "정", "캡슐", "알", "롤", "포"):
+        elif c1 > 1 and c2 > 1 and u1 in ("개입", "입", "매", "정", "캡슐", "알", "롤", "포", "병", "캔", "봉", "개"):
             count_val = c1 * c2
             count_unit = "개" if u1 in ("개입", "입") else u1
         else:
             count_val = c2
             count_unit = "개" if u2 == "개입" else u2
     elif len(counts) == 1:
-        count_val = int(counts[0][0])
+        count_val = int(counts[0][0].replace(",", ""))
         count_unit = "개" if counts[0][1] == "개입" else counts[0][1]
 
     total_amount = 0.0
@@ -907,11 +907,15 @@ _SHIPPING_THRESHOLD_SPAN_RE = re.compile(
     re.IGNORECASE,
 )
 _SHIPPING_FEE_FORWARD_RE = re.compile(
-    r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*\d[\d,\. \t]*원",
+    r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는)?[ \t]*(?:별도[ \t]*)?[:：\+\-\(]?[ \t\r\n]*\d[\d,\. \t]*원\)?",
+    re.IGNORECASE,
+)
+_SHIPPING_FEE_PAREN_REVERSE_RE = re.compile(
+    r"[\(\[][ \t]*\d[\d,\. \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)(?:[ \t]*(?:별도|착불))?[ \t]*[\)\]]",
     re.IGNORECASE,
 )
 _SHIPPING_FEE_REVERSE_RE = re.compile(
-    r"\d[\d,\. \t]*원[ \t]*(?:배송비(?![ \t]*(?:무료|0[ \t]*원|없음))|택배비|배송료|운송비)",
+    r"\d[\d,\. \t]*원[ \t]*(?:배송비(?![ \t]*(?:무료|0[ \t]*원|없음))|택배비|배송료|운송비)(?:[ \t]*(?:별도|착불))?",
     re.IGNORECASE,
 )
 
@@ -932,10 +936,11 @@ def _strip_pair_ship_fee(m: re.Match) -> str:
 
 
 def _strip_shipping_and_threshold_phrases(text: str) -> str:
-    """배송비·무료배송 기준 금액('29,800원 이상 무료배송', '배송비 3,000원', '(3,000원 배송비)', '(12,000/3,000)') 순차 제거"""
+    """배송비·무료배송 기준 금액('29,800원 이상 무료배송', '배송비 3,000원', '(3,000원 배송비 별도)', '(12,000/3,000)') 순차 제거"""
     s = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", text or "")
     s = _SHIPPING_FEE_FORWARD_RE.sub(" ", s)
-    s = re.sub(r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:무료|0[ \t]*원|없음|별도|착불)", " ", s)
+    s = _SHIPPING_FEE_PAREN_REVERSE_RE.sub(" ", s)
+    s = re.sub(r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는)?[ \t]*(?:무료|0[ \t]*원|없음|별도|착불|포함|제외|있음)", " ", s)
     s = _SHIPPING_FEE_REVERSE_RE.sub(" ", s)
     s = re.sub(
         r"([\(\[])([^\)\]/\r\n]+)(\s*/\s*)([^\)\]/\r\n]*\d[\d,]*\s*원?[^\)\]/\r\n]*)([\)\]])",
@@ -1042,13 +1047,13 @@ def parse_shipping_details(
 
     # 무료배송 기준 금액('29,800원 이상 무료배송' 등) 및 '배송비 무료/0원'을 먼저 걷어낸 뒤에만 유료 배송비 추출
     combined_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", combined)
-    combined_no_thr = re.sub(r"배송비[ \t]*(?:무료|0[ \t]*원|없음)", " ", combined_no_thr)
+    combined_no_thr = re.sub(r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는)?[ \t]*(?:무료|0[ \t]*원|없음)", " ", combined_no_thr)
     extra_no_thr = _SHIPPING_THRESHOLD_SPAN_RE.sub(" ", extra_shipping or "")
 
     shipping_fee = 0
     for pat in (
-        r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*([\d,]+)[ \t]*원",
-        r"([\d,]+)[ \t]*원[ \t]*(?:배송비|택배비|배송료)",
+        r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는)?[ \t]*(?:별도[ \t]*)?[:：\+\-\(]?[ \t\r\n]*([\d,]+)[ \t]*원",
+        r"[\(\[][ \t]*([\d,]+)[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)",
     ):
         for fm in re.finditer(pat, combined_no_thr):
             val = int(fm.group(1).replace(",", ""))
@@ -1057,6 +1062,18 @@ def parse_shipping_details(
                 break
         if shipping_fee:
             break
+
+    if shipping_fee == 0:
+        combined_rev_scan = re.sub(
+            r"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는)?[ \t]*(?:무료|0[ \t]*원|없음|별도|착불|포함|제외|있음)",
+            " ",
+            combined_no_thr,
+        )
+        for fm in re.finditer(r"([\d,]+)[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)", combined_rev_scan):
+            val = int(fm.group(1).replace(",", ""))
+            if 500 <= val <= 50000:
+                shipping_fee = val
+                break
 
     if shipping_fee == 0 and extra_no_thr:
         m_ex = re.search(r"([\d,]+)\s*원", extra_no_thr)
@@ -1086,9 +1103,12 @@ def parse_shipping_details(
     uncond_scan = _RESTRICTED_FREE_RE.sub(" ", uncond_scan)
     uncond_scan = _QTY_FREE_RE.sub(" ", uncond_scan)
     uncond_scan = _SHIPPING_FEE_FORWARD_RE.sub(" ", uncond_scan)
+    uncond_scan = _SHIPPING_FEE_PAREN_REVERSE_RE.sub(" ", uncond_scan)
     uncond_scan = _SHIPPING_FEE_REVERSE_RE.sub(" ", uncond_scan)
-    has_unconditional_free = (shipping_fee == 0 and not has_paid_text and not has_negated_free) and bool(
-        re.search(r"로켓\s*무료배송|로켓\s*무배|로켓무배|무료배송|무배|배송비\s*무료|배송비\s*0\s*원|/\s*무료(?:\s*[\)\]]|$)|\(\s*무료\s*\)", uncond_scan)
+    extra_ship_norm = re.sub(r"\s+", " ", extra_shipping or "").strip()
+    has_unconditional_free = (shipping_fee == 0 and not has_paid_text and not has_negated_free) and (
+        bool(re.search(r"로켓\s*무료배송|로켓\s*무배|로켓무배|무료배송|무배|배송비\s*무료|배송비\s*0\s*원|/\s*무료(?:\s*[\)\]]|$)|\(\s*무료\s*\)", uncond_scan))
+        or extra_ship_norm in ("무료", "0원", "무배")
     )
 
     # 복합 무료배송 조건 조합 (예: 와우 회원 29,800원 이상 무료배송 / 수도권만 무료배송)
@@ -1154,7 +1174,7 @@ def parse_shipping_details(
 
 def _extract_clean_won_numbers(text: str, blacklisted_nums: Set[int]) -> List[int]:
     """정상 표기된 원화 금액 추출 (OCR 콤마 뒤 공백 '23, 100원' 포함)"""
-    s = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(text))
+    s = _strip_inline_non_prices(_strip_shipping_and_threshold_phrases(text))
     nums: List[int] = []
     for m in re.finditer(r"(?<![+\-\d월])(\d{1,3}(?:\s*,\s*\d{3})+|\d{4,8})\s*원", s):
         raw = re.sub(r"[\s,]", "", m.group(1))
@@ -1170,7 +1190,7 @@ def _extract_strikethrough_candidates(text: str, blacklisted_nums: Set[int]) -> 
     취소선이 그어진 정상가 후보 추출 (예: '899;eee원' -> 899000, '60;000원' -> 60000).
     ※ 이 후보들은 단독 사용되지 않으며, 반드시 명시된 할인율(%) 또는 쿠폰차액과 수학적으로 일치할 때만 채택됨!
     """
-    s = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(text))
+    s = _strip_inline_non_prices(_strip_shipping_and_threshold_phrases(text))
     cands: List[int] = []
     for m in re.finditer(r"(?<![+\-\d월])(\d{1,3}(?:[\s,;]+\d{3}|\s*[;,]\s*[0eEoO]{3})+)\s*원", s):
         cleaned = re.sub(r"[\s,;]", "", m.group(1)).lower().replace("e", "0").replace("o", "0")
@@ -1222,7 +1242,7 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "", extra_shipp
     sale_price = 0
 
     # 1-A) 제목에서 가격 최우선 추출 (작성자가 직접 명시한 핫딜가)
-    title_clean = _strip_shipping_and_threshold_phrases(_strip_inline_non_prices(title))
+    title_clean = _strip_inline_non_prices(_strip_shipping_and_threshold_phrases(title))
     # 제목에 화살표(10,570원 -> 9,370원)가 있으면 뒤쪽 가격이 할인가
     m_title_arrow = re.search(r"([\d,]+)\s*원?\s*(?:에서|->|→|~>)\s*([\d,]+)\s*원", title_clean)
     if m_title_arrow:
@@ -2198,70 +2218,78 @@ def _extract_coupang_url_from_href_or_text(raw: str) -> Optional[str]:
 
 
 def collect_dealbada_deals() -> List[Dict[str, Any]]:
-    """딜바다 국내핫딜 게시판 1페이지 쿠팡 핫딜 수집"""
+    """딜바다 국내핫딜 게시판 1~2페이지 쿠팡 핫딜 수집 (빈 썸네일 앵커 우회)"""
     deals: List[Dict[str, Any]] = []
-    url = "https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        if r.status_code != 200:
-            _record_source_http_block("dealbada", r)
-            return deals
-        soup = BeautifulSoup(r.text, "html.parser")
-        for row in soup.select("table tbody tr"):
-            row_cls = row.get("class") or []
-            if "bo_notice" in row_cls or "notice" in row_cls:
+    for page in (1, 2):
+        url = f"https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic&page={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            if r.status_code != 200:
+                _record_source_http_block("dealbada", r)
+                if r.status_code in (403, 429):
+                    break
                 continue
-            if row.select_one(".deal_end, del, s, strike"):
-                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for row in soup.select("table tbody tr"):
+                row_cls = row.get("class") or []
+                if "bo_notice" in row_cls or "notice" in row_cls:
+                    continue
+                if row.select_one(".deal_end, del, s, strike"):
+                    continue
 
-            subj_a = row.select_one("td.td_subject a[href*='wr_id='], a[href*='bo_table=deal_domestic'][href*='wr_id=']")
-            if not subj_a:
-                continue
-            href = str(subj_a.get("href") or "").strip()
-            m_id = re.search(r"wr_id=(\d+)", href)
-            if not m_id:
-                continue
+                subj_a = row.select_one("td.td_subject a[href*='wr_id=']")
+                if not subj_a:
+                    for cand_a in row.select("a[href*='bo_table=deal_domestic'][href*='wr_id=']"):
+                        if cand_a.get_text(strip=True):
+                            subj_a = cand_a
+                            break
+                if not subj_a:
+                    continue
+                href = str(subj_a.get("href") or "").strip()
+                m_id = re.search(r"wr_id=(\d+)", href)
+                if not m_id:
+                    continue
 
-            row_txt = " ".join(row.get_text(" ", strip=True).split())
-            raw_t = " ".join(subj_a.get_text(" ", strip=True).split())
-            if not raw_t:
-                continue
-            if "쿠팡" not in raw_t and "쿠팡" not in row_txt and "coupang" not in row_txt.lower():
-                continue
+                row_txt = " ".join(row.get_text(" ", strip=True).split())
+                raw_t = " ".join(subj_a.get_text(" ", strip=True).split())
+                if not raw_t:
+                    continue
+                if "쿠팡" not in raw_t and "쿠팡" not in row_txt and "coupang" not in row_txt.lower():
+                    continue
 
-            comments = 0
-            cmt_el = row.select_one(".cnt_cmt")
-            if cmt_el:
-                m_c = re.search(r"\d+", cmt_el.get_text(strip=True))
-                if m_c:
-                    comments = int(m_c.group(0))
+                comments = 0
+                cmt_el = row.select_one(".cnt_cmt")
+                if cmt_el:
+                    m_c = re.search(r"\d+", cmt_el.get_text(strip=True))
+                    if m_c:
+                        comments = int(m_c.group(0))
 
-            title = re.sub(r"\s*\[\d+\]\s*$", "", raw_t).strip()
-            if not title or is_closed_deal(title):
-                continue
+                title = re.sub(r"\s*\[\d+\]\s*$", "", raw_t).strip()
+                if not title or is_closed_deal(title):
+                    continue
 
-            votes = 0
-            good_el = row.select_one("td.td_num:last-of-type, .bo_v_good")
-            if good_el:
-                m_v = re.search(r"\d+", good_el.get_text(strip=True))
-                if m_v:
-                    votes = int(m_v.group(0))
+                votes = 0
+                good_el = row.select_one("td.td_num:last-of-type, .bo_v_good")
+                if good_el:
+                    m_v = re.search(r"\d+", good_el.get_text(strip=True))
+                    if m_v:
+                        votes = int(m_v.group(0))
 
-            wr_id = m_id.group(1)
-            deal_id = f"dealbada_{wr_id}"
-            full_url = f"https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id={wr_id}"
-            if not any(d["id"] == deal_id for d in deals):
-                deals.append({
-                    "id": deal_id,
-                    "title": title,
-                    "link": full_url,
-                    "votes": votes,
-                    "downvotes": 0,
-                    "comments": comments,
-                    "hits": 0,
-                })
-    except Exception as e:
-        logger.error(f"딜바다 수집 오류: {e}")
+                wr_id = m_id.group(1)
+                deal_id = f"dealbada_{wr_id}"
+                full_url = f"https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id={wr_id}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({
+                        "id": deal_id,
+                        "title": title,
+                        "link": full_url,
+                        "votes": votes,
+                        "downvotes": 0,
+                        "comments": comments,
+                        "hits": 0,
+                    })
+        except Exception as e:
+            logger.error(f"딜바다 수집 오류 (page={page}): {e}")
     return deals
 
 
@@ -2463,6 +2491,8 @@ def _has_track_b_food_reaction(
         return False
     if votes >= 3:
         return True
+    if downvotes == 0 and comments >= 3:
+        return True
     if comments >= 2 and votes >= 1:
         return True
     combined = f"{base_title}\n{body_text}"
@@ -2498,7 +2528,11 @@ def evaluate_deal_quality(
     total_p = final_p + ship_fee if ship_fee > 0 else final_p
 
     is_ambig, _ = has_ambiguous_option_or_price(base_title, body_text, sale_price=final_p)
-    obs_ship_type = normalize_observed_shipping_type(ship_type, ship_fee)
+    obs_ship_type = normalize_observed_shipping_type(
+        ship_type,
+        ship_fee,
+        shipping_condition=str(p_info.get("shipping_condition") or ""),
+    )
     unit_metrics = compute_effective_unit_metrics(base_title, total_p, body_text=body_text)
     effective_unit_display = str(unit_metrics.get("display_unit") or "")
 
@@ -2565,7 +2599,7 @@ def evaluate_deal_quality(
         return base_res
 
     # Track B1: 동일 확정 옵션/구성 + 확정 배송 조건 30일(5일 이상 관측) 중앙값 대비 할인 검증
-    if price_db is not None and is_comparable_option_key(option_key) and obs_ship_type in ("free", "paid"):
+    if price_db is not None and is_comparable_option_key(option_key) and obs_ship_type in ("free", "paid", "wow_free"):
         baseline = price_db.get_observed_baseline(
             option_key,
             shipping_type=obs_ship_type,
@@ -2590,7 +2624,7 @@ def evaluate_deal_quality(
 
     # Track B2: 식품/반복소비재 단일 구성 단가 + 확정 배송 + 반응 게이트
     if category == "food" and effective_unit_display:
-        if obs_ship_type not in ("free", "paid"):
+        if obs_ship_type not in ("free", "paid", "wow_free"):
             base_res["reason"] = "wait"
             return base_res
         if _has_track_b_food_reaction(d, source_name, base_title, body_text):
@@ -2801,7 +2835,7 @@ def process_deal(
         eval_res["reason"] != "permanent"
         and not eval_res.get("is_ambiguous")
         and is_comparable_option_key(option_key)
-        and eval_res.get("obs_ship_type") in ("free", "paid")
+        and eval_res.get("obs_ship_type") in ("free", "paid", "wow_free")
     ):
         um = eval_res.get("unit_metrics") or {}
         price_db.record_observation(

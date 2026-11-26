@@ -16,7 +16,7 @@ KST = timezone(timedelta(hours=9))
 
 _IT_STRICT_KEYWORDS = (
     "그래픽카드", "노트북", "모니터", "태블릿", "아이패드", "갤럭시탭", "갤럭시북",
-    "맥북", "스마트폰", "자급제", "키보드", "마우스", "공유기", "이어폰", "헤드셋",
+    "맥북", "lg전자", "lg 그램", "그램 ai", "울트라피씨", "스마트폰", "자급제", "키보드", "마우스", "공유기", "이어폰", "헤드셋",
     "헤드폰", "스피커", "무선충전", "보조배터리", "충전기", "메모리카드", "외장하드",
     "외장ssd", "마이크로sd", "메인보드", "파워서플라이", "수랭쿨러", "공랭쿨러",
     "로봇청소기", "무선청소기", "물걸레청소기", "공기청정기", "가습기", "제습기",
@@ -74,6 +74,13 @@ _FOOD_KEYWORDS = (
     "락토핏", "오메가3", "루테인", "밀크씨슬", "마그네슘", "아연", "콜라겐", "영양제",
     "사료", "고양이사료", "강아지사료", "츄르", "개껌", "반려동물간식", "국밥", "설렁탕",
     "육개장", "곰탕", "갈비탕", "부대찌개", "된장찌개", "김치찌개", "핫도그", "피자",
+    "오리온", "미쯔", "오뜨", "치즈", "황치즈", "블루베리", "퓨레", "즙", "케익",
+    "보리차", "하늘보리", "계란과자", "당뇨식", "케어웰", "호밍스", "사골", "진곰탕",
+    "멸균", "유기농", "크라운", "해태", "농심", "오뚜기", "삼양", "팔도", "빙그레",
+    "매일", "남양", "서울우유", "동서", "맥심", "카누", "청정원", "풀무원", "하림",
+    "사조", "동원", "칠성", "나랑드", "스프라이트", "닥터페퍼", "파인애플", "복숭아",
+    "망고", "딸기", "초코파이", "몽쉘", "카스타드", "새우깡", "감자칩", "팝콘", "크런키",
+    "로아커", "누텔라", "디저트", "음료", "녹차", "홍차", "콤부차", "유자차", "아몬드브리즈", "오트사이드",
 )
 
 
@@ -128,16 +135,19 @@ _NUM_COMMAS_RE = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
 
 _PURCHASE_LIMIT_INLINE_RE = re.compile(
     rf"(?:"
-    rf"(?:1\s*인(?:\s*당)?|인당|계정당|아이디당|id\s*당|주문당|1\s*회당)\s*(?:(?:1\s*회|1\s*일|일일|당일|최대)\s*){{0,2}}\d+\s*(?:{_ALL_COUNT_UNIT_ALT})(?:\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하))?"
-    rf"|최대\s*\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하)"
-    rf"|\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:(?:구매|주문|수량)\s*(?:제한|한정)|제한)"
+    rf"(?:1\s*인(?:\s*당)?)[ \t]*[:：]?[ \t]*(?:(?:1\s*회|1\s*일|일일|당일|최대)\s*){{0,2}}{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:최대|구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하)"
+    rf"|(?:인당|계정당|아이디당|id\s*당|주문당|1\s*회당|회원당)[ \t]*[:：]?[ \t]*(?:(?:1\s*회|1\s*일|일일|당일|최대)\s*){{0,2}}{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})(?:\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하))?"
+    rf"|1\s*인(?:\s*당)?[ \t]*[:：]?[ \t]*최대[ \t]*{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})(?:\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하))?"
+    rf"|1\s*회[ \t]*최대[ \t]*{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})(?:\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하))?"
+    rf"|최대[ \t]*{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:구매|주문|수량)?\s*(?:제한|한정|가능|까지|이하)"
+    rf"|(?:선착순[ \t]+)?{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})\s*(?:(?:구매|주문)\s*(?:제한|한정)|까지\s*(?:구매|주문)\s*(?:제한|한정)|구매\s*가능|제한)"
     rf")",
     re.IGNORECASE,
 )
 
 
 def strip_purchase_limit_phrases(text: str) -> str:
-    """'1인 2박스 구매 제한', '계정당 최대 2개 한정' 등 구매 수량 제한 절만 제거(괄호 내 정상 구성은 보존)."""
+    """'1인 2박스 구매 제한', '계정당 최대 2개 한정' 등 구매 수량 제한 절만 제거(괄호 내 정상 구성·개행 보존)."""
     if not text:
         return ""
     s = _PURCHASE_LIMIT_INLINE_RE.sub(" ", text)
@@ -146,25 +156,26 @@ def strip_purchase_limit_phrases(text: str) -> str:
     s = re.sub(r"\[\s*[,/·\-]+\s*", "[", s)
     s = re.sub(r"\s*[,/·\-]+\s*\]", "]", s)
     s = re.sub(r"\(\s*\)|\[\s*\]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in s.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 _AMBIGUOUS_OPTION_PATTERNS = (
     re.compile(r"(?:택\s*\d|택일|중\s*택|선택\s*가능|옵션\s*선택|옵션별|구성별|종류별|골라담기)"),
     re.compile(
-        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:{_ALL_COUNT_UNIT_ALT}|kg|g|ml|l|리터|킬로)\s*(?:또는|혹은|\bor\b)\s*{_NUM_COMMAS_RE}",
+        rf"(?<!\d)(?<!\d,)(?<!\d\.){_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:{_ALL_COUNT_UNIT_ALT}|kg|g|ml|l|리터|킬로)\s*(?:또는|혹은|\bor\b)\s*{_NUM_COMMAS_RE}",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"(?:^|[^0-9,.원])\d+\s*(?:{_ALL_COUNT_UNIT_ALT})?\s*(?:~|/)\s*\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\b",
+        rf"(?<!\d)(?<!\d,)(?<!\d\.){_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})?\s*(?:~|/)\s*{_NUM_COMMAS_RE}\s*(?:{_ALL_COUNT_UNIT_ALT})\b",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\b",
+        rf"(?<!\d)(?<!\d,)(?<!\d\.){_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:ml|l|리터)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\b",
+        rf"(?<!\d)(?<!\d,)(?<!\d\.){_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\s*(?:~|/)\s*{_NUM_COMMAS_RE}(?:\.\d+)?\s*(?:kg|g|킬로)\b",
         re.IGNORECASE,
     ),
 )
@@ -180,29 +191,35 @@ _PAIR_NOISE_THRESHOLD_RE = re.compile(
     re.IGNORECASE,
 )
 _PAIR_NOISE_UNIT_PRICE_RE = re.compile(
-    rf"(?:\d+(?:\.\d+)?\s*)?(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*당\s*(?:약\s*)?\d[\d,]*\s*원",
+    rf"(?:(?:\d+(?:\.\d+)?\s*)?(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*당"
+    rf"|(?<!\d)(?:1|10|100)\s*(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*에)"
+    rf"\s*(?:약\s*)?\d[\d,]*\s*원(?:\s*꼴)?",
     re.IGNORECASE,
 )
 _PAIR_NOISE_FORWARD_SHIP_RE = re.compile(
-    rf"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*[:：\+\-]?[ \t]*(?:{_NUM_COMMAS_RE}[ \t]*원|무료|0[ \t]*원|없음|별도|착불|포함|제외|있음)",
+    rf"(?:유료배송|배송비|택배비|배송료|운송비)[ \t]*(?:은|는|이|가)?[ \t]*(?:별도[ \t]*)?[:：\+\-\(]?[ \t]*(?:{_NUM_COMMAS_RE}[ \t]*원\)?|무료|0[ \t]*원|없음|별도|착불|포함|제외|있음)",
+    re.IGNORECASE,
+)
+_PAIR_NOISE_PAREN_REVERSE_SHIP_RE = re.compile(
+    rf"[\(\[][ \t]*{_NUM_COMMAS_RE}[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)(?:[ \t]*(?:별도|착불))?[ \t]*[\)\]]",
     re.IGNORECASE,
 )
 _PAIR_NOISE_REVERSE_SHIP_RE = re.compile(
-    rf"{_NUM_COMMAS_RE}[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)",
+    rf"{_NUM_COMMAS_RE}[ \t]*원[ \t]*(?:배송비|택배비|배송료|운송비)(?:[ \t]*(?:별도|착불))?",
     re.IGNORECASE,
 )
 
 _OPTION_PRICE_PAIR_RE = re.compile(
     rf"(?:"
-    rf"(?<![0-9,.])(?P<wv_num>{_NUM_COMMAS_RE}(?:\.\d+)?)\s*(?P<wv_unit>kg|g|ml|l|리터|킬로)(?![a-zA-Z])"
-    rf"|(?<![0-9,.])(?P<cnt_num>\d{{1,4}})\s*(?P<cnt_unit>{_ALL_COUNT_UNIT_ALT})"
+    rf"(?<!\d)(?<!\d,)(?<!\d\.)(?P<wv_num>{_NUM_COMMAS_RE}(?:\.\d+)?)\s*(?P<wv_unit>kg|g|ml|l|리터|킬로)(?![a-zA-Z])"
+    rf"|(?<!\d)(?<!\d,)(?<!\d\.)(?P<cnt_num>{_NUM_COMMAS_RE})\s*(?P<cnt_unit>{_ALL_COUNT_UNIT_ALT})"
     rf")"
     rf"(?!\s*당)(?!\s*(?:무료|이상|미만|배송|택배|착불))"
     rf"(?:(?:은|는|이|가|에|의|짜리|들이)?"
     rf"(?:\s*(?:기준(?:으로)?|짜리|옵션|구성|가격|판매가|할인가|특가))?"
     rf"(?:\s*(?:은|는|이|가|에))?"
     rf"\s*(?:->|=>|→|➡️?|[:：=\-(\[~])?\s*)"
-    rf"(?P<price>\d{{1,3}}(?:,\d{{3}})+|\d{{4,7}})\s*원",
+    rf"(?P<price>\d{{1,3}}(?:,\d{{3}})+|\d{{4,7}})\s*원(?!\s*(?:할인|쿠폰|절약|적립|캐시|이상|미만))",
     re.IGNORECASE,
 )
 
@@ -219,19 +236,22 @@ def _canon_pair_spec_key(num_s: str, unit_s: str, is_wv: bool) -> Tuple[str, str
             return f"vol:{_fmt_spec_num(val * 1000.0)}ml", "vol", int(round(val * 1000))
         return f"vol:{_fmt_spec_num(val)}ml", "vol", int(round(val))
     canon_u = _COUNT_UNIT_CANON.get(ul, ul)
-    n = int(num_s)
+    n = int(num_s.replace(",", ""))
     return f"cnt:{canon_u}:{n}", f"cnt_t{_unit_tier(canon_u)}", n
 
 
 def _extract_option_price_pairs(text: str) -> List[Tuple[str, str, int, int]]:
-    """텍스트에서 '(구성키, 단위군, 수치, 가격원)' 목록 추출 (배송비 선제거 후 역순 배송비 제거로 인접 상품값 보존)."""
+    """텍스트에서 '(구성키, 단위군, 수치, 가격원)' 목록 추출 (배송비·단가·쿠폰/할인 제외)."""
     if not text:
         return []
     cleaned = strip_purchase_limit_phrases(text)
     cleaned = _PAIR_NOISE_THRESHOLD_RE.sub(" ", cleaned)
     cleaned = _PAIR_NOISE_UNIT_PRICE_RE.sub(" ", cleaned)
     cleaned = _PAIR_NOISE_FORWARD_SHIP_RE.sub(" ", cleaned)
+    cleaned = _PAIR_NOISE_PAREN_REVERSE_SHIP_RE.sub(" ", cleaned)
     cleaned = _PAIR_NOISE_REVERSE_SHIP_RE.sub(" ", cleaned)
+    # Track A 할인 화살표 앞 정상가(예: '40병 25,000원 -> 17,900원')는 최종 할인가와 병합
+    cleaned = re.sub(rf"{_NUM_COMMAS_RE}\s*원\s*(?:에서|->|=>|→|~>)\s*", "", cleaned)
     pairs: List[Tuple[str, str, int, int]] = []
     for m in _OPTION_PRICE_PAIR_RE.finditer(cleaned):
         price = int(m.group("price").replace(",", ""))
@@ -250,9 +270,9 @@ def _extract_bundle_total_t1_count(clean_title: str) -> Optional[int]:
     s = _DUP_PAREN_COUNT_RE.sub(r"\1\2", s)
     s = re.sub(r"[\[\]\(\)]", " ", s)
     toks = [
-        (int(m.group(1)), m.group(2), m.start(), m.end())
+        (int(m.group(1).replace(",", "")), m.group(2), m.start(), m.end())
         for m in _COUNT_ONLY_TOKEN_RE.finditer(s)
-        if int(m.group(1)) >= 2
+        if int(m.group(1).replace(",", "")) >= 2
     ]
     if len(toks) == 2:
         (n1, u1, _s1, e1), (n2, u2, s2, _e2) = toks
@@ -286,10 +306,14 @@ def has_ambiguous_option_or_price(
         return True, "ambiguous_option_price_pairs"
 
     title_pairs = _extract_option_price_pairs(clean_title)
+    distinct_title = {(sk, pr) for sk, _fam, _mag, pr in title_pairs}
+    if len(distinct_title) >= 2:
+        return True, "ambiguous_option_price_pairs"
+
     if not title_pairs and sale_price >= 1000:
         cleaned_t = re.sub(r"[\[\]\(\)]", " ", _PAREN_TOTAL_SUMMARY_RE.sub(" ", clean_title))
         for cm in _COUNT_ONLY_TOKEN_RE.finditer(cleaned_t):
-            cnt = int(cm.group(1))
+            cnt = int(cm.group(1).replace(",", ""))
             if cnt >= 2:
                 sk, fam, mag = _canon_pair_spec_key(cm.group(1), cm.group(2), is_wv=False)
                 title_pairs.append((sk, fam, mag, int(sale_price)))
@@ -314,14 +338,21 @@ def has_ambiguous_option_or_price(
     return False, ""
 
 
-def normalize_observed_shipping_type(shipping_type: str, shipping_fee: int = 0) -> str:
-    """배송 근거를 'free' | 'paid' | 'unknown'으로 엄격 정규화 (미확인·조건부는 'unknown')."""
+def normalize_observed_shipping_type(
+    shipping_type: str,
+    shipping_fee: int = 0,
+    shipping_condition: str = "",
+) -> str:
+    """배송 근거를 'free' | 'wow_free' | 'paid' | 'unknown'으로 엄격 정규화."""
     st = (shipping_type or "").strip().lower()
     fee = int(shipping_fee or 0)
+    cond = (shipping_condition or "").strip()
     if st in ("free", "rocket_free") and fee == 0:
         return "free"
     if st == "paid" and fee > 0:
         return "paid"
+    if st == "conditional" and fee == 0 and cond in ("와우 무료배송", "로켓와우 무료배송"):
+        return "wow_free"
     return "unknown"
 
 
@@ -330,20 +361,20 @@ _PAREN_TOTAL_SUMMARY_RE = re.compile(
     re.IGNORECASE,
 )
 _DUP_PAREN_COUNT_RE = re.compile(
-    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})\s*\(\s*\1\s*({_ALL_COUNT_UNIT_ALT})\s*\)",
+    rf"({_NUM_COMMAS_RE})\s*({_ALL_COUNT_UNIT_ALT})\s*\(\s*\1\s*({_ALL_COUNT_UNIT_ALT})\s*\)",
     re.IGNORECASE,
 )
 _WEIGHT_VOL_SPEC_RE = re.compile(
-    rf"(?<![0-9,])({_NUM_COMMAS_RE}(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)\b",
+    rf"(?<!\d)(?<!\d,)(?<!\d\.)({_NUM_COMMAS_RE}(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)(?![a-zA-Z])",
     re.IGNORECASE,
 )
 _PACK_MULTI_TOKEN_RE = re.compile(
-    rf"(?:([x×*])\s*(\d+)(?:\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))?"
-    rf"|(\d+)\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))",
+    rf"(?:([x×*])\s*({_NUM_COMMAS_RE})(?:\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))?"
+    rf"|(?<!\d)(?<!\d,)(?<!\d\.)({_NUM_COMMAS_RE})\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣]))",
     re.IGNORECASE,
 )
 _COUNT_ONLY_TOKEN_RE = re.compile(
-    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣])",
+    rf"(?<!\d)(?<!\d,)(?<!\d\.)({_NUM_COMMAS_RE})\s*({_ALL_COUNT_UNIT_ALT})(?![가-힣])",
     re.IGNORECASE,
 )
 
@@ -383,6 +414,9 @@ def compute_effective_unit_metrics(
 ) -> Dict[str, Any]:
     """제목의 단일 구성 중량/용량/수량과 총 결제금액(배송비 포함)으로 표준 단위가격 및 구성 시그니처 계산."""
     if not title or not isinstance(total_price, (int, float)) or total_price < 1000:
+        return {}
+
+    if classify_deal_category(title, body_text) == "it" or re.search(r"\d+\s*(?:gb|tb|mah|wh|hz)\b", title.lower()):
         return {}
 
     is_ambig, _ = has_ambiguous_option_or_price(title, body_text, sale_price=0)
@@ -426,14 +460,14 @@ def compute_effective_unit_metrics(
             abs_pos = first_m.end() + pm.start()
             in_par = _in_any_span(abs_pos, paren_spans)
             if pm.group(1):
-                n = int(pm.group(2))
+                n = int(pm.group(2).replace(",", ""))
                 u = pm.group(3) or ""
                 explicit_x = True
             else:
-                n = int(pm.group(4))
+                n = int(pm.group(4).replace(",", ""))
                 u = pm.group(5) or ""
                 explicit_x = False
-            if 1 <= n <= 500:
+            if 1 <= n <= 5000:
                 tokens.append((n, u, explicit_x, in_par))
 
         if len(tokens) > 2:
@@ -506,12 +540,12 @@ def compute_effective_unit_metrics(
             "config_sig": f"wt:{_fmt_spec_num(base_val)}g:n{mult}",
         }
 
-    # 2) 개수 기반 단위 (예: 30롤, 100매 10팩, 60정)
+    # 2) 개수 기반 단위 (예: 30롤, 100매 10팩, 1,200포)
     cnt_tokens: List[Tuple[int, str, int, int, bool]] = []
     for cm in _COUNT_ONLY_TOKEN_RE.finditer(text):
-        cnt = int(cm.group(1))
+        cnt = int(cm.group(1).replace(",", ""))
         lbl = cm.group(2)
-        if 2 <= cnt <= 2000:
+        if 2 <= cnt <= 10000:
             cnt_tokens.append((cnt, lbl, cm.start(), cm.end(), _in_any_span(cm.start(), paren_spans)))
 
     if not cnt_tokens:
@@ -722,7 +756,7 @@ class PriceHistoryDB:
         now: Optional[datetime] = None,
     ) -> None:
         stype = (shipping_type or "").strip().lower()
-        if not is_comparable_option_key(option_key) or stype not in ("free", "paid"):
+        if not is_comparable_option_key(option_key) or stype not in ("free", "paid", "wow_free"):
             return
         if total_price <= 0 or sale_price <= 0:
             return
@@ -782,7 +816,7 @@ class PriceHistoryDB:
         now: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         stype = (shipping_type or "").strip().lower()
-        if not is_comparable_option_key(option_key) or stype not in ("free", "paid"):
+        if not is_comparable_option_key(option_key) or stype not in ("free", "paid", "wow_free"):
             return None
         dt = _now_kst(now)
         since_date = (dt - timedelta(days=days)).strftime("%Y-%m-%d")
