@@ -54,6 +54,17 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Restore SQLite Price History & OCR Cache
+        if: steps.check_pc.outputs.pc_active != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            price_history.db
+            ocr_cache.json
+          key: deal-pusher-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            deal-pusher-state-
+
       - name: Run Deal Pusher
         if: steps.check_pc.outputs.pc_active != 'true'
         env:
@@ -65,6 +76,26 @@ jobs:
           TELEGRAM_REPORT_CHANNEL_ID: ${{ secrets.TELEGRAM_REPORT_CHANNEL_ID }}
         run: |
           python push_deals.py
+
+      - name: Checkpoint SQLite Price History DB
+        if: always() && steps.check_pc.outputs.pc_active != 'true'
+        run: |
+          python -c "import os, sqlite3
+          p = 'price_history.db'
+          if os.path.exists(p):
+              c = sqlite3.connect(p)
+              c.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+              c.commit()
+              c.close()"
+
+      - name: Save SQLite Price History & OCR Cache
+        if: always() && steps.check_pc.outputs.pc_active != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            price_history.db
+            ocr_cache.json
+          key: deal-pusher-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Commit and push updated seen deals & sales tracker
         if: steps.check_pc.outputs.pc_active != 'true'

@@ -50,6 +50,9 @@ from price_history import (
     build_option_key,
     classify_deal_category,
     compute_effective_unit_metrics,
+    has_ambiguous_option_or_price,
+    is_comparable_option_key,
+    normalize_observed_shipping_type,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1635,6 +1638,9 @@ def collect_ruliweb_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
         try:
             res = requests.get(url, headers=HEADERS, timeout=8)
             if res.status_code != 200:
+                _record_source_http_block("ruliweb", res)
+                if res.status_code in (403, 429):
+                    break
                 continue
 
             soup = BeautifulSoup(res.text, "html.parser")
@@ -1691,6 +1697,7 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
         if res.status_code != 200:
+            _record_source_http_block("ruliweb", res)
             if _is_transient_http_status(res.status_code):
                 logger.warning(f"⏳ 루리웹 상세 일시 오류 (HTTP {res.status_code}): {url}")
                 return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
@@ -1766,6 +1773,9 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
         try:
             r = requests.get(url, headers=HEADERS, timeout=6)
             if r.status_code != 200:
+                _record_source_http_block("ppomppu", r)
+                if r.status_code in (403, 429):
+                    break
                 continue
             r.encoding = "euc-kr"
             soup = BeautifulSoup(r.text, "html.parser")
@@ -1841,6 +1851,7 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
         time.sleep(0.25)
         res = requests.get(url, headers=HEADERS, timeout=7)
         if res.status_code != 200:
+            _record_source_http_block("ppomppu", res)
             if _is_transient_http_status(res.status_code):
                 logger.warning(f"⏳ 뽐뿌 상세 일시 오류 (HTTP {res.status_code}): {url}")
                 return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
@@ -1914,11 +1925,16 @@ def collect_arcalive_deals() -> List[Dict[str, Any]]:
     kw = urllib.parse.quote("쿠팡")
 
     # 1) 메인 게시판 1~4페이지 스캔 (제목에 '쿠팡' 없어도 스토어 태그가 쿠팡인 딜 전량 포착)
+    blocked = False
     for page in (1, 2, 3, 4):
         url = f"https://arca.live/b/hotdeal?p={page}"
         try:
             r = requests.get(url, headers=HEADERS, timeout=8)
             if r.status_code != 200:
+                _record_source_http_block("arca", r)
+                if r.status_code in (403, 429):
+                    blocked = True
+                    break
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
             for row in soup.select("div.vrow.hybrid"):
@@ -1964,10 +1980,14 @@ def collect_arcalive_deals() -> List[Dict[str, Any]]:
             logger.error(f"아카라이브 메인 수집 오류 (p={page}): {e}")
 
     # 2) 키워드 검색 보조 수집
+    if blocked:
+        return deals
     search_url = f"https://arca.live/b/hotdeal?target=all&keyword={kw}"
     try:
         r = requests.get(search_url, headers=HEADERS, timeout=8)
-        if r.status_code == 200:
+        if r.status_code != 200:
+            _record_source_http_block("arca", r)
+        elif r.status_code == 200:
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.select("a.title, div.vrow-top a.hybrid-title, a.vrow"):
                 if "notice" in (a.get("class") or []):
@@ -2004,6 +2024,7 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
         if res.status_code != 200:
+            _record_source_http_block("arca", res)
             if _is_transient_http_status(res.status_code):
                 logger.warning(f"⏳ 아카라이브 상세 일시 오류 (HTTP {res.status_code}): {url}")
                 return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
@@ -2466,7 +2487,9 @@ def evaluate_deal_quality(
     ship_type = str(p_info.get("shipping_type") or "")
     total_p = final_p + ship_fee if ship_fee > 0 else final_p
 
-    unit_metrics = compute_effective_unit_metrics(base_title, total_p)
+    is_ambig, _ = has_ambiguous_option_or_price(base_title, body_text)
+    obs_ship_type = normalize_observed_shipping_type(ship_type, ship_fee)
+    unit_metrics = compute_effective_unit_metrics(base_title, total_p, body_text=body_text)
     effective_unit_display = str(unit_metrics.get("display_unit") or "")
 
     base_res: Dict[str, Any] = {
@@ -2481,6 +2504,8 @@ def evaluate_deal_quality(
         "effective_unit_display": effective_unit_display,
         "total_price": total_p,
         "unit_metrics": unit_metrics,
+        "is_ambiguous": is_ambig,
+        "obs_ship_type": obs_ship_type,
     }
 
     low_title = base_title.lower()
@@ -2525,17 +2550,12 @@ def evaluate_deal_quality(
         base_res["reason"] = "low_discount"
         return base_res
 
-    if _AMBIGUOUS_TRACK_B_RE.search(base_title):
+    if is_ambig or _AMBIGUOUS_TRACK_B_RE.search(base_title):
         base_res["reason"] = "wait"
         return base_res
 
-    # Track B1: 동일 옵션 30일(5일 이상 관측) 중앙값 대비 할인 검증
-    if price_db is not None and option_key:
-        obs_ship_type = (
-            "paid"
-            if (ship_fee > 0 or ship_type == "paid")
-            else ("conditional" if ship_type == "conditional" else "free")
-        )
+    # Track B1: 동일 확정 옵션/구성 + 확정 배송 조건 30일(5일 이상 관측) 중앙값 대비 할인 검증
+    if price_db is not None and is_comparable_option_key(option_key) and obs_ship_type in ("free", "paid"):
         baseline = price_db.get_observed_baseline(
             option_key,
             shipping_type=obs_ship_type,
@@ -2558,8 +2578,11 @@ def evaluate_deal_quality(
                 })
                 return base_res
 
-    # Track B2: 식품/반복소비재 단가 + 반응 게이트
+    # Track B2: 식품/반복소비재 단일 구성 단가 + 확정 배송 + 반응 게이트
     if category == "food" and effective_unit_display:
+        if obs_ship_type not in ("free", "paid"):
+            base_res["reason"] = "wait"
+            return base_res
         if _has_track_b_food_reaction(d, source_name, base_title, body_text):
             ship_note = f"배송포함 {effective_unit_display}" if ship_fee > 0 else effective_unit_display
             base_res.update({
@@ -2636,6 +2659,8 @@ def process_deal(
         return False
 
     price_db = get_price_db()
+    if price_db.get_source_cooldown(source_name):
+        return False
     wait_key = f"{source_name}:{deal_id}"
     skip_wait, skip_reason = price_db.should_skip_wait_recheck(wait_key, WAIT_RECHECK_MIN_MINUTES)
     if skip_wait:
@@ -2685,7 +2710,7 @@ def process_deal(
         price_db.delete_pending_wait(wait_key)
         return False
 
-    option_key = build_option_key(product_id=product_id, url=clean_url, title=base_title)
+    option_key = build_option_key(product_id=product_id, url=clean_url, title=base_title, body_text=body_text)
     pricing_title = base_title
     if detail.get("extracted_price") and detail["extracted_price"] >= 1000:
         if f"{detail['extracted_price']:,}" not in pricing_title and str(detail["extracted_price"]) not in pricing_title:
@@ -2752,7 +2777,7 @@ def process_deal(
         price_db.delete_pending_wait(wait_key)
         return False
 
-    # 유효 가격 관측 이력 적재 (1일 1옵션 1배송조건 최저가)
+    # 유효 가격 관측 이력 적재 (확정 옵션/구성 + 확정 배송 조건 'free'|'paid'만 1일 최저가 기록)
     eval_res = evaluate_deal_quality(
         d,
         source_name,
@@ -2762,13 +2787,12 @@ def process_deal(
         option_key=option_key,
         price_db=price_db,
     )
-    if eval_res["reason"] != "permanent" and not _AMBIGUOUS_TRACK_B_RE.search(base_title):
-        ship_t = str(p_info.get("shipping_type") or "")
-        obs_ship_type = (
-            "paid"
-            if (int(p_info.get("shipping_fee", 0) or 0) > 0 or ship_t == "paid")
-            else ("conditional" if ship_t == "conditional" else "free")
-        )
+    if (
+        eval_res["reason"] != "permanent"
+        and not eval_res.get("is_ambiguous")
+        and is_comparable_option_key(option_key)
+        and eval_res.get("obs_ship_type") in ("free", "paid")
+    ):
         um = eval_res.get("unit_metrics") or {}
         price_db.record_observation(
             option_key=option_key,
@@ -2777,7 +2801,7 @@ def process_deal(
             sale_price=int(p_info["final_price"]),
             shipping_fee=int(p_info.get("shipping_fee", 0) or 0),
             orig_price=int(p_info["orig_price"]),
-            shipping_type=obs_ship_type,
+            shipping_type=str(eval_res["obs_ship_type"]),
             category=str(eval_res["category"]),
             source=source_name,
             metric_type=str(um.get("metric_type") or ""),
@@ -2845,7 +2869,9 @@ def process_deal(
 
     display_unit = str(p_info.get("unit_info") or "")
     eff_unit = str(eval_res.get("effective_unit_display") or "")
-    if eff_unit and (not display_unit or int(p_info.get("shipping_fee", 0) or 0) > 0):
+    if eval_res.get("is_ambiguous"):
+        display_unit = ""
+    elif eff_unit:
         display_unit = f"{eff_unit} (배송포함)" if int(p_info.get("shipping_fee", 0) or 0) > 0 else eff_unit
 
     # 전단지 큐 모드: 검증 완료 즉시 큐에 적재하고 중복 방지를 위해 seen 기록
@@ -3527,9 +3553,15 @@ def main():
     flyer_queue = load_flyer_queue()
     ocr_cache = load_ocr_cache()
     price_db = get_price_db()
-    expired_waits = price_db.cleanup_expired_waits()
-    if expired_waits > 0:
-        logger.info(f"🧹 [대기열 정리] 만료된 대기 딜 {expired_waits}건 정리 완료")
+    expired_waits = price_db.pop_expired_waits()
+    if expired_waits:
+        for ew in expired_waits:
+            post_id = str(ew.get("post_id") or "")
+            if post_id:
+                seen.add(post_id)
+                _drop_ocr_cache_entry(ocr_cache, post_id)
+        save_seen(seen)
+        logger.info(f"🧹 [대기열 정리] 만료된 대기 딜 {len(expired_waits)}건 seen 영구 제외 및 정리 완료")
     run_stats = {"queued": 0, "sent": 0}
 
     def _remaining_daily_room() -> int:
@@ -3581,6 +3613,9 @@ def main():
             for src in active_sources:
                 if (run_stats["queued"] + run_stats["sent"]) >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= _remaining_daily_room():
                     break
+                if price_db.get_source_cooldown(src):
+                    logger.info(f"⏸️ [{src}] 회차 중 쿨다운 진입 — 추가 후보 조회 중단")
+                    continue
                 if attempts_by_source[src] >= MAX_PER_SOURCE_PER_RUN:
                     continue
                 q_rows = iterators[src]
@@ -3608,6 +3643,9 @@ def main():
                         ocr_cache=ocr_cache,
                     )
                     processed_one = True
+                if price_db.get_source_cooldown(src):
+                    logger.info(f"⏸️ [{src}] 상세 조회 중 차단/429 감지 — 동일 회차 남은 후보 중단")
+                    continue
                 if q_rows and attempts_by_source[src] < MAX_PER_SOURCE_PER_RUN:
                     next_active.append(src)
             active_sources = next_active

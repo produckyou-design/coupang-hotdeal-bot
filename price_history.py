@@ -117,90 +117,230 @@ def classify_deal_category(title: str, body_text: str = "") -> str:
     return "general"
 
 
-_UNIT_SPEC_WEIGHT_VOL_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)\b"
-    r"(?:\s*[x×*]\s*(\d+)\s*(?:개|입|봉|팩|병|캔|페트|포|통|박스|세트)?)?",
+_COUNT_UNIT_TIER1 = {
+    "개", "개입", "입", "병", "캔", "봉", "봉지", "포", "매", "롤", "정", "캡슐", "페트", "알", "통",
+}
+_COUNT_UNIT_TIER2 = {"팩", "박스", "상자", "묶음", "세트"}
+_COUNT_UNIT_CANON = {"개입": "개", "입": "개", "봉지": "봉", "페트": "병"}
+_ALL_COUNT_UNITS = _COUNT_UNIT_TIER1 | _COUNT_UNIT_TIER2
+_ALL_COUNT_UNIT_ALT = "개입|개|봉지|봉|병|캔|팩|입|롤|매|정|캡슐|포|페트|알|통|박스|상자|묶음|세트"
+
+_AMBIGUOUS_OPTION_PATTERNS = (
+    re.compile(r"(?:택\s*\d|택일|중\s*택|선택\s*가능|옵션\s*선택|옵션별|구성별|종류별|골라담기)"),
+    re.compile(
+        rf"\d+(?:\.\d+)?\s*(?:{_ALL_COUNT_UNIT_ALT}|kg|g|ml|l|리터|킬로)\s*(?:또는|혹은|\bor\b)\s*\d+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:^|[^0-9,.원])\d+\s*(?:{_ALL_COUNT_UNIT_ALT})?\s*(?:~|/)\s*\d+\s*(?:{_ALL_COUNT_UNIT_ALT})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\d+(?:\.\d+)?\s*(?:ml|l|리터)\s*(?:~|/)\s*\d+(?:\.\d+)?\s*(?:ml|l|리터)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\d+(?:\.\d+)?\s*(?:kg|g|킬로)\s*(?:~|/)\s*\d+(?:\.\d+)?\s*(?:kg|g|킬로)\b",
+        re.IGNORECASE,
+    ),
+)
+
+_AMBIGUOUS_PRICE_RE = re.compile(
+    r"\d[\d,]*\s*원\s*(?:부터|~)|최대\s*할인|체감가"
+    r"|(?:적립|캐시|포인트)\s*(?:포함|후|적용\s*시?)\s*[\d,]+\s*원"
+    r"|카드\s*(?:할인|청구)\s*(?:포함|적용|시)\s*[\d,]+\s*원"
+)
+
+
+def has_ambiguous_option_or_price(title: str, body_text: str = "") -> Tuple[bool, str]:
+    """제목 및 본문에서 다중 옵션 선택(택1/A 또는 B)이나 비확정 가격(~원부터/체감가)을 감지."""
+    text = re.sub(r"\s+", " ", f"{title or ''} {body_text or ''}").strip()
+    if not text:
+        return False, ""
+    if _AMBIGUOUS_PRICE_RE.search(text):
+        return True, "ambiguous_price"
+    for pat in _AMBIGUOUS_OPTION_PATTERNS:
+        if pat.search(text):
+            return True, "ambiguous_option"
+    return False, ""
+
+
+def normalize_observed_shipping_type(shipping_type: str, shipping_fee: int = 0) -> str:
+    """배송 근거를 'free' | 'paid' | 'unknown'으로 엄격 정규화 (미확인·조건부는 'unknown')."""
+    st = (shipping_type or "").strip().lower()
+    fee = int(shipping_fee or 0)
+    if st in ("free", "rocket_free") and fee == 0:
+        return "free"
+    if st == "paid" and fee > 0:
+        return "paid"
+    return "unknown"
+
+
+_PAREN_TOTAL_SUMMARY_RE = re.compile(
+    rf"\(\s*(?:총|합계|전체|약)\s*[\d.,]+\s*(?:kg|g|ml|l|리터|킬로|{_ALL_COUNT_UNIT_ALT})\s*\)",
     re.IGNORECASE,
 )
-_PACK_MULTI_RE = re.compile(
-    r"(?:[x×*]\s*(\d+)|(\d+)\s*(?:개입|개|봉지|봉|팩|입|롤|매|정|캡슐|병|캔|페트|포|통|박스|세트))",
+_DUP_PAREN_COUNT_RE = re.compile(
+    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})\s*\(\s*\1\s*({_ALL_COUNT_UNIT_ALT})\s*\)",
     re.IGNORECASE,
 )
-_COUNT_UNIT_RE = re.compile(
-    r"(\d+)\s*(롤|매|정|캡슐|포|봉|팩|병|캔|개|입)\b",
+_WEIGHT_VOL_SPEC_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(kg|g|l|ml|리터|킬로)\b",
+    re.IGNORECASE,
+)
+_PACK_MULTI_TOKEN_RE = re.compile(
+    rf"(?:([x×*])\s*(\d+)(?:\s*({_ALL_COUNT_UNIT_ALT}))?"
+    rf"|(\d+)\s*({_ALL_COUNT_UNIT_ALT}))\b",
+    re.IGNORECASE,
+)
+_COUNT_ONLY_TOKEN_RE = re.compile(
+    rf"(\d+)\s*({_ALL_COUNT_UNIT_ALT})\b",
     re.IGNORECASE,
 )
 
 
-def compute_effective_unit_metrics(title: str, total_price: int) -> Dict[str, Any]:
-    """제목의 중량/용량/수량과 총 결제금액(배송비 포함)으로 표준 단위가격을 계산."""
+def _fmt_spec_num(v: float) -> str:
+    if abs(v - round(v)) < 1e-6:
+        return str(int(round(v)))
+    return f"{v:.3f}".rstrip("0").rstrip(".")
+
+
+def _unit_tier(u: str) -> int:
+    ul = (u or "").lower()
+    if ul in _COUNT_UNIT_TIER2:
+        return 2
+    if ul in _COUNT_UNIT_TIER1:
+        return 1
+    return 0
+
+
+def _clean_title_for_unit_parse(title: str) -> Tuple[str, List[Tuple[int, int]]]:
+    s = _PAREN_TOTAL_SUMMARY_RE.sub(" ", title or "")
+    s = _DUP_PAREN_COUNT_RE.sub(r"\1\2", s)
+    paren_spans = [(m.start(), m.end()) for m in re.finditer(r"\([^\)]*\)|\[[^\]]*\]", s)]
+    spaced = re.sub(r"[\[\]\(\)]", " ", s)
+    return spaced, paren_spans
+
+
+def _in_any_span(pos: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
+def compute_effective_unit_metrics(
+    title: str,
+    total_price: int,
+    body_text: str = "",
+) -> Dict[str, Any]:
+    """제목의 단일 구성 중량/용량/수량과 총 결제금액(배송비 포함)으로 표준 단위가격 및 구성 시그니처 계산."""
     if not title or not isinstance(total_price, (int, float)) or total_price < 1000:
         return {}
 
-    text = re.sub(r"[\[\]\(\)]", " ", title)
+    is_ambig, _ = has_ambiguous_option_or_price(title, body_text)
+    if is_ambig:
+        return {}
 
-    # 1) 중량/용량 + 배수 탐색 (예: 500ml x 40, 500ml 40개, 72g 6개, 200g 2팩 3박스)
-    best_weight_g = 0.0
-    best_vol_ml = 0.0
+    text, paren_spans = _clean_title_for_unit_parse(title)
 
-    for m in _UNIT_SPEC_WEIGHT_VOL_RE.finditer(text):
+    # 1) 중량/용량 스펙 탐색 — 서로 다른 규격이 2개 이상이면 복합 구성으로 간주해 단가 미산출
+    specs: List[Tuple[str, float, re.Match]] = []
+    seen_specs = set()
+    for m in _WEIGHT_VOL_SPEC_RE.finditer(text):
         val = float(m.group(1))
         unit = m.group(2).lower()
-        mult = int(m.group(3)) if m.group(3) else 1
-
-        if mult == 1:
-            # 바로 뒤 구간(최대 24자)에서 개/봉/팩/박스 등 수량 multiplier 탐색
-            tail = text[m.end(): m.end() + 24]
-            mults = []
-            for pm in _PACK_MULTI_RE.finditer(tail):
-                num_s = pm.group(1) or pm.group(2)
-                if num_s:
-                    n = int(num_s)
-                    if 1 <= n <= 500:
-                        mults.append(n)
-            if mults:
-                for n in mults:
-                    mult *= n
-
         if unit in ("kg", "킬로"):
-            total_g = val * 1000.0 * mult
-            if total_g > best_weight_g:
-                best_weight_g = total_g
+            fam, base_val = "wt", round(val * 1000.0, 3)
         elif unit == "g":
-            total_g = val * mult
-            if total_g > best_weight_g:
-                best_weight_g = total_g
+            fam, base_val = "wt", round(val, 3)
         elif unit in ("l", "리터"):
-            total_ml = val * 1000.0 * mult
-            if total_ml > best_vol_ml:
-                best_vol_ml = total_ml
-        elif unit == "ml":
-            total_ml = val * mult
-            if total_ml > best_vol_ml:
-                best_vol_ml = total_ml
-
-    if best_vol_ml > 0:
-        per_100ml = round(total_price * 100.0 / best_vol_ml, 2)
-        if best_vol_ml >= 1000.0:
-            per_1l = int(round(total_price * 1000.0 / best_vol_ml))
-            display_unit = f"1L당 {per_1l:,}원"
+            fam, base_val = "vol", round(val * 1000.0, 3)
         else:
-            display_unit = f"100ml당 {int(round(per_100ml)):,}원"
-        return {
-            "metric_type": "per_100ml",
-            "metric_value": per_100ml,
-            "per_100g": None,
-            "per_100ml": per_100ml,
-            "per_unit": None,
-            "unit_count": None,
-            "unit_label": "ml",
-            "display_unit": display_unit,
-        }
+            fam, base_val = "vol", round(val, 3)
+        if base_val <= 0:
+            continue
+        specs.append((fam, base_val, m))
+        seen_specs.add((fam, base_val))
 
-    if best_weight_g > 0:
-        per_100g = round(total_price * 100.0 / best_weight_g, 2)
-        if best_weight_g >= 2000.0:
-            per_1kg = int(round(total_price * 1000.0 / best_weight_g))
+    if len(seen_specs) > 1:
+        return {}
+
+    if specs:
+        fam, base_val, first_m = specs[0]
+        tail_raw = text[first_m.end(): first_m.end() + 28]
+        # 가격 토큰('9,900원') 이후는 수량 탐색 대상에서 제외
+        m_price = re.search(r"\d[\d,]*\s*원", tail_raw)
+        if m_price:
+            tail_raw = tail_raw[: m_price.start()]
+
+        tokens: List[Tuple[int, str, bool, bool]] = []
+        for pm in _PACK_MULTI_TOKEN_RE.finditer(tail_raw):
+            abs_pos = first_m.end() + pm.start()
+            in_par = _in_any_span(abs_pos, paren_spans)
+            if pm.group(1):
+                n = int(pm.group(2))
+                u = pm.group(3) or ""
+                explicit_x = True
+            else:
+                n = int(pm.group(4))
+                u = pm.group(5) or ""
+                explicit_x = False
+            if 1 <= n <= 500:
+                tokens.append((n, u, explicit_x, in_par))
+
+        if len(tokens) > 2:
+            # 괄호 안 동일 숫자 중복 토큰 정리 시도
+            dedup: List[Tuple[int, str, bool, bool]] = []
+            for tok in tokens:
+                if tok[3] and any(d[0] == tok[0] for d in dedup):
+                    continue
+                dedup.append(tok)
+            tokens = dedup
+            if len(tokens) > 2:
+                return {}
+
+        mult = 1
+        if len(tokens) == 1:
+            mult = tokens[0][0]
+        elif len(tokens) == 2:
+            (n1, u1, _x1, _p1), (n2, u2, x2, p2) = tokens
+            t1, t2 = _unit_tier(u1), _unit_tier(u2)
+            if p2 and n2 == n1:
+                mult = n1
+            elif x2:
+                mult = n1 * n2
+            elif t1 == 1 and t2 == 2:
+                mult = n1 * n2
+            elif n1 == n2:
+                mult = n1
+            elif t1 == t2:
+                return {}
+            elif t1 == 2 and t2 == 1 and n2 == 1:
+                mult = n1
+            else:
+                return {}
+
+        total_spec = base_val * mult
+        if fam == "vol":
+            per_100ml = round(total_price * 100.0 / total_spec, 2)
+            if total_spec >= 1000.0:
+                per_1l = int(round(total_price * 1000.0 / total_spec))
+                display_unit = f"1L당 {per_1l:,}원"
+            else:
+                display_unit = f"100ml당 {int(round(per_100ml)):,}원"
+            return {
+                "metric_type": "per_100ml",
+                "metric_value": per_100ml,
+                "per_100g": None,
+                "per_100ml": per_100ml,
+                "per_unit": None,
+                "unit_count": mult if mult > 1 else None,
+                "unit_label": "ml",
+                "display_unit": display_unit,
+                "config_sig": f"vol:{_fmt_spec_num(base_val)}ml:n{mult}",
+            }
+
+        per_100g = round(total_price * 100.0 / total_spec, 2)
+        if total_spec >= 2000.0:
+            per_1kg = int(round(total_price * 1000.0 / total_spec))
             display_unit = f"1kg당 {per_1kg:,}원"
         else:
             display_unit = f"100g당 {int(round(per_100g)):,}원"
@@ -210,38 +350,79 @@ def compute_effective_unit_metrics(title: str, total_price: int) -> Dict[str, An
             "per_100g": per_100g,
             "per_100ml": None,
             "per_unit": None,
-            "unit_count": None,
+            "unit_count": mult if mult > 1 else None,
             "unit_label": "g",
             "display_unit": display_unit,
+            "config_sig": f"wt:{_fmt_spec_num(base_val)}g:n{mult}",
         }
 
-    # 2) 개수 기반 단위 (예: 30롤, 100매, 60정, 24개)
-    counts: List[Tuple[int, str]] = []
-    for cm in _COUNT_UNIT_RE.finditer(text):
+    # 2) 개수 기반 단위 (예: 30롤, 100매 10팩, 60정)
+    cnt_tokens: List[Tuple[int, str, int, int, bool]] = []
+    for cm in _COUNT_ONLY_TOKEN_RE.finditer(text):
         cnt = int(cm.group(1))
         lbl = cm.group(2)
         if 2 <= cnt <= 2000:
-            counts.append((cnt, lbl))
-    if counts:
-        total_cnt = 1
-        unit_label = counts[0][1]
-        for cnt, lbl in counts[:2]:
-            total_cnt *= cnt
-            unit_label = lbl
-        per_unit = round(total_price / total_cnt, 2)
-        display_unit = f"1{unit_label}당 {int(round(per_unit)):,}원"
-        return {
-            "metric_type": f"per_{unit_label}",
-            "metric_value": per_unit,
-            "per_100g": None,
-            "per_100ml": None,
-            "per_unit": per_unit,
-            "unit_count": total_cnt,
-            "unit_label": unit_label,
-            "display_unit": display_unit,
-        }
+            cnt_tokens.append((cnt, lbl, cm.start(), cm.end(), _in_any_span(cm.start(), paren_spans)))
 
-    return {}
+    if not cnt_tokens:
+        return {}
+
+    if len(cnt_tokens) > 2:
+        dedup_c: List[Tuple[int, str, int, int, bool]] = []
+        for tok in cnt_tokens:
+            if tok[4] and any(d[0] == tok[0] for d in dedup_c):
+                continue
+            dedup_c.append(tok)
+        cnt_tokens = dedup_c
+        if len(cnt_tokens) > 2:
+            return {}
+
+    if len(cnt_tokens) == 1:
+        total_cnt = cnt_tokens[0][0]
+        raw_lbl = cnt_tokens[0][1]
+    else:
+        (n1, u1, _s1, e1, _p1), (n2, u2, s2, _e2, p2) = cnt_tokens
+        t1, t2 = _unit_tier(u1), _unit_tier(u2)
+        between = text[e1:s2]
+        if p2 and n2 == n1:
+            total_cnt, raw_lbl = n1, u1
+        elif re.match(r"^\s*[x×*]\s*$", between):
+            total_cnt, raw_lbl = n1 * n2, u1
+        elif t1 == 1 and t2 == 2:
+            total_cnt, raw_lbl = n1 * n2, u1
+        elif n1 == n2:
+            total_cnt, raw_lbl = n1, u1
+        elif t1 == 2 and t2 == 1 and n2 == 1:
+            total_cnt, raw_lbl = n1, u1
+        else:
+            return {}
+
+    canon_lbl = _COUNT_UNIT_CANON.get(raw_lbl.lower(), raw_lbl)
+    per_unit = round(total_price / total_cnt, 2)
+    display_unit = f"1{canon_lbl}당 {int(round(per_unit)):,}원"
+    return {
+        "metric_type": f"per_{canon_lbl}",
+        "metric_value": per_unit,
+        "per_100g": None,
+        "per_100ml": None,
+        "per_unit": per_unit,
+        "unit_count": total_cnt,
+        "unit_label": canon_lbl,
+        "display_unit": display_unit,
+        "config_sig": f"cnt:{canon_lbl}:n{total_cnt}",
+    }
+
+
+def extract_config_signature(title: str, body_text: str = "") -> str:
+    """제목/본문에서 단일 구성이 확정된 경우 정규화 구성 시그니처 반환."""
+    res = compute_effective_unit_metrics(title, 10000, body_text=body_text)
+    return str(res.get("config_sig") or "")
+
+
+def is_comparable_option_key(option_key: str) -> bool:
+    """옵션 ID(:vid:, :iid:) 또는 단일 구성(:cfg:)이 확정된 키인지 여부."""
+    k = str(option_key or "")
+    return (":vid:" in k) or (":iid:" in k) or (":cfg:" in k)
 
 
 def build_option_key(
@@ -250,8 +431,9 @@ def build_option_key(
     vendor_item_id: str = "",
     title: str = "",
     url: str = "",
+    body_text: str = "",
 ) -> str:
-    """쿠팡 상품/옵션 식별자(productId + itemId/vendorItemId) 기반 고유 키 생성."""
+    """쿠팡 상품/옵션 식별자(vid > iid > 정규화 구성 시그니처 > 미확정) 기반 고유 키 생성."""
     pid = str(product_id or "").strip()
     iid = str(item_id or "").strip()
     vid = str(vendor_item_id or "").strip()
@@ -276,7 +458,10 @@ def build_option_key(
             return f"pid:{pid}:vid:{vid}"
         if iid:
             return f"pid:{pid}:iid:{iid}"
-        return f"pid:{pid}"
+        cfg = extract_config_signature(title, body_text=body_text)
+        if cfg:
+            return f"pid:{pid}:cfg:{cfg}"
+        return f"pid:{pid}:unspec"
 
     norm = re.sub(r"\s+", "", (title or url or "unknown").lower())
     digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
@@ -378,7 +563,7 @@ class PriceHistoryDB:
         sale_price: int,
         shipping_fee: int = 0,
         orig_price: int = 0,
-        shipping_type: str = "free",
+        shipping_type: str = "unknown",
         category: str = "general",
         source: str = "",
         metric_type: str = "",
@@ -386,11 +571,13 @@ class PriceHistoryDB:
         obs_date: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> None:
-        if not option_key or total_price <= 0 or sale_price <= 0:
+        stype = (shipping_type or "").strip().lower()
+        if not is_comparable_option_key(option_key) or stype not in ("free", "paid"):
+            return
+        if total_price <= 0 or sale_price <= 0:
             return
         dt = _now_kst(now)
         day_str = obs_date or dt.strftime("%Y-%m-%d")
-        stype = (shipping_type or "free").strip().lower()
         with self._connect() as conn:
             conn.execute(
                 """
@@ -444,7 +631,8 @@ class PriceHistoryDB:
         min_days: int = 5,
         now: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        if not option_key:
+        stype = (shipping_type or "").strip().lower()
+        if not is_comparable_option_key(option_key) or stype not in ("free", "paid"):
             return None
         dt = _now_kst(now)
         since_date = (dt - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -452,13 +640,10 @@ class PriceHistoryDB:
         query = """
             SELECT obs_date, MIN(total_price) AS day_low
             FROM price_observations
-            WHERE option_key = ? AND obs_date >= ?
+            WHERE option_key = ? AND obs_date >= ? AND shipping_type = ?
+            GROUP BY obs_date ORDER BY obs_date DESC
         """
-        params: List[Any] = [option_key, since_date]
-        if shipping_type:
-            query += " AND shipping_type = ?"
-            params.append(shipping_type.strip().lower())
-        query += " GROUP BY obs_date ORDER BY obs_date DESC"
+        params: List[Any] = [option_key, since_date, stype]
 
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
@@ -642,14 +827,22 @@ class PriceHistoryDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM pending_wait_deals WHERE wait_key = ?", (wait_key,))
 
-    def cleanup_expired_waits(self, now: Optional[datetime] = None) -> int:
+    def pop_expired_waits(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         dt = _now_kst(now)
         with self._connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM pending_wait_deals WHERE expires_at <= ?",
+            rows = conn.execute(
+                "SELECT * FROM pending_wait_deals WHERE expires_at <= ?",
                 (dt.isoformat(),),
-            )
-            return int(cur.rowcount or 0)
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    "DELETE FROM pending_wait_deals WHERE expires_at <= ?",
+                    (dt.isoformat(),),
+                )
+            return [dict(r) for r in rows]
+
+    def cleanup_expired_waits(self, now: Optional[datetime] = None) -> int:
+        return len(self.pop_expired_waits(now=now))
 
     def set_source_cooldown(
         self,
