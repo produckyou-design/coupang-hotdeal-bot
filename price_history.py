@@ -1084,3 +1084,20 @@ class PriceHistoryDB:
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM source_cooldowns WHERE source = ?", (source,))
+
+    def prune_old_records(self, days: int = 120, now: Optional[datetime] = None) -> Dict[str, int]:
+        """오래된 관측 가격·게시 이력·만료된 출처 쿨다운을 정리해 DB 비대화를 방지한다."""
+        dt = _now_kst(now)
+        keep_days = max(30, int(days or 120))
+        cutoff_dt = dt - timedelta(days=keep_days)
+        cutoff_date = cutoff_dt.strftime("%Y-%m-%d")
+        cutoff_iso = cutoff_dt.isoformat()
+        with self._connect() as conn:
+            c1 = conn.execute("DELETE FROM price_observations WHERE obs_date < ?", (cutoff_date,)).rowcount
+            c2 = conn.execute("DELETE FROM published_prices WHERE published_at < ?", (cutoff_iso,)).rowcount
+            c3 = conn.execute("DELETE FROM source_cooldowns WHERE cooldown_until <= ?", (dt.isoformat(),)).rowcount
+        return {
+            "observations": max(0, int(c1 or 0)),
+            "published": max(0, int(c2 or 0)),
+            "cooldowns": max(0, int(c3 or 0)),
+        }

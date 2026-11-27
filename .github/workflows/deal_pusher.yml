@@ -17,27 +17,31 @@ permissions:
 jobs:
   push-deals:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install System OCR Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-kor fonts-nanum
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y --fix-missing tesseract-ocr tesseract-ocr-kor fonts-nanum && break
+            echo "apt-get retry $i..."
+            sleep 5
+          done
 
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
 
       - name: Restore SQLite Price History & OCR Cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             price_history.db
@@ -72,7 +76,7 @@ jobs:
 
       - name: Save SQLite Price History & OCR Cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             price_history.db
@@ -88,6 +92,10 @@ jobs:
           done
           if ! git diff --cached --quiet; then
             git commit -m "chore: update seen deals and sales tracker [skip ci]"
-            git pull --rebase origin main || true
-            git push origin main
+            for i in 1 2 3; do
+              git pull --rebase origin main || true
+              git push origin main && break
+              echo "git push retry $i..."
+              sleep 3
+            done
           fi

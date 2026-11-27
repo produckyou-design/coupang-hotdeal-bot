@@ -1,4 +1,4 @@
-import { handleTelegramUpdate } from "./telegram_bot.js";
+import { handleTelegramUpdate, parseAdminChatId, tgApi } from "./telegram_bot.js";
 
 const ALLOWED_HOSTS = new Set([
   "link.coupang.com",
@@ -1392,10 +1392,123 @@ async function handleTelegramWebhook(request, env, ctx, origin) {
   return jsonResponse({ ok: true });
 }
 
+async function readChannelMeta(env, key) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM channel_meta WHERE key = ? LIMIT 1").bind(key).first();
+    return row ? String(row.value || "") : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeChannelMeta(env, key, value, nowIso = new Date().toISOString()) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO channel_meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    )
+      .bind(key, String(value), nowIso)
+      .run();
+  } catch (err) {
+    console.warn("writeChannelMeta failed", key, String(err));
+  }
+}
+
+async function sendWatchdogAlert(env, message, nowMs = Date.now(), throttleMs = 6 * 3600 * 1000) {
+  const adminId = parseAdminChatId(env);
+  if (adminId === null || !String(env?.TELEGRAM_BOT_TOKEN || "").trim()) return false;
+  const lastIso = await readChannelMeta(env, "last_watchdog_alert");
+  if (lastIso) {
+    const lastMs = Date.parse(lastIso);
+    if (!Number.isNaN(lastMs) && nowMs - lastMs < throttleMs) {
+      return false;
+    }
+  }
+  await writeChannelMeta(env, "last_watchdog_alert", new Date(nowMs).toISOString(), new Date(nowMs).toISOString());
+  try {
+    await tgApi(env, "sendMessage", {
+      chat_id: adminId,
+      text: message,
+      parse_mode: "HTML",
+    });
+    return true;
+  } catch (err) {
+    console.warn("sendWatchdogAlert failed", String(err));
+    return false;
+  }
+}
+
+export async function runDailyMaintenance(env, nowDate = new Date()) {
+  const nowMs = nowDate.getTime();
+  const cutoff30d = new Date(nowMs - 30 * 86400 * 1000).toISOString();
+  const cutoff14d = new Date(nowMs - 14 * 86400 * 1000).toISOString();
+  const cutoff365d = new Date(nowMs - 365 * 86400 * 1000).toISOString();
+
+  const pruned = { sessions: 0, posts: 0, clicks: 0, links: 0 };
+  try {
+    const rSess = await env.DB.prepare("DELETE FROM bot_sessions WHERE updated_at < ?").bind(cutoff30d).run();
+    const rPost = await env.DB.prepare("DELETE FROM posted_messages WHERE posted_at < ?").bind(cutoff14d).run();
+    const rClicks = await env.DB.prepare("DELETE FROM clicks WHERE clicked_at < ?").bind(cutoff365d).run();
+    const rLinks = await env.DB.prepare(
+      "DELETE FROM links WHERE created_at < ? AND code NOT IN (SELECT DISTINCT code FROM clicks)"
+    )
+      .bind(cutoff365d)
+      .run();
+    pruned.sessions = Number(rSess?.meta?.changes || 0);
+    pruned.posts = Number(rPost?.meta?.changes || 0);
+    pruned.clicks = Number(rClicks?.meta?.changes || 0);
+    pruned.links = Number(rLinks?.meta?.changes || 0);
+  } catch (err) {
+    console.warn(JSON.stringify({ event: "d1_prune_error", message: String(err) }));
+  }
+
+  let webhookHealed = false;
+  const botToken = String(env?.TELEGRAM_BOT_TOKEN || "").trim();
+  const whSecret = String(env?.TELEGRAM_WEBHOOK_SECRET || "").trim();
+  if (botToken && whSecret) {
+    try {
+      const baseUrl = String(env?.WORKER_BASE_URL || "https://hotpang-click.produckyou.workers.dev").replace(/\/+$/, "");
+      const expectedUrl = `${baseUrl}/telegram/webhook`;
+      const info = await tgApi(env, "getWebhookInfo", {});
+      const allowed = Array.isArray(info?.allowed_updates) ? info.allowed_updates : [];
+      if (info?.url !== expectedUrl || !allowed.includes("chat_member") || !allowed.includes("message")) {
+        await tgApi(env, "setWebhook", {
+          url: expectedUrl,
+          secret_token: whSecret,
+          allowed_updates: ["message", "callback_query", "chat_member"],
+          drop_pending_updates: false,
+        });
+        webhookHealed = true;
+        console.warn(JSON.stringify({ event: "webhook_self_healed", prev_url: info?.url || "" }));
+        const adminId = parseAdminChatId(env);
+        if (adminId !== null) {
+          await tgApi(env, "sendMessage", {
+            chat_id: adminId,
+            text: "🛠️ <b>[자동 복구]</b> Telegram Webhook 설정이 유실되어 자동으로 재등록했습니다.",
+            parse_mode: "HTML",
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.warn(JSON.stringify({ event: "webhook_check_error", message: String(err) }));
+    }
+  }
+
+  console.log(JSON.stringify({ event: "daily_maintenance", pruned, webhookHealed }));
+  return { ok: true, pruned, webhookHealed };
+}
+
 export async function runScheduledDispatch(env, nowDate = new Date()) {
   const kst = new Date(nowDate.getTime() + 9 * 3600 * 1000);
   const kstHour = kst.getUTCHours();
   const kstMinute = kst.getUTCMinutes();
+
+  if (kstHour === 4 && kstMinute === 0) {
+    await runDailyMaintenance(env, nowDate).catch((err) => {
+      console.warn(JSON.stringify({ event: "daily_maintenance_error", message: String(err) }));
+    });
+  }
 
   if (kstHour >= 0 && kstHour < 7 && kstMinute % 20 !== 0) {
     console.log(JSON.stringify({ event: "cron_dispatch", skipped: true, reason: "quiet_hours", kstHour, kstMinute }));
@@ -1413,20 +1526,91 @@ export async function runScheduledDispatch(env, nowDate = new Date()) {
   const wf = String(env?.GH_WORKFLOW_FILE || "deal_pusher.yml").trim();
   const dispatchUrl = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${wf}/dispatches`;
 
-  const res = await fetch(dispatchUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${ghToken}`,
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "User-Agent": "hotpang-click-worker",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: JSON.stringify({ ref: "main" }),
-  });
+  let res = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      res = await fetch(dispatchUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ghToken}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": "hotpang-click-worker",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({ ref: "main" }),
+      });
+      if (res.ok || (res.status !== 429 && res.status < 500)) {
+        break;
+      }
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+  }
 
-  console.log(JSON.stringify({ event: "cron_dispatch", status: res.status, kstHour, kstMinute }));
-  return { ok: res.ok, status: res.status, kstHour, kstMinute };
+  const ok = Boolean(res && res.ok);
+  const status = res ? res.status : 0;
+  const nowMs = nowDate.getTime();
+  const prevStreakRaw = await readChannelMeta(env, "dispatch_fail_streak");
+  const prevStreak = Number.parseInt(prevStreakRaw || "0", 10) || 0;
+
+  if (ok) {
+    if (prevStreak > 0) {
+      await writeChannelMeta(env, "dispatch_fail_streak", "0", nowDate.toISOString());
+    }
+    if (prevStreak >= 3) {
+      const adminId = parseAdminChatId(env);
+      if (adminId !== null && String(env?.TELEGRAM_BOT_TOKEN || "").trim()) {
+        await tgApi(env, "sendMessage", {
+          chat_id: adminId,
+          text: "✅ <b>[자동 복구]</b> GitHub Actions 스케줄 트리거가 정상 복구되었습니다.",
+          parse_mode: "HTML",
+        }).catch(() => {});
+      }
+    }
+  } else {
+    const nextStreak = prevStreak + 1;
+    await writeChannelMeta(env, "dispatch_fail_streak", String(nextStreak), nowDate.toISOString());
+    if (nextStreak >= 3) {
+      const authHint =
+        status === 401 || status === 403
+          ? "\n• <code>GH_DISPATCH_TOKEN</code> 만료 또는 권한 오류일 수 있습니다. PAT 갱신을 확인하세요."
+          : "";
+      const errDetail = lastErr ? ` (${String(lastErr)})` : ` (HTTP ${status})`;
+      await sendWatchdogAlert(
+        env,
+        `🚨 <b>[자동 감시 경고]</b> GitHub Actions 스케줄 호출이 <b>${nextStreak}회 연속</b> 실패했습니다.${errDetail}${authHint}`,
+        nowMs
+      );
+    }
+  }
+
+  // Stale runner watchdog (>4 hours since last flyer_status report)
+  try {
+    const flyerStatus = await readFlyerStatus(env);
+    if (flyerStatus?.updated_at) {
+      const updMs = Date.parse(String(flyerStatus.updated_at));
+      if (!Number.isNaN(updMs) && nowMs - updMs > 4 * 3600 * 1000) {
+        await sendWatchdogAlert(
+          env,
+          "⚠️ <b>[자동 감시 경고]</b> 핫딜 수집기(GitHub Actions)가 <b>4시간 이상</b> 실행 보고가 없습니다. Actions 로그를 확인해 주세요.",
+          nowMs
+        );
+      }
+    }
+  } catch (err) {
+    console.warn("stale watchdog check failed", String(err));
+  }
+
+  console.log(JSON.stringify({ event: "cron_dispatch", ok, status, kstHour, kstMinute }));
+  return { ok, status, kstHour, kstMinute };
 }
 
 export default {

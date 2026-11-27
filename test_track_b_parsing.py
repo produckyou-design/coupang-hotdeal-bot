@@ -1547,6 +1547,33 @@ class TestUpgradesIntegration(unittest.TestCase):
         self.assertNotIn("골드박스 제외", sent_caption)
         self.assertNotIn("종료딜 제외", sent_caption)
 
+    def test_price_history_prune_old_records(self):
+        import tempfile
+        from datetime import datetime, timezone, timedelta
+        from pathlib import Path
+        from price_history import PriceHistoryDB
+
+        kst = timezone(timedelta(hours=9))
+        now_dt = datetime(2026, 11, 28, 4, 5, tzinfo=kst)
+        old_dt = now_dt - timedelta(days=150)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "test_prune.db")
+            db = PriceHistoryDB(db_path)
+            db.record_observation("pid:1001:vid:1", "1001", 10000, 10000, shipping_type="free", now=old_dt)
+            db.record_observation("pid:1002:vid:2", "1002", 12000, 12000, shipping_type="free", now=now_dt)
+            db.record_published("pid:1001:vid:1", "1001", 10000, 10000, now=old_dt)
+            db.record_published("pid:1002:vid:2", "1002", 12000, 12000, now=now_dt)
+            db.set_source_cooldown("arca", 403, 10, "old", now=old_dt)
+            db.set_source_cooldown("clien", 429, 30, "active", now=now_dt)
+
+            res = db.prune_old_records(days=120, now=now_dt)
+            self.assertEqual(res["observations"], 1)
+            self.assertEqual(res["published"], 1)
+            self.assertEqual(res["cooldowns"], 1)
+            self.assertIsNotNone(db.get_source_cooldown("clien", now=now_dt))
+            self.assertIsNone(db.get_source_cooldown("arca", now=now_dt))
+
 
 if __name__ == "__main__":
     unittest.main()

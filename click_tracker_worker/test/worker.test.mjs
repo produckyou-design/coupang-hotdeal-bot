@@ -20,7 +20,7 @@ import {
   parseOffer,
   waterRankings,
 } from "../src/unit_compare.js";
-import worker, { runScheduledDispatch } from "../src/index.js";
+import worker, { runDailyMaintenance, runScheduledDispatch } from "../src/index.js";
 
 function createMockD1() {
   const store = {
@@ -204,6 +204,27 @@ function createMockD1() {
     }
     if (s.startsWith("SELECT items_json, all_closed FROM posted_messages")) {
       return { results: [] };
+    }
+    if (s.startsWith("DELETE FROM bot_sessions")) {
+      const before = store.bot_sessions.size;
+      store.bot_sessions.clear();
+      return { meta: { changes: before } };
+    }
+    if (s.startsWith("DELETE FROM posted_messages")) {
+      const before = store.posted_messages.length;
+      store.posted_messages = store.posted_messages.filter((p) => p.posted_at >= String(args[0]));
+      return { meta: { changes: before - store.posted_messages.length } };
+    }
+    if (s.startsWith("DELETE FROM clicks")) {
+      const before = store.clicks.length;
+      store.clicks = store.clicks.filter((c) => c.clicked_at >= String(args[0]));
+      return { meta: { changes: before - store.clicks.length } };
+    }
+    if (s.startsWith("DELETE FROM links")) {
+      const clickedCodes = new Set(store.clicks.map((c) => c.code));
+      const before = store.links.length;
+      store.links = store.links.filter((l) => !(l.created_at < String(args[0]) && !clickedCodes.has(l.code)));
+      return { meta: { changes: before - store.links.length } };
     }
     if (mode === "all") return { results: [] };
     if (mode === "first") return null;
@@ -417,6 +438,94 @@ test("Telegram webhook auth, chat_member +1/milestone, /alert, ComparePad, /stat
     const cronNightRun = await runScheduledDispatch(env, kst0320Utc);
     assert.equal(cronNightRun.ok, true);
     assert.equal(cronNightRun.status, 204);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("runDailyMaintenance self-heals webhook & watchdog handles 3x dispatch failures and stale runner", async () => {
+  const db = createMockD1();
+  const nowDate = new Date("2026-11-28T04:00:00+09:00");
+  db.store.bot_sessions.set("old_user", JSON.stringify({ mode: "" }));
+  db.store.posted_messages.push({ message_id: 1, posted_at: "2026-10-01T00:00:00Z" });
+  db.store.links.push({ code: "old1", created_at: "2024-01-01T00:00:00Z" });
+
+  const calls = [];
+  const origFetch = globalThis.fetch;
+  let ghMode = "fail";
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : {};
+    calls.push({ u, body });
+    if (u.endsWith("/getWebhookInfo")) {
+      return new Response(JSON.stringify({ ok: true, result: { url: "", allowed_updates: [] } }), { status: 200 });
+    }
+    if (u.endsWith("/setWebhook")) {
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }
+    if (u.includes("api.github.com")) {
+      if (ghMode === "fail") return new Response("Unauthorized", { status: 401 });
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }), { status: 200 });
+  };
+
+  try {
+    const env = {
+      DB: db,
+      TELEGRAM_BOT_TOKEN: "123:test",
+      TELEGRAM_ADMIN_CHAT_ID: "999001",
+      TELEGRAM_WEBHOOK_SECRET: "wh-sec",
+      WORKER_BASE_URL: "https://hotpang-click.produckyou.workers.dev",
+      GH_DISPATCH_TOKEN: "ghp_test",
+    };
+
+    // 1) Daily maintenance prunes D1 & self-heals webhook
+    const maint = await runDailyMaintenance(env, nowDate);
+    assert.equal(maint.ok, true);
+    assert.equal(maint.webhookHealed, true);
+    assert.equal(maint.pruned.sessions, 1);
+    assert.equal(maint.pruned.posts, 1);
+    assert.equal(maint.pruned.links, 1);
+    assert.ok(calls.some((c) => c.u.endsWith("/setWebhook") && c.body.url === "https://hotpang-click.produckyou.workers.dev/telegram/webhook"));
+    assert.ok(calls.some((c) => c.u.endsWith("/sendMessage") && /자동 복구/.test(c.body.text)));
+
+    // 2) 3 consecutive dispatch failures -> alert DM, then recovery DM
+    calls.length = 0;
+    const dayTime = new Date("2026-11-28T10:05:00+09:00");
+    await runScheduledDispatch(env, dayTime);
+    await runScheduledDispatch(env, dayTime);
+    assert.equal(calls.filter((c) => c.u.endsWith("/sendMessage")).length, 0);
+    await runScheduledDispatch(env, dayTime);
+    const failDm = calls.find((c) => c.u.endsWith("/sendMessage"));
+    assert.ok(failDm);
+    assert.match(failDm.body.text, /3회 연속/);
+
+    // 4th fail throttled within 6h
+    calls.length = 0;
+    await runScheduledDispatch(env, dayTime);
+    assert.equal(calls.filter((c) => c.u.endsWith("/sendMessage")).length, 0);
+
+    // Recovery triggers recovery DM and resets streak
+    calls.length = 0;
+    ghMode = "ok";
+    await runScheduledDispatch(env, dayTime);
+    const recDm = calls.find((c) => c.u.endsWith("/sendMessage"));
+    assert.ok(recDm);
+    assert.match(recDm.body.text, /정상 복구/);
+    assert.equal(db.store.channel_meta.get("dispatch_fail_streak"), "0");
+
+    // 3) Stale flyer_status > 4h triggers watchdog DM
+    db.store.channel_meta.delete("last_watchdog_alert");
+    db.store.channel_meta.set(
+      "flyer_status",
+      JSON.stringify({ date: "20261128", community_sent: 1, goldbox_sent: 0, waiting: 0, updated_at: "2026-11-28T00:00:00Z" })
+    );
+    calls.length = 0;
+    await runScheduledDispatch(env, new Date("2026-11-28T10:05:00Z"));
+    const staleDm = calls.find((c) => c.u.endsWith("/sendMessage"));
+    assert.ok(staleDm);
+    assert.match(staleDm.body.text, /4시간 이상/);
   } finally {
     globalThis.fetch = origFetch;
   }

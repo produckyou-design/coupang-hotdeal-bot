@@ -8,6 +8,7 @@ enabled = true
 
 [vars]
 TELEGRAM_PUBLIC_CHANNEL_ID = "@HOTpang911"
+WORKER_BASE_URL = "https://hotpang-click.produckyou.workers.dev"
 GH_REPO_OWNER = "produckyou-design"
 GH_REPO_NAME = "coupang-hotdeal-bot"
 GH_WORKFLOW_FILE = "deal_pusher.yml"

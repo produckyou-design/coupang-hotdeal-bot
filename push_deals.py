@@ -4969,7 +4969,10 @@ def main():
     total_sent = run_stats["sent"]
 
     # 전단지 큐 플러시 (4건 모이면 즉시, 미만 시 대기 타임아웃/긴급할인 조건에 따라 송출)
-    total_sent += flush_flyer_queue(flyer_queue, quota)
+    try:
+        total_sent += flush_flyer_queue(flyer_queue, quota)
+    except Exception as fq_err:
+        logger.warning(f"전단지 큐 플러시 생략: {fq_err}")
 
     # 최근 6시간 내 채널 게시물 품절/정상화 자동 감시 및 캡션 수정
     if not is_quiet_hours():
@@ -4979,7 +4982,10 @@ def main():
             logger.warning(f"품절 감시 생략: {cm_err}")
 
     # 매일 20시 당일 실시간 클릭 TOP 4 앵콜 전단지 송출
-    total_sent += run_top_clicks_recap_if_evening(seen, quota)
+    try:
+        total_sent += run_top_clicks_recap_if_evening(seen, quota)
+    except Exception as tc_err:
+        logger.warning(f"20시 클릭 TOP 앵콜 생략: {tc_err}")
 
     # 채널 구독자 증가 체크 (로컬 봇 백업)
     try:
@@ -4989,9 +4995,22 @@ def main():
 
     # 로켓 골드박스 생필품·식품 미끼 4선 전단지 (오전 8~11시 · 저녁 18~21시 2타임)
     if ENABLE_GOLDBOX or "--force-goldbox" in sys.argv:
-        total_sent += run_goldbox_staggered(seen, quota)
+        try:
+            total_sent += run_goldbox_staggered(seen, quota)
+        except Exception as gb_err:
+            logger.warning(f"골드박스 송출 생략: {gb_err}")
 
-    # 클라우드 봇 /status 조회용 전단지·대기큐 현황 동기화
+    # 1일 1회(04:00~04:25 KST) 오래된 가격 관측/게시/만료 쿨다운 자동 정리
+    now_kst = datetime.now(KST)
+    if now_kst.hour == 4 and now_kst.minute < 25:
+        try:
+            pruned = price_db.prune_old_records(days=120, now=now_kst)
+            if any(pruned.values()):
+                logger.info(f"🧹 [DB 자동 정리] {pruned}")
+        except Exception as pr_err:
+            logger.warning(f"DB 자동 정리 생략: {pr_err}")
+
+    # 클라우드 봇 /status 조회용 전단지·대기큐 현황 동기화 (워커 워치독 하트비트 겸용)
     try:
         report_flyer_status(
             str(quota.get("date") or ""),
@@ -5003,10 +5022,16 @@ def main():
         logger.warning(f"전단지 현황 D1 기록 생략: {st_err}")
 
     # 최근 4일 주문 집계 감지 및 마일스톤 알림
-    check_and_notify_sales()
+    try:
+        check_and_notify_sales()
+    except Exception as sl_err:
+        logger.warning(f"판매 집계 알림 생략: {sl_err}")
 
     # 밤 23시 일일·월간 결산 리포트 (하루 1회만 발송)
-    total_sent += run_daily_report_if_night(seen)
+    try:
+        total_sent += run_daily_report_if_night(seen)
+    except Exception as dr_err:
+        logger.warning(f"일일 결산 리포트 생략: {dr_err}")
 
     if total_sent > 0 or queued_this_run > 0:
         sync_git_push()
