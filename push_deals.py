@@ -31,14 +31,20 @@ load_dotenv()
 from urllib.parse import parse_qs, unquote, urlparse
 
 from click_tracker import (
+    fetch_active_posted_messages,
+    fetch_channel_member_stats,
     fetch_click_stats,
     format_click_stats_telegram,
+    format_member_stats_line,
     list_keyword_alerts,
     match_alerts_for_deal,
     match_alerts_for_title,
     record_alert_hits,
+    register_posted_message,
     register_tracked_link,
     remove_keyword_alert,
+    report_channel_member_count,
+    update_posted_message,
 )
 from coupang_api import (
     CoupangPartnersAPI,
@@ -154,6 +160,7 @@ SOURCE_SUB_ID_MAP = {
     "ruliweb": "tgruli",
     "ppomppu": "tgppom",
     "dealbada": "tgdealbada",
+    "clien": "tgclien",
 }
 
 SOURCE_LABEL_MAP = {
@@ -161,6 +168,7 @@ SOURCE_LABEL_MAP = {
     "ppomppu": "뽐뿌",
     "ruliweb": "루리웹",
     "dealbada": "딜바다",
+    "clien": "클리앙",
 }
 
 
@@ -1848,6 +1856,9 @@ def send_telegram(
         return (False, 0, str(e)) if return_detail else False
 
 
+_LAST_SENT_MESSAGE_ID: int = 0
+
+
 def send_telegram_photo_bytes(
     chat_id: str,
     png_bytes: bytes,
@@ -1855,6 +1866,8 @@ def send_telegram_photo_bytes(
     inline_keyboard: Optional[List[List[Dict[str, Any]]]] = None,
 ) -> bool:
     """메모리 내 렌더링된 PNG 전단지 이미지를 멀티파트 sendPhoto로 전송"""
+    global _LAST_SENT_MESSAGE_ID
+    _LAST_SENT_MESSAGE_ID = 0
     data: Dict[str, Any] = {
         "chat_id": chat_id,
         "caption": caption,
@@ -1870,11 +1883,77 @@ def send_telegram_photo_bytes(
             timeout=15,
         ).json()
         if res.get("ok"):
+            _LAST_SENT_MESSAGE_ID = int((res.get("result") or {}).get("message_id", 0) or 0)
             return True
         logger.warning(f"전단지 sendPhoto 응답 실패: {res.get('description') or res}")
     except Exception as e:
         logger.error(f"전단지 sendPhoto 전송 예외: {e}")
     return False
+
+
+def edit_telegram_caption(
+    chat_id: str,
+    message_id: int,
+    caption: str,
+    inline_keyboard: Optional[List[List[Dict[str, Any]]]] = None,
+) -> bool:
+    """송출 완료된 사진 전단지의 캡션/버튼을 editMessageCaption으로 즉시 수정"""
+    if not BOT_TOKEN or not chat_id or not message_id:
+        return False
+    payload: Dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "message_id": int(message_id),
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if inline_keyboard is not None:
+        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageCaption",
+            json=payload,
+            timeout=10,
+        ).json()
+        if res.get("ok"):
+            return True
+        desc = str(res.get("description") or "")
+        if "message is not modified" in desc.lower():
+            return True
+        logger.warning(f"전단지 캡션 수정 실패 (msg={message_id}): {desc}")
+    except Exception as e:
+        logger.warning(f"전단지 캡션 수정 예외 (msg={message_id}): {e}")
+    return False
+
+
+def _register_posted_batch(
+    message_id: int,
+    caption: str,
+    batch: List[Dict[str, Any]],
+    inline_kb: List[List[Dict[str, Any]]],
+) -> None:
+    """채널에 방금 송출된 전단지를 품절/정상화 감시 및 공개 피드 필터링용으로 기록."""
+    if not message_id or not batch:
+        return
+    compact_items = []
+    for it in batch:
+        if str(it.get("source") or "").strip().lower() == "goldbox":
+            continue
+        compact_items.append({
+            "deal_id": str(it.get("deal_id") or ""),
+            "product_id": str(it.get("product_id") or ""),
+            "source": str(it.get("source") or ""),
+            "source_url": str(it.get("source_url") or ""),
+            "clean_title": str(it.get("clean_title") or ""),
+            "short_title": str(it.get("short_title") or shorten_card_title(str(it.get("clean_title") or ""), 13)),
+            "deeplink": str(it.get("deeplink") or ""),
+            "closed": False,
+        })
+    if not compact_items:
+        return
+    try:
+        register_posted_message(int(message_id), CHANNEL_ID, caption, compact_items, inline_kb)
+    except Exception as e:
+        logger.warning(f"송출 전단지 메타 등록 생략: {e}")
 
 
 # ==========================================
@@ -2652,6 +2731,151 @@ def parse_dealbada_detail(url: str) -> Optional[Dict[str, Any]]:
 
 
 # ==========================================
+# 3-C. 클리앙 알뜰구매 수집기
+# ==========================================
+def collect_clien_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
+    """클리앙 알뜰구매 게시판에서 쿠팡 관련 핫딜 수집"""
+    deals: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for po in range(max_pages):
+        url = f"https://www.clien.net/service/board/jirum?&od=T31&category=0&po={po}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code != 200:
+                _record_source_http_block("clien", r)
+                if r.status_code in (403, 429):
+                    break
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            rows = soup.select("div.list_item[data-role='list-row']")
+            if not rows:
+                continue
+            for row in rows:
+                a = row.select_one("a[href*='/service/board/jirum/']")
+                if not a:
+                    continue
+                href = str(a.get("href") or "").split("?")[0]
+                m_id = re.search(r"/jirum/(\d+)", href)
+                if not m_id:
+                    continue
+                post_no = m_id.group(1)
+                deal_id = f"clien_{post_no}"
+                if deal_id in seen_ids:
+                    continue
+                if row.select_one("strike, del, s"):
+                    continue
+                sold_el = row.select_one(".icon_info, .soldout")
+                if sold_el and "품절" in sold_el.get_text(" ", strip=True):
+                    continue
+                title = " ".join(a.get_text(" ", strip=True).split())
+                if not title or is_closed_deal(title):
+                    continue
+                row_txt = " ".join(row.get_text(" ", strip=True).split())
+                if "쿠팡" not in title and "coupang" not in row_txt.lower() and "쿠팡" not in row_txt:
+                    continue
+
+                votes = 0
+                sym_el = row.select_one(".list_symph span, .list_symph")
+                if sym_el:
+                    m_v = re.search(r"(\d+)", sym_el.get_text(strip=True))
+                    if m_v:
+                        votes = int(m_v.group(1))
+                comments = 0
+                rep_el = row.select_one(".rSymph05, .list_reply")
+                if rep_el:
+                    m_c = re.search(r"(\d+)", rep_el.get_text(strip=True))
+                    if m_c:
+                        comments = int(m_c.group(1))
+
+                full_url = f"https://www.clien.net{href}" if href.startswith("/") else href
+                seen_ids.add(deal_id)
+                deals.append({
+                    "id": deal_id,
+                    "title": title,
+                    "link": full_url,
+                    "votes": votes,
+                    "downvotes": 0,
+                    "comments": comments,
+                    "hits": 0,
+                })
+            time.sleep(0.25)
+        except Exception as e:
+            logger.error(f"클리앙 알뜰구매 목록 수집 오류 ({url}): {e}")
+    return deals
+
+
+def parse_clien_detail(url: str) -> Optional[Dict[str, Any]]:
+    """클리앙 알뜰구매 상세에서 쿠팡 링크·본문·이미지·댓글 추출"""
+    try:
+        time.sleep(0.25)
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        if res.status_code != 200:
+            _record_source_http_block("clien", res)
+            if _is_transient_http_status(res.status_code):
+                logger.warning(f"⏳ 클리앙 상세 일시 오류 (HTTP {res.status_code}): {url}")
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
+            return None
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        subj_el = soup.select_one(".post_subject")
+        subj_txt = " ".join(subj_el.get_text(" ", strip=True).split()) if subj_el else ""
+        if subj_el and (subj_el.select_one("del, s, strike, .soldout") or "품절" in subj_txt or is_closed_deal(subj_txt)):
+            return None
+
+        cp_url: Optional[str] = None
+        art_el = soup.select_one("div.post_article")
+        search_els = art_el.select("a[href]") if art_el else soup.select("a[href]")
+        for a in search_els:
+            cand = _extract_coupang_url_from_href_or_text(a.get("href", ""))
+            if not cand:
+                cand = _extract_coupang_url_from_href_or_text(a.get_text(" ", strip=True))
+            if cand:
+                cp_url = cand
+                break
+        if not cp_url:
+            m_raw = re.search(
+                r"https?://(?:www\.|m\.|link\.)?coupang\.com/(?:vp/products/\d+|re/[^\s\"'<>]+|go/[^\s\"'<>]+)[^\s\"'<>]*",
+                res.text,
+            )
+            if m_raw:
+                cp_url = m_raw.group(0)
+        if not cp_url:
+            return None
+
+        img_urls: List[str] = []
+        body_text = ""
+        if art_el:
+            for img in art_el.select("img"):
+                iu = str(img.get("src") or "").strip()
+                if not iu or iu.endswith(".svg") or "emoticon" in iu.lower():
+                    continue
+                if iu.startswith("//"):
+                    iu = "https:" + iu
+                elif iu.startswith("/"):
+                    iu = "https://www.clien.net" + iu
+                if iu not in img_urls:
+                    img_urls.append(iu)
+            body_text = art_el.get_text("\n", strip=True)
+
+        return {
+            "coupang_url": cp_url,
+            "body_text": body_text,
+            "img_url": img_urls[0] if img_urls else None,
+            "ocr_img_urls": img_urls[:2],
+            "comment_texts": _collect_comment_texts(soup, "div.comment_view", limit=15),
+        }
+    except requests.Timeout as e:
+        logger.warning(f"⏳ 클리앙 상세 타임아웃 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "timeout"}
+    except requests.RequestException as e:
+        logger.warning(f"⏳ 클리앙 상세 네트워크 일시 오류 ({url}): {e}")
+        return {"transient_error": True, "error_reason": "request_error"}
+    except Exception as e:
+        logger.error(f"클리앙 상세 파싱 오류 ({url}): {e}")
+        return None
+
+
+# ==========================================
 # 4. 핫딜 송출 엔진
 # ==========================================
 def get_discount_badge(disc_rate: int) -> Tuple[str, str]:
@@ -2761,6 +2985,8 @@ def _has_verified_reaction(
         return True
     if source_name == "dealbada" and (votes >= 2 or comments >= 2):
         return True
+    if source_name == "clien" and (votes >= 1 or comments >= 2):
+        return True
 
     combined = f"{base_title}\n{body_text}"
     if downvotes < 2 and any(kw in combined for kw in ("역대가", "역대", "대란", "꿀딜")):
@@ -2812,6 +3038,8 @@ def _has_community_hot_reaction(
         return True
     if source_name == "dealbada" and downvotes == 0 and votes >= 4 and comments >= 3:
         return True
+    if source_name == "clien" and downvotes == 0 and (votes >= 4 or (votes >= 3 and comments >= 5)):
+        return True
     return False
 
 
@@ -2834,7 +3062,7 @@ def evaluate_deal_quality(
     - Track B1: 정상가 미확인 딜 중 30일 DB 관측(5일+ 중앙값) 대비 20%+ 하락 검증
     - Track B2: ENABLE_TRACK_B2_NO_ORIG_FOOD 활성화 시에만 동작 (기본 False)
     - Track B3: ENABLE_COMMUNITY_HOT_NO_ORIG 활성화 시 커뮤니티 고호응 + 가치신호 확인 인기딜 통과 ('커뮤니티 반응 높음' 배지)
-    반환 dict: {passed, reason, track, category, evidence_badge, evidence_note, baseline_price, observed_disc_rate, effective_unit_display}
+    반환 dict: {passed, reason, track, category, evidence_badge, evidence_note, baseline_price, observed_disc_rate, effective_unit_display, is_30d_low}
     """
     category = classify_deal_category(base_title, body_text)
     ship_fee = int(p_info.get("shipping_fee", 0) or 0)
@@ -2853,13 +3081,30 @@ def evaluate_deal_quality(
     unit_metrics = compute_effective_unit_metrics(base_title, total_p, body_text=body_text)
     effective_unit_display = str(unit_metrics.get("display_unit") or "")
 
+    is_30d_low = False
+    if (
+        price_db is not None
+        and not is_ambig
+        and is_comparable_option_key(option_key)
+        and obs_ship_type in ("free", "paid", "wow_free")
+        and total_p >= 1000
+    ):
+        low_base = price_db.get_observed_baseline(
+            option_key,
+            shipping_type=obs_ship_type,
+            days=30,
+            min_days=2,
+        )
+        if low_base and total_p < int(low_base["min_price"]):
+            is_30d_low = True
+
     base_res: Dict[str, Any] = {
         "passed": False,
         "reason": "low_discount",
         "track": "",
         "category": category,
-        "evidence_badge": "",
-        "evidence_note": "",
+        "evidence_badge": "30일 최저가" if is_30d_low else "",
+        "evidence_note": "🏆 30일 관측 최저가" if is_30d_low else "",
         "baseline_price": 0,
         "observed_disc_rate": 0,
         "effective_unit_display": effective_unit_display,
@@ -2867,6 +3112,7 @@ def evaluate_deal_quality(
         "unit_metrics": unit_metrics,
         "is_ambiguous": is_ambig,
         "obs_ship_type": obs_ship_type,
+        "is_30d_low": is_30d_low,
     }
 
     low_title = base_title.lower()
@@ -3115,8 +3361,15 @@ def notify_keyword_subscribers(
     sale_p = int(item.get("sale_price", 0) or 0)
     orig_p = int(item.get("orig_price", 0) or 0)
     disc_r = int(item.get("discount_rate", 0) or 0)
+    prod_id = str(item.get("product_id") or "").strip()
 
-    matched = match_alerts_for_deal(clean_title, alerts, sale_price=sale_p, discount_rate=disc_r)
+    matched = match_alerts_for_deal(
+        clean_title,
+        alerts,
+        sale_price=sale_p,
+        discount_rate=disc_r,
+        product_id=prod_id,
+    )
     if not matched:
         return 0
 
@@ -3166,13 +3419,25 @@ def notify_keyword_subscribers(
             f"{react_block}\n\n"
             f"<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>"
         )
-        inline_kb = [
-            [{"text": btn_text, "url": deeplink, "style": "success"}],
-            [
-                {"text": f"🔕 '{first_kw_short}' 끄기", "callback_data": mute_cb},
-                {"text": "⚙️ 키워드 관리", "callback_data": "alert:menu"},
-            ],
-        ]
+        ctrl_row = [{"text": f"🔕 '{first_kw_short}' 끄기", "callback_data": mute_cb}]
+        is_pid_match = any(kn.startswith("pid:") for kn in kw_norms)
+        if prod_id and sale_p >= 2000 and not is_pid_match:
+            watch_p = max(1000, int(round(sale_p * 0.95 / 100.0) * 100))
+            watch_cb = f"alert:watch:{prod_id}:{watch_p}"
+            if len(watch_cb.encode("utf-8")) <= 64:
+                ctrl_row.append({"text": f"📉 {watch_p:,}원↓ 재알림", "callback_data": watch_cb})
+            ctrl_row_3 = [{"text": "⚙️ 키워드 관리", "callback_data": "alert:menu"}]
+            inline_kb = [
+                [{"text": btn_text, "url": deeplink, "style": "success"}],
+                ctrl_row,
+                ctrl_row_3,
+            ]
+        else:
+            ctrl_row.append({"text": "⚙️ 키워드 관리", "callback_data": "alert:menu"})
+            inline_kb = [
+                [{"text": btn_text, "url": deeplink, "style": "success"}],
+                ctrl_row,
+            ]
         disable_notif = bool(is_night and quiet_night)
 
         try:
@@ -3506,10 +3771,12 @@ def process_deal(
             "product_id": product_id,
             "option_key": option_key,
             "source": source_name,
+            "source_url": d["link"],
             "track": track,
             "category": eval_res["category"],
             "evidence_badge": eval_res["evidence_badge"],
             "evidence_note": eval_res["evidence_note"],
+            "is_30d_low": bool(eval_res.get("is_30d_low")),
             "clean_title": clean_title,
             "short_title": shorten_card_title(clean_title),
             "orig_price": int(p_info["orig_price"]),
@@ -3538,8 +3805,9 @@ def process_deal(
         if is_vip_or_half and not is_quiet_hours():
             try:
                 png_bytes = render_hotdeal_flyer([item], coupang_api=coupang_api)
-                caption, inline_kb = format_flyer_caption_and_buttons([item])
+                caption, inline_kb = format_flyer_caption_and_buttons([item], include_bot_footer=True)
                 if send_telegram_photo_bytes(CHANNEL_ID, png_bytes, caption, inline_kb):
+                    _register_posted_batch(_LAST_SENT_MESSAGE_ID, caption, [item], inline_kb)
                     seen.add(deal_id)
                     mark_product_seen(product_id, seen)
                     save_seen(seen)
@@ -3613,6 +3881,7 @@ def process_deal(
         notify_keyword_subscribers(
             {
                 "deal_id": deal_id,
+                "product_id": product_id,
                 "clean_title": clean_title,
                 "orig_price": int(p_info["orig_price"]),
                 "sale_price": int(p_info["final_price"]),
@@ -3734,7 +4003,7 @@ def flush_flyer_queue(
 
         try:
             png_bytes = render_hotdeal_flyer(batch, coupang_api=coupang_api)
-            caption, inline_kb = format_flyer_caption_and_buttons(batch)
+            caption, inline_kb = format_flyer_caption_and_buttons(batch, include_bot_footer=True)
         except Exception as e:
             logger.error(f"전단지 렌더링 오류: {e}")
             break
@@ -3743,6 +4012,7 @@ def flush_flyer_queue(
         if not ok:
             logger.warning("전단지 텔레그램 전송 실패 — 큐 유지 후 다음 회차 재시도")
             break
+        _register_posted_batch(_LAST_SENT_MESSAGE_ID, caption, batch, inline_kb)
 
         batch_ids = {id(it) for it in batch}
         queue[:] = [it for it in queue if id(it) not in batch_ids]
@@ -4115,6 +4385,309 @@ def check_and_notify_sales():
         logger.error(f"판매 모니터링 오류: {e}")
 
 
+_CLOSURE_PHRASES = (
+    "품절", "종료", "마감", "가격 정상화", "이미 정상화", "가격 올랐", "가격이 올랐",
+    "정상화됐", "정상화 됐", "끝났", "솔드아웃", "sold out", "매진", "할인 끝",
+)
+_MEMBER_MILESTONE_HINTS = {
+    50: "🎊 <b>50명 돌파!</b>",
+    100: "💯 <b>100명 돌파!!</b>",
+    150: "🔥 <b>150명 돌파!</b>",
+    200: "🚀 <b>200명 돌파!</b>",
+    300: "🏆 <b>300명 돌파!</b>",
+    500: "👑 <b>500명 돌파!!</b>",
+    1000: "🎉 <b>1,000명 대돌파!!</b>",
+}
+
+
+def _is_source_post_closed(source: str, source_url: str) -> bool:
+    """원본 커뮤니티 글의 종료/품절/가격 정상화 여부 확인 (네트워크 오류 시 False 안전 반환)."""
+    if not source_url or not str(source_url).startswith("http"):
+        return False
+    src = str(source or "").strip().lower()
+    if src == "goldbox":
+        return False
+    try:
+        res = requests.get(source_url, headers=HEADERS, timeout=6)
+        if res.status_code in (404, 410):
+            return True
+        if res.status_code != 200:
+            return False
+        if src == "ppomppu":
+            res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        title_sel = {
+            "arca": "div.title-row",
+            "ruliweb": "h4.subject, span.subject_text",
+            "ppomppu": "div.sub-top-text-box, font.view_title2",
+            "dealbada": "#bo_v_title, .bo_v_tit",
+            "clien": ".post_subject",
+        }.get(src, "title")
+        t_el = soup.select_one(title_sel)
+        if t_el:
+            if t_el.select_one(".deal-close, .deal_end, .soldout, del, s, strike"):
+                return True
+            t_txt = t_el.get_text(" ", strip=True)
+            if is_closed_deal(t_txt) or "품절" in t_txt:
+                return True
+
+        cmts: List[str] = []
+        if src == "arca":
+            cmts = _collect_comment_texts(soup, ".comment-item .message .text", limit=10)
+        elif src == "ruliweb":
+            cmts = _collect_comment_texts(soup, ".comment_view .text_wrapper .text, .comment_element .text", limit=10)
+        elif src == "dealbada":
+            cmts = _collect_comment_texts(soup, "#bo_vc article p", limit=10)
+        elif src == "clien":
+            cmts = _collect_comment_texts(soup, "div.comment_view", limit=10)
+        elif src == "ppomppu":
+            m_no = re.search(r"no=(\d+)", source_url)
+            if m_no:
+                cmts = _fetch_ppomppu_comments(m_no.group(1), source_url, limit=10)
+
+        hits = 0
+        for c in cmts:
+            low_c = c.lower()
+            if any(p in low_c for p in _CLOSURE_PHRASES):
+                hits += 1
+        return hits >= 2
+    except Exception:
+        return False
+
+
+def _apply_closed_markup(
+    caption: str,
+    items: List[Dict[str, Any]],
+    inline_kb: List[List[Dict[str, Any]]],
+) -> Tuple[str, List[List[Dict[str, Any]]]]:
+    """종료된 상품의 캡션 제목 줄에 취소선+[종료] 적용 및 구매 버튼 라벨 갱신(멱등)."""
+    new_caption = str(caption or "")
+    closed_urls: Set[str] = set()
+    closed_titles: List[str] = []
+    for it in items:
+        if not it.get("closed"):
+            continue
+        u = str(it.get("deeplink") or "").strip()
+        if u:
+            closed_urls.add(u)
+        ct = str(it.get("clean_title") or "").strip()
+        if ct:
+            closed_titles.append(ct)
+
+    lines = new_caption.splitlines()
+    out_lines: List[str] = []
+    for ln in lines:
+        matched_line = False
+        for u in closed_urls:
+            if esc(u) in ln or u in ln:
+                matched_line = True
+                break
+        if not matched_line:
+            for ct in closed_titles:
+                if esc(ct[:16]) in ln and "<a " in ln:
+                    matched_line = True
+                    break
+        if matched_line and "[종료]" not in ln:
+            ln = re.sub(r"<b>(.*?)</b>", r"<s><b>\1</b></s> [종료]", ln, count=1)
+        out_lines.append(ln)
+    new_caption = "\n".join(out_lines)
+    if len(new_caption) > 1020:
+        new_caption = new_caption[:1016] + "…"
+
+    new_kb: List[List[Dict[str, Any]]] = []
+    for row in inline_kb or []:
+        new_row = []
+        for btn in row:
+            b = dict(btn)
+            b_url = str(b.get("url") or "").strip()
+            if b_url and b_url in closed_urls and not str(b.get("text") or "").startswith("⛔"):
+                raw_t = str(b.get("text") or "상품").replace("🚨", "").replace("💎", "").strip()
+                short_name = raw_t.split("·")[0].strip()[:12]
+                b["text"] = f"⛔ 종료 · {short_name}"
+                b.pop("style", None)
+            new_row.append(b)
+        new_kb.append(new_row)
+    return new_caption, new_kb
+
+
+def check_and_mark_closed_posts() -> int:
+    """최근 6시간 내 송출된 채널 게시물의 품절/가격정상화 여부를 확인해 자동 [종료] 수정."""
+    posts = fetch_active_posted_messages(hours=6, min_recheck_min=20, limit=4)
+    if not posts:
+        return 0
+    edited_cnt = 0
+    for post in posts:
+        mid = int(post.get("message_id", 0) or 0)
+        chat_id = str(post.get("chat_id") or CHANNEL_ID)
+        items = list(post.get("items") or [])
+        if not mid or not items:
+            continue
+        newly_closed = False
+        for it in items:
+            if it.get("closed"):
+                continue
+            if _is_source_post_closed(str(it.get("source") or ""), str(it.get("source_url") or "")):
+                it["closed"] = True
+                newly_closed = True
+        all_closed = all(bool(it.get("closed")) for it in items)
+        if newly_closed:
+            next_cap, next_kb = _apply_closed_markup(
+                str(post.get("caption") or ""),
+                items,
+                list(post.get("inline_kb") or []),
+            )
+            if edit_telegram_caption(chat_id, mid, next_cap, next_kb):
+                update_posted_message(mid, caption=next_cap, items=items, inline_kb=next_kb, all_closed=all_closed)
+                edited_cnt += 1
+                logger.info(f"⛔ [품절 자동 수정] msg_id={mid} 캡션/버튼 종료 반영 완료 (all_closed={all_closed})")
+            else:
+                update_posted_message(mid, items=items, all_closed=all_closed)
+        else:
+            # last_checked_at 갱신
+            update_posted_message(mid, all_closed=False)
+    return edited_cnt
+
+
+def run_top_clicks_recap_if_evening(
+    seen: Set[str],
+    quota: Dict[str, Any],
+    now_dt: Optional[datetime] = None,
+) -> int:
+    """매일 저녁 20시 당일 실시간 클릭 TOP 4 앵콜 요약 전단지 1회 송출."""
+    now = now_dt or datetime.now(KST)
+    today_str = now.strftime("%Y%m%d")
+    recap_key = f"top_clicks_{today_str}"
+    if "--force-top-clicks" not in sys.argv:
+        if now.hour != 20 or recap_key in seen:
+            return 0
+
+    stats = fetch_click_stats(days=1, limit=12)
+    if not stats:
+        return 0
+    closed_ids = set(str(x) for x in (stats.get("closed_deal_ids") or []) if x)
+    top_rows = list(stats.get("top_today") or [])
+
+    selected: List[Dict[str, Any]] = []
+    seen_pids: Set[str] = set()
+    total_clicks = 0
+    for r in top_rows:
+        src = str(r.get("source") or "").strip().lower()
+        did = str(r.get("deal_id") or "").strip()
+        pid = str(r.get("product_id") or r.get("code") or "").strip()
+        clicks_n = int(r.get("clicks", 0) or 0)
+        if clicks_n <= 0 or src == "goldbox":
+            continue
+        if did and did in closed_ids:
+            continue
+        if pid and pid in seen_pids:
+            continue
+        short_url = str(r.get("short_url") or "").strip()
+        if not short_url:
+            continue
+        if pid:
+            seen_pids.add(pid)
+        total_clicks += clicks_n
+        clean_t = clean_display_title(str(r.get("title") or "쿠팡 인기 상품"))
+        selected.append({
+            "deal_id": did,
+            "product_id": pid,
+            "source": src or "arca",
+            "track": "A",
+            "clean_title": clean_t,
+            "short_title": shorten_card_title(clean_t),
+            "orig_price": 0,
+            "sale_price": int(r.get("sale_price", 0) or 0),
+            "discount_rate": int(r.get("discount_rate", 0) or 0),
+            "clicks": clicks_n,
+            "unit_info": "",
+            "shipping_label": "",
+            "reaction_text": "",
+            "deeplink": short_url,
+            "img_url": None,
+            "votes": 0,
+            "comments": 0,
+        })
+        if len(selected) >= 4:
+            break
+
+    if len(selected) < 2 or total_clicks < 3:
+        return 0
+
+    try:
+        png_bytes = render_hotdeal_flyer(selected, coupang_api=coupang_api)
+        caption, inline_kb = format_flyer_caption_and_buttons(
+            selected,
+            include_bot_footer=True,
+            batch_mode="top_clicks",
+        )
+    except Exception as e:
+        logger.warning(f"20시 클릭 TOP4 전단지 렌더링 실패: {e}")
+        return 0
+
+    if not send_telegram_photo_bytes(CHANNEL_ID, png_bytes, caption, inline_kb):
+        return 0
+
+    seen.add(recap_key)
+    save_seen(seen)
+    logger.info(f"🏆 [20시 클릭 TOP {len(selected)} 앵콜 송출 완료] (총 클릭 {total_clicks}회)")
+    time.sleep(2)
+    return 1
+
+
+def fetch_telegram_channel_member_count(chat_id: str = CHANNEL_ID) -> Optional[int]:
+    """Telegram getChatMemberCount로 현재 채널 구독자 수 조회."""
+    if not BOT_TOKEN or not chat_id:
+        return None
+    try:
+        res = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMemberCount",
+            params={"chat_id": str(chat_id)},
+            timeout=6,
+        ).json()
+        if res.get("ok") and isinstance(res.get("result"), int):
+            return int(res["result"])
+    except Exception as e:
+        logger.warning(f"채널 구독자 수 조회 실패: {e}")
+    return None
+
+
+def format_member_growth_dm(res: Dict[str, Any], channel_label: str = "오늘의 핫딜") -> str:
+    """구독자 증가/마일스톤 돌파 관리자 알림 DM HTML 생성."""
+    cnt = int(res.get("count", 0) or 0)
+    delta = int(res.get("delta", 0) or 0)
+    today_net = int(res.get("today_net", 0) or 0)
+    milestone = int(res.get("milestone", 0) or 0)
+    ms_line = _MEMBER_MILESTONE_HINTS.get(milestone) or (f"🎉 <b>{milestone:,}명 돌파!!</b>" if milestone > 0 else "")
+    net_str = f"+{today_net:,}명" if today_net >= 0 else f"{today_net:,}명"
+    header = f"🎉 <b>[{esc(channel_label)} 구독자 +{delta:,}]</b> 현재 <b>{cnt:,}명</b>!"
+    lines = [header]
+    if ms_line:
+        lines.append(ms_line)
+    lines.append(f"• 오늘 순증: <b>{net_str}</b>")
+    return "\n".join(lines)
+
+
+def check_and_notify_channel_members(now_dt: Optional[datetime] = None) -> bool:
+    """로컬 봇 백업 겸 주기적 채널 인원 카운트 체크 — 증가 시 관리자 DM 발송."""
+    target_admin = str(ADMIN_CHAT_ID or "").strip()
+    if not target_admin:
+        return False
+    cnt = fetch_telegram_channel_member_count(CHANNEL_ID)
+    if cnt is None:
+        return False
+    res = report_channel_member_count(cnt)
+    if not res or int(res.get("delta", 0) or 0) <= 0:
+        return False
+    cur_dt = now_dt or datetime.now(KST)
+    quiet = is_quiet_hours(cur_dt)
+    dm_text = format_member_growth_dm(res, "오늘의 핫딜")
+    ok = bool(send_telegram(chat_id=target_admin, text=dm_text, disable_notification=quiet))
+    if ok:
+        logger.info(f"🎉 [채널 구독자 증가 DM] +{res['delta']} -> 현재 {res['count']}명")
+    return ok
+
+
 def run_daily_report_if_night(seen: Set[str]) -> int:
     now = datetime.now(KST)
     today_str = now.strftime("%Y%m%d")
@@ -4176,6 +4749,15 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         except Exception as cs_err:
             logger.warning(f"실시간 클릭 통계 조회 생략: {cs_err}")
 
+        member_block = ""
+        try:
+            m_info = fetch_channel_member_stats()
+            m_line = format_member_stats_line(m_info)
+            if m_line:
+                member_block = f"\n\n{m_line}"
+        except Exception:
+            pass
+
         report_msg = (
             f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
             f"📅 리포트 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
@@ -4185,7 +4767,7 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             f"• 총 주문 / 취소: <b>{m_orders:,}건</b> / {m_cancels:,}건\n"
             f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
             f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
-            f"{channel_split_block}{click_stats_block}\n\n"
+            f"{channel_split_block}{click_stats_block}{member_block}\n\n"
             f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>"
         )
 
@@ -4274,7 +4856,7 @@ def main():
     update_pc_heartbeat()
     sync_git_state()
 
-    logger.info("🚀 핫딜 수집 및 전단지 송출 작업 시작 (투트랙 선별 · 딜바다 포함 4개 출처 라운드로빈 · v5 빅타이포 전단지)...")
+    logger.info("🚀 핫딜 수집 및 전단지 송출 작업 시작 (투트랙 선별 · 클리앙 포함 5개 출처 라운드로빈 · v5 빅타이포 전단지)...")
     seen = load_seen()
     quota = load_post_quota()
     flyer_queue = load_flyer_queue()
@@ -4311,6 +4893,7 @@ def main():
             (collect_ppomppu_deals, parse_ppomppu_detail, "ppomppu"),
             (collect_arcalive_deals, parse_arcalive_detail, "arca"),
             (collect_dealbada_deals, parse_dealbada_detail, "dealbada"),
+            (collect_clien_deals, parse_clien_detail, "clien"),
         )
         collected_by_source: List[Tuple[str, Any, List[Dict[str, Any]]]] = []
         for collector, parser, source_name in sources:
@@ -4386,6 +4969,22 @@ def main():
 
     # 전단지 큐 플러시 (4건 모이면 즉시, 미만 시 대기 타임아웃/긴급할인 조건에 따라 송출)
     total_sent += flush_flyer_queue(flyer_queue, quota)
+
+    # 최근 6시간 내 채널 게시물 품절/정상화 자동 감시 및 캡션 수정
+    if not is_quiet_hours():
+        try:
+            check_and_mark_closed_posts()
+        except Exception as cm_err:
+            logger.warning(f"품절 감시 생략: {cm_err}")
+
+    # 매일 20시 당일 실시간 클릭 TOP 4 앵콜 전단지 송출
+    total_sent += run_top_clicks_recap_if_evening(seen, quota)
+
+    # 채널 구독자 증가 체크 (로컬 봇 백업)
+    try:
+        check_and_notify_channel_members()
+    except Exception as mem_err:
+        logger.warning(f"채널 인원 체크 생략: {mem_err}")
 
     # 로켓 골드박스 생필품·식품 미끼 4선 전단지 (오전 8~11시 · 저녁 18~21시 2타임)
     if ENABLE_GOLDBOX or "--force-goldbox" in sys.argv:

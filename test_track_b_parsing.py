@@ -1364,5 +1364,189 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertFalse(r_meme["passed"])
 
 
+class TestUpgradesIntegration(unittest.TestCase):
+    def test_clien_collector_and_detail(self):
+        from unittest.mock import MagicMock, patch
+
+        list_html = """
+        <div class="list_content">
+          <div class="list_item symph_row" data-role="list-row" data-board-sn="18999001" data-comment-count="7">
+            <div class="list_symph"><span>12</span></div>
+            <div class="list_title">
+              <a class="list_subject" href="/service/board/jirum/18999001">
+                <span data-role="list-title-text">[쿠팡] 코멧 생수 2L 24병 (11,900원/무료)</span>
+              </a>
+              <span class="rSymph05">7</span>
+            </div>
+          </div>
+          <div class="list_item symph_row" data-role="list-row" data-board-sn="18999002" data-comment-count="2">
+            <div class="list_symph"><span>3</span></div>
+            <div class="list_title">
+              <a class="list_subject" href="/service/board/jirum/18999002">
+                <span data-role="list-title-text">[네이버] 무선 마우스 특가 19,000원</span>
+              </a>
+            </div>
+          </div>
+        </div>
+        """
+        detail_html = """
+        <div class="post_subject"><span>[쿠팡] 코멧 생수 2L 24병</span></div>
+        <div class="post_content">
+          <article>
+            <div class="post_article">
+              <a href="https://www.coupang.com/vp/products/123456789?itemId=111">구매링크</a>
+              <img src="https://img.example.com/water.jpg" />
+            </div>
+          </article>
+        </div>
+        <div class="comment_view">역대가네요 바로 샀습니다</div>
+        """
+
+        list_resp = MagicMock(status_code=200, text=list_html)
+        empty_resp = MagicMock(status_code=200, text='<div class="list_content"></div>')
+        detail_resp = MagicMock(status_code=200, text=detail_html)
+
+        with patch.object(push_deals.requests, "get", side_effect=[list_resp, empty_resp]) as mock_list_get:
+            items = push_deals.collect_clien_deals(max_pages=2)
+        self.assertEqual(mock_list_get.call_count, 2)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], "clien_18999001")
+        self.assertEqual(items[0]["votes"], 12)
+        self.assertEqual(items[0]["comments"], 7)
+
+        with patch.object(push_deals.requests, "get", return_value=detail_resp):
+            detail = push_deals.parse_clien_detail(items[0]["link"])
+        self.assertIsNotNone(detail)
+        self.assertIn("coupang.com/vp/products/123456789", detail["coupang_url"])
+        self.assertIn("역대가네요 바로 샀습니다", detail["comment_texts"])
+
+    def test_flyer_footer_30d_low_and_top_clicks_caption(self):
+        import flyer_renderer
+
+        sample_deals = [
+            {
+                "clean_title": "코멧 생수 2L 24병",
+                "short_title": "코멧 생수 2L 24병",
+                "source": "clien",
+                "track": "A",
+                "sale_price": 11900,
+                "orig_price": 16900,
+                "discount_rate": 30,
+                "unit_info": "100ml당 24원",
+                "shipping_label": "무료",
+                "deeplink": "https://hotpang-click.produckyou.workers.dev/c/abcd1234",
+                "is_30d_low": True,
+                "clicks": 42,
+            }
+        ]
+        cap_default, kb_default = flyer_renderer.format_flyer_caption_and_buttons(sample_deals)
+        self.assertIn("🏆<b>[30일 최저가]</b>", cap_default)
+        self.assertIn("클리앙", cap_default)
+        self.assertEqual(len(kb_default), 1)
+
+        cap_pub, kb_pub = flyer_renderer.format_flyer_caption_and_buttons(
+            sample_deals,
+            include_bot_footer=True,
+            batch_mode="top_clicks",
+        )
+        self.assertIn("가장 많이 클릭한 쿠팡 핫딜 TOP", cap_pub)
+        self.assertIn("👆 오늘 42명 클릭", cap_pub)
+        self.assertEqual(len(kb_pub), 2)
+        footer_texts = [b["text"] for b in kb_pub[-1]]
+        self.assertTrue(any("키워드 알림" in t for t in footer_texts))
+        self.assertTrue(any("단가 비교" in t for t in footer_texts))
+
+    def test_apply_closed_markup_and_check_posts(self):
+        from unittest.mock import patch
+
+        caption = (
+            "🔥 <b>특가 전단지</b>\n"
+            "① <b>[30%] 코멧 생수 2L</b> · 11,900원 👉 <a href=\"https://ex.com/a\">링크</a>\n"
+            "② <b>[25%] 무세제 세탁세제</b> · 9,900원 👉 <a href=\"https://ex.com/b\">링크</a>"
+        )
+        items = [
+            {"source": "arca", "source_url": "https://arca.live/b/hotdeal/1", "deeplink": "https://ex.com/a", "clean_title": "코멧 생수 2L", "closed": True},
+            {"source": "clien", "source_url": "https://clien.net/1", "deeplink": "https://ex.com/b", "clean_title": "무세제 세탁세제", "closed": False},
+        ]
+        kb = [
+            [
+                {"text": "코멧 생수 · 11,900원", "url": "https://ex.com/a", "style": "danger"},
+                {"text": "무세제 세탁세제 · 9,900원", "url": "https://ex.com/b"},
+            ]
+        ]
+        new_cap, new_kb = push_deals._apply_closed_markup(caption, items, kb)
+        self.assertIn("<s><b>[30%] 코멧 생수 2L</b></s> [종료]", new_cap)
+        self.assertNotIn("<s><b>[25%] 무세제 세탁세제</b></s>", new_cap)
+        self.assertTrue(new_kb[0][0]["text"].startswith("⛔ 종료 ·"))
+        self.assertNotIn("style", new_kb[0][0])
+        self.assertEqual(new_kb[0][1]["text"], "무세제 세탁세제 · 9,900원")
+
+        # 멱등성 확인
+        new_cap2, new_kb2 = push_deals._apply_closed_markup(new_cap, items, new_kb)
+        self.assertEqual(new_cap2, new_cap)
+        self.assertEqual(new_kb2, new_kb)
+
+        fake_posts = [
+            {
+                "message_id": 88801,
+                "chat_id": "@HOTpang911",
+                "caption": caption,
+                "items": [
+                    {"source": "arca", "source_url": "https://arca.live/b/hotdeal/1", "deeplink": "https://ex.com/a", "clean_title": "코멧 생수 2L", "closed": False},
+                ],
+                "inline_kb": [[{"text": "코멧 생수 · 11,900원", "url": "https://ex.com/a"}]],
+            }
+        ]
+        with patch.object(push_deals, "fetch_active_posted_messages", return_value=fake_posts), \
+             patch.object(push_deals, "_is_source_post_closed", return_value=True), \
+             patch.object(push_deals, "edit_telegram_caption", return_value=True) as mock_edit, \
+             patch.object(push_deals, "update_posted_message", return_value=True) as mock_upd:
+            edited = push_deals.check_and_mark_closed_posts()
+        self.assertEqual(edited, 1)
+        mock_edit.assert_called_once()
+        mock_upd.assert_called_once()
+
+    def test_run_top_clicks_recap_if_evening(self):
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import patch
+
+        kst = timezone(timedelta(hours=9))
+        seen = set()
+        quota = {}
+
+        # 19시는 스킵
+        with patch.object(push_deals, "fetch_click_stats") as mock_stats:
+            res_skip = push_deals.run_top_clicks_recap_if_evening(
+                seen, quota, now_dt=datetime(2026, 11, 28, 19, 10, tzinfo=kst)
+            )
+        self.assertEqual(res_skip, 0)
+        mock_stats.assert_not_called()
+
+        fake_stats = {
+            "closed_deal_ids": ["closed_1"],
+            "top_today": [
+                {"deal_id": "g1", "code": "p0", "source": "goldbox", "title": "골드박스 제외", "clicks": 50, "short_url": "https://s/0"},
+                {"deal_id": "closed_1", "code": "p1", "source": "arca", "title": "종료딜 제외", "clicks": 30, "short_url": "https://s/1"},
+                {"deal_id": "d2", "code": "1001", "source": "arca", "title": "인기 상품 A", "clicks": 12, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2"},
+                {"deal_id": "d2_dup", "code": "1001", "source": "ruliweb", "title": "인기 상품 A 중복", "clicks": 9, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2d"},
+                {"deal_id": "d3", "code": "1002", "source": "clien", "title": "인기 상품 B", "clicks": 8, "sale_price": 22000, "discount_rate": 25, "short_url": "https://s/3"},
+            ],
+        }
+        with patch.object(push_deals, "fetch_click_stats", return_value=fake_stats), \
+             patch.object(push_deals, "render_hotdeal_flyer", return_value=b"PNG"), \
+             patch.object(push_deals, "send_telegram_photo_bytes", return_value=True) as mock_send, \
+             patch.object(push_deals, "save_seen"), \
+             patch.object(push_deals.time, "sleep"):
+            res_ok = push_deals.run_top_clicks_recap_if_evening(
+                seen, quota, now_dt=datetime(2026, 11, 28, 20, 5, tzinfo=kst)
+            )
+        self.assertEqual(res_ok, 1)
+        self.assertIn("top_clicks_20261128", seen)
+        sent_caption = mock_send.call_args[0][2]
+        self.assertIn("가장 많이 클릭한 쿠팡 핫딜 TOP", sent_caption)
+        self.assertNotIn("골드박스 제외", sent_caption)
+        self.assertNotIn("종료딜 제외", sent_caption)
+
+
 if __name__ == "__main__":
     unittest.main()

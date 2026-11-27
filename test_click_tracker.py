@@ -580,5 +580,157 @@ class ClickTrackerTests(unittest.TestCase):
         asyncio.run(_run_smart_bot())
 
 
+class TestUpgradesV2(unittest.TestCase):
+    def test_pid_alert_matching_and_badge(self):
+        badge = click_tracker.format_alert_condition_badge(
+            {"keyword": "pid:77889900", "max_price": 28500, "min_discount": 20}
+        )
+        self.assertIn("상품추적 #77889900", badge)
+        self.assertIn("20%↑", badge)
+
+        alerts = [
+            {
+                "id": 31,
+                "chat_id": "5001",
+                "keyword": "pid:77889900",
+                "max_price": 30000,
+                "min_discount": 0,
+                "last_notified_at": "",
+            },
+            {
+                "id": 32,
+                "chat_id": "5002",
+                "keyword": "pid:77889900",
+                "max_price": 20000,
+                "min_discount": 0,
+                "last_notified_at": "",
+            },
+        ]
+        matched = click_tracker.match_alerts_for_deal(
+            "전혀 다른 리네임 상품명 25,000원",
+            alerts,
+            sale_price=25000,
+            discount_rate=15,
+            product_id="77889900",
+        )
+        self.assertIn("5001", matched)
+        self.assertNotIn("5002", matched)
+        missed = click_tracker.match_alerts_for_deal(
+            "다른 상품 25,000원",
+            alerts,
+            sale_price=25000,
+            discount_rate=15,
+            product_id="11223344",
+        )
+        self.assertEqual(missed, {})
+
+    def test_format_member_stats_line(self):
+        self.assertEqual(click_tracker.format_member_stats_line(None), "")
+        self.assertEqual(click_tracker.format_member_stats_line({"count": 0, "today_net": 0}), "")
+        self.assertIn("+3명", click_tracker.format_member_stats_line({"count": 52, "today_net": 3}))
+        self.assertIn("-1명", click_tracker.format_member_stats_line({"count": 48, "today_net": -1}))
+        self.assertIn("변동 없음", click_tracker.format_member_stats_line({"count": 49, "today_net": 0}))
+
+    def test_bot_channel_member_update_and_watch_callback(self):
+        import types
+        from telegram import ChatMember
+        from telegram.constants import ChatType
+        import bot
+
+        async def _run_member_and_watch():
+            dm_mock = MagicMock()
+            bot_obj = types.SimpleNamespace(
+                get_chat_member_count=AsyncMock(return_value=50),
+                send_message=AsyncMock(side_effect=dm_mock),
+            )
+            ctx = types.SimpleNamespace(bot=bot_obj)
+
+            # 1) 입장 (+1, 50명 마일스톤) -> 관리자 DM 발송
+            join_upd = types.SimpleNamespace(
+                chat_member=types.SimpleNamespace(
+                    chat=types.SimpleNamespace(id=-10012345, username="HOTpang911"),
+                    old_chat_member=types.SimpleNamespace(status=ChatMember.LEFT),
+                    new_chat_member=types.SimpleNamespace(status=ChatMember.MEMBER),
+                )
+            )
+            with patch.object(bot, "PUBLIC_CHANNEL_ID", "@HOTpang911"), \
+                 patch.object(bot, "_valid_admin_chat_id", return_value=999001), \
+                 patch.object(
+                     bot,
+                     "report_channel_member_count",
+                     return_value={"ok": True, "count": 50, "delta": 1, "today_net": 2, "milestone": 50},
+                 ):
+                await bot.on_channel_member_update(join_upd, ctx)
+            bot_obj.send_message.assert_awaited_once()
+            sent_txt = bot_obj.send_message.await_args.kwargs["text"]
+            self.assertIn("+1", sent_txt)
+            self.assertIn("50명 돌파", sent_txt)
+
+            # 2) 이탈 (-1) -> 관리자 DM 미발송
+            bot_obj.send_message.reset_mock()
+            bot_obj.get_chat_member_count = AsyncMock(return_value=49)
+            leave_upd = types.SimpleNamespace(
+                chat_member=types.SimpleNamespace(
+                    chat=types.SimpleNamespace(id=-10012345, username="HOTpang911"),
+                    old_chat_member=types.SimpleNamespace(status=ChatMember.MEMBER),
+                    new_chat_member=types.SimpleNamespace(status=ChatMember.LEFT),
+                )
+            )
+            with patch.object(bot, "PUBLIC_CHANNEL_ID", "@HOTpang911"), \
+                 patch.object(bot, "_valid_admin_chat_id", return_value=999001), \
+                 patch.object(
+                     bot,
+                     "report_channel_member_count",
+                     return_value={"ok": True, "count": 49, "delta": -1, "today_net": 1, "milestone": 0},
+                 ):
+                await bot.on_channel_member_update(leave_upd, ctx)
+            bot_obj.send_message.assert_not_awaited()
+
+            # 3) alert:watch:<pid>:<price> 콜백
+            reply_mock = AsyncMock()
+            cb_upd = types.SimpleNamespace(
+                effective_user=types.SimpleNamespace(id=3001),
+                effective_chat=types.SimpleNamespace(type=ChatType.PRIVATE),
+                effective_message=types.SimpleNamespace(reply_text=reply_mock),
+                callback_query=types.SimpleNamespace(
+                    data="alert:watch:987654321:25000",
+                    answer=AsyncMock(),
+                    message=types.SimpleNamespace(reply_text=reply_mock),
+                ),
+            )
+            with patch.object(bot, "add_keyword_alert_ex", return_value={"ok": True, "id": 77}) as mock_add_watch:
+                await bot.alert_callback(cb_upd, ctx)
+            mock_add_watch.assert_called_once_with(3001, "pid:987654321", max_price=25000, parse_natural=False)
+            reply_mock.assert_awaited_once()
+
+        asyncio.run(_run_member_and_watch())
+
+    def test_push_deals_check_and_notify_channel_members(self):
+        import push_deals
+
+        with patch.object(push_deals, "ADMIN_CHAT_ID", "999001"), \
+             patch.object(push_deals, "fetch_telegram_channel_member_count", return_value=51), \
+             patch.object(
+                 push_deals,
+                 "report_channel_member_count",
+                 return_value={"ok": True, "count": 51, "delta": 1, "today_net": 3, "milestone": 0},
+             ), \
+             patch.object(push_deals, "send_telegram", return_value=True) as mock_send:
+            self.assertTrue(push_deals.check_and_notify_channel_members())
+            mock_send.assert_called_once()
+            self.assertIn("+1", mock_send.call_args.kwargs["text"])
+
+        with patch.object(push_deals, "ADMIN_CHAT_ID", "999001"), \
+             patch.object(push_deals, "fetch_telegram_channel_member_count", return_value=51), \
+             patch.object(
+                 push_deals,
+                 "report_channel_member_count",
+                 return_value={"ok": True, "count": 51, "delta": 0, "today_net": 3, "milestone": 0},
+             ), \
+             patch.object(push_deals, "send_telegram") as mock_send2:
+            self.assertFalse(push_deals.check_and_notify_channel_members())
+            mock_send2.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

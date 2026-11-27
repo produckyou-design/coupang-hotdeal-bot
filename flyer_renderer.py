@@ -53,6 +53,7 @@ SOURCE_LABEL_MAP = {
     "ppomppu": "뽐뿌",
     "ruliweb": "루리웹",
     "dealbada": "딜바다",
+    "clien": "클리앙",
     "goldbox": "골드박스",
 }
 
@@ -1089,11 +1090,17 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     return buf.getvalue()
 
 
-def _build_community_line(d: Dict[str, Any], quote_cap: int = 38) -> str:
+def _build_community_line(d: Dict[str, Any], quote_cap: int = 38, batch_mode: str = "") -> str:
     """출처·추천·댓글 및 한줄 반응을 캡션용 1줄 문자열로 구성 (0건 통계는 출처만 명확히 표기)"""
     if _is_goldbox_deal(d):
         return ""
     src_kr = format_source_label(str(d.get("source") or ""))
+    if batch_mode == "top_clicks":
+        clicks_n = int(d.get("clicks", 0) or 0)
+        parts_tc = [f"👆 오늘 {clicks_n:,}명 클릭"] if clicks_n > 0 else []
+        if src_kr:
+            parts_tc.append(f"출처: {html.escape(src_kr, quote=False)}")
+        return " · ".join(parts_tc)
     votes_n = int(d.get("votes", 0) or 0)
     comments_n = int(d.get("comments", 0) or 0)
     quote_raw = " ".join(str(d.get("reaction_text") or "").split()).strip()
@@ -1125,13 +1132,20 @@ def _build_community_line(d: Dict[str, Any], quote_cap: int = 38) -> str:
     return ""
 
 
-def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, max_quote_len: int = 38) -> str:
+def _build_caption_with_limit(
+    batch: List[Dict[str, Any]],
+    max_title_len: int,
+    max_quote_len: int = 38,
+    batch_mode: str = "",
+) -> str:
     n = len(batch)
     has_half = any(is_half_off_mega(d) for d in batch)
     has_vip = any(is_high_ticket_mega(d) for d in batch)
     max_rate = max(int(d.get("discount_rate", 0) or 0) for d in batch)
 
-    if _is_goldbox_batch(batch):
+    if batch_mode == "top_clicks":
+        header = f"🏆 <b>[오늘 가장 많이 클릭한 쿠팡 핫딜 TOP {n}]</b>"
+    elif _is_goldbox_batch(batch):
         slot_lbl = str(batch[0].get("slot_label") or "").strip()
         header = (
             f"🍯 <b>[쿠팡 오늘의 골드박스 · {html.escape(slot_lbl, quote=False)}]</b>"
@@ -1185,6 +1199,8 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, m
             lines.append(f"<b>{icon} {html.escape(full_t, quote=False)}</b>")
 
         tags: List[str] = []
+        if d.get("is_30d_low"):
+            tags.append("🏆<b>[30일 최저가]</b>")
         if is_half_off_mega(d):
             if disc_r >= 70:
                 tags.append("🚨<b>[대폭 할인]</b>")
@@ -1230,7 +1246,7 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, m
 
         ship_label = resolve_shipping_label(d)
         ship_part = f" · {html.escape(ship_label, quote=False)}" if ship_label else ""
-        comm_line = _build_community_line(d, quote_cap=max_quote_len)
+        comm_line = _build_community_line(d, quote_cap=max_quote_len, batch_mode=batch_mode)
         lines.append(f"   {rate_part}{orig_part}{price_str}{extra}{ship_part}")
         if comm_line:
             lines.append(f"   {comm_line}")
@@ -1242,16 +1258,19 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, m
 
 def format_flyer_caption_and_buttons(
     deals: List[Dict[str, Any]],
+    *,
+    include_bot_footer: bool = False,
+    batch_mode: str = "",
 ) -> Tuple[str, List[List[Dict[str, Any]]]]:
     """텔레그램 sendPhoto용 1,024자 안전 캡션과 번호별 초록(success) CTA 버튼 생성"""
     batch = deals[:4]
     caption = ""
     for title_cap, quote_cap in ((60, 38), (50, 32), (42, 26), (34, 22), (28, 18), (24, 0), (16, 0), (12, 0)):
-        caption = _build_caption_with_limit(batch, title_cap, max_quote_len=quote_cap)
+        caption = _build_caption_with_limit(batch, title_cap, max_quote_len=quote_cap, batch_mode=batch_mode)
         if len(caption) <= 980:
             break
     if len(caption) > 1020:
-        caption = _build_caption_with_limit(batch, 10, max_quote_len=0)
+        caption = _build_caption_with_limit(batch, 10, max_quote_len=0, batch_mode=batch_mode)
     if len(caption) > 1020:
         caption = caption[:1016] + "…"
 
@@ -1276,5 +1295,11 @@ def format_flyer_caption_and_buttons(
         url = str(d.get("deeplink") or "").strip()
         if url:
             inline_keyboard.append([{"text": btn_text, "url": url, "style": "success"}])
+
+    if include_bot_footer and inline_keyboard:
+        inline_keyboard.append([
+            {"text": "🔔 키워드 알림", "url": "https://t.me/coupang_deal_hub_bot?start=alert"},
+            {"text": "⚖️ 단가 비교", "url": "https://t.me/coupang_deal_hub_bot?start=compare"},
+        ])
 
     return caption, inline_keyboard

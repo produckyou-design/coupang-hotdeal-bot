@@ -43,9 +43,35 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS channel_stats (
+  kst_date TEXT PRIMARY KEY,
+  start_count INTEGER NOT NULL,
+  latest_count INTEGER NOT NULL,
+  peak_count INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channel_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS posted_messages (
+  message_id INTEGER PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  caption TEXT NOT NULL,
+  items_json TEXT NOT NULL,
+  inline_kb_json TEXT NOT NULL,
+  all_closed INTEGER DEFAULT 0,
+  posted_at TEXT NOT NULL,
+  last_checked_at TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_links_deal_id ON links(deal_id);
 CREATE INDEX IF NOT EXISTS idx_links_created ON links(created_at);
 CREATE INDEX IF NOT EXISTS idx_clicks_code ON clicks(code);
 CREATE INDEX IF NOT EXISTS idx_clicks_kst_date ON clicks(kst_date);
 CREATE INDEX IF NOT EXISTS idx_keyword_alerts_chat ON keyword_alerts(chat_id);
 CREATE INDEX IF NOT EXISTS idx_keyword_alerts_norm ON keyword_alerts(keyword_norm);
+CREATE INDEX IF NOT EXISTS idx_posted_messages_active ON posted_messages(all_closed, posted_at);

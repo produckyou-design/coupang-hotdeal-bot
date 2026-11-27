@@ -215,6 +215,8 @@ def classify_sub_id(sub_id: Optional[str]) -> Tuple[str, str]:
             return "telegram", "뽐뿌"
         if "dealbada" in s:
             return "telegram", "딜바다"
+        if "clien" in s:
+            return "telegram", "클리앙"
         if "gold" in s:
             return "telegram", "골드박스"
         if "manual" in s:

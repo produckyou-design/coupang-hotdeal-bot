@@ -20,6 +20,7 @@ SOURCE_LABEL_MAP = {
     "ppomppu": "뽐뿌",
     "ruliweb": "루리웹",
     "dealbada": "딜바다",
+    "clien": "클리앙",
     "goldbox": "골드박스",
 }
 
@@ -354,9 +355,10 @@ def format_alert_condition_badge(row: Dict[str, Any]) -> str:
         parts.append(f"-{ex}")
     if len(excl) > 2:
         parts.append(f"외 {len(excl) - 2}제외")
+    disp_kw = f"📉 상품추적 #{kw[4:]}" if kw.lower().startswith("pid:") else kw
     if parts:
-        return f"{kw} ({' · '.join(parts)})"
-    return kw
+        return f"{disp_kw} ({' · '.join(parts)})"
+    return disp_kw
 
 
 def list_keyword_alerts_with_prefs(
@@ -731,10 +733,12 @@ def match_alerts_for_deal(
     *,
     sale_price: int = 0,
     discount_rate: int = 0,
+    product_id: str = "",
 ) -> Dict[str, Dict[str, Any]]:
-    """상품 제목+가격+할인율 기준으로 매칭되는 구독자별 상세 결과 반환."""
+    """상품 제목+상품ID+가격+할인율 기준으로 매칭되는 구독자별 상세 결과 반환."""
     title_norm = normalize_alert_keyword(title)
-    if not title_norm or not alerts:
+    pid_norm = str(product_id or "").strip().lower()
+    if (not title_norm and not pid_norm) or not alerts:
         return {}
 
     matched: Dict[str, Dict[str, Any]] = {}
@@ -747,23 +751,30 @@ def match_alerts_for_deal(
         if not cid or not kw_norm or len(kw_norm) < 2:
             continue
 
-        raw_tokens = kw.split() if kw else [kw_norm]
-        tokens = [normalize_alert_keyword(t) for t in raw_tokens if normalize_alert_keyword(t)]
-        if not tokens:
-            continue
+        if kw_norm.startswith("pid:"):
+            target_pid = kw_norm[4:].strip()
+            if not pid_norm or not target_pid or pid_norm != target_pid:
+                continue
+        else:
+            if not title_norm:
+                continue
+            raw_tokens = kw.split() if kw else [kw_norm]
+            tokens = [normalize_alert_keyword(t) for t in raw_tokens if normalize_alert_keyword(t)]
+            if not tokens:
+                continue
 
-        all_tokens_ok = True
-        for tok in tokens:
-            variants = _TOKEN_VARIANT_MAP.get(tok, (tok,))
-            if not any(v in title_norm for v in variants):
-                all_tokens_ok = False
-                break
-        if not all_tokens_ok:
-            continue
+            all_tokens_ok = True
+            for tok in tokens:
+                variants = _TOKEN_VARIANT_MAP.get(tok, (tok,))
+                if not any(v in title_norm for v in variants):
+                    all_tokens_ok = False
+                    break
+            if not all_tokens_ok:
+                continue
 
-        excl_terms = _sanitize_exclude_terms(row.get("exclude_terms") or "")
-        if any(normalize_alert_keyword(ex) in title_norm for ex in excl_terms):
-            continue
+            excl_terms = _sanitize_exclude_terms(row.get("exclude_terms") or "")
+            if any(normalize_alert_keyword(ex) in title_norm for ex in excl_terms):
+                continue
 
         max_p = int(row.get("max_price", 0) or 0)
         if max_p > 0 and (int(sale_price or 0) <= 0 or int(sale_price or 0) > max_p):
@@ -783,7 +794,7 @@ def match_alerts_for_deal(
                 "quiet_night": quiet_night,
             },
         )
-        disp_kw = kw or kw_norm
+        disp_kw = f"상품가격하락(#{kw_norm[4:]})" if kw_norm.startswith("pid:") else (kw or kw_norm)
         if disp_kw not in bucket["keywords"]:
             bucket["keywords"].append(disp_kw)
         if kw_norm not in bucket["keyword_norms"]:
@@ -792,6 +803,163 @@ def match_alerts_for_deal(
         if aid > 0 and aid not in bucket["alert_ids"]:
             bucket["alert_ids"].append(aid)
     return matched
+
+
+def report_channel_member_count(count: int, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """채널 구독자 수 변화를 Cloudflare D1에 기록하고 delta/순증/마일스톤 반환 (fail-open)."""
+    if not is_click_tracker_enabled():
+        return None
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.post(
+            f"{base_url}/api/channel/members",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"count": int(count)},
+            timeout=timeout,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, dict) and data.get("ok"):
+                return data
+        logger.warning(f"채널 구독자 수 기록 HTTP {res.status_code}")
+    except Exception as e:
+        logger.warning(f"채널 구독자 수 기록 실패: {e}")
+    return None
+
+
+def fetch_channel_member_stats(timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """현재 채널 구독자 수 및 오늘 순증·최근 7일 추이 조회."""
+    if not is_click_tracker_enabled():
+        return None
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.get(
+            f"{base_url}/api/channel/members",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, dict) and data.get("ok"):
+                return data
+    except Exception as e:
+        logger.warning(f"채널 구독자 통계 조회 실패: {e}")
+    return None
+
+
+def format_member_stats_line(stats: Optional[Dict[str, Any]]) -> str:
+    """리포트/클릭 현황용 채널 구독자 1줄 요약 포맷."""
+    if not stats or int(stats.get("count", 0) or 0) <= 0:
+        return ""
+    cnt = int(stats.get("count", 0) or 0)
+    net = int(stats.get("today_net", 0) or 0)
+    net_str = f"+{net:,}명" if net > 0 else (f"{net:,}명" if net < 0 else "변동 없음")
+    return f"👥 <b>채널 구독자</b>: <b>{cnt:,}명</b> (오늘 {net_str})"
+
+
+def register_posted_message(
+    message_id: int,
+    chat_id: str,
+    caption: str,
+    items: List[Dict[str, Any]],
+    inline_kb: List[List[Dict[str, Any]]],
+    timeout: float = 4.0,
+) -> bool:
+    """송출된 채널 전단지의 message_id와 품목 목록을 품절 감시용 D1 테이블에 저장."""
+    if not message_id or not chat_id or not is_click_tracker_enabled():
+        return False
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.post(
+            f"{base_url}/api/posts",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "message_id": int(message_id),
+                "chat_id": str(chat_id),
+                "caption": str(caption or ""),
+                "items": list(items or []),
+                "inline_kb": list(inline_kb or []),
+            },
+            timeout=timeout,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        logger.warning(f"송출 메시지 등록 실패 (무시): {e}")
+        return False
+
+
+def fetch_active_posted_messages(
+    hours: int = 6,
+    min_recheck_min: int = 20,
+    limit: int = 4,
+    timeout: float = 5.0,
+) -> List[Dict[str, Any]]:
+    """품절/가격정상화 감시 대상 최근 채널 게시물 목록 조회."""
+    if not is_click_tracker_enabled():
+        return []
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.get(
+            f"{base_url}/api/posts/active",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params={
+                "hours": int(hours),
+                "min_recheck_min": int(min_recheck_min),
+                "limit": int(limit),
+            },
+            timeout=timeout,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, dict) and data.get("ok") and isinstance(data.get("posts"), list):
+                return data["posts"]
+    except Exception as e:
+        logger.warning(f"활성 게시물 조회 실패: {e}")
+    return []
+
+
+def update_posted_message(
+    message_id: int,
+    *,
+    caption: Optional[str] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+    inline_kb: Optional[List[List[Dict[str, Any]]]] = None,
+    all_closed: Optional[bool] = None,
+    timeout: float = 4.0,
+) -> bool:
+    """품절 감지 후 수정된 캡션·버튼·종료 상태 D1 동기화."""
+    if not message_id or not is_click_tracker_enabled():
+        return False
+    base_url, api_key = _get_tracker_config()
+    payload: Dict[str, Any] = {"message_id": int(message_id)}
+    if caption is not None:
+        payload["caption"] = caption
+    if items is not None:
+        payload["items"] = items
+    if inline_kb is not None:
+        payload["inline_kb"] = inline_kb
+    if all_closed is not None:
+        payload["all_closed"] = bool(all_closed)
+    try:
+        res = requests.post(
+            f"{base_url}/api/posts/update",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        logger.warning(f"송출 메시지 갱신 실패 (무시): {e}")
+        return False
 
 
 def match_alerts_for_title(

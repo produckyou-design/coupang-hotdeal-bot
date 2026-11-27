@@ -13,6 +13,34 @@ const MOBILE_UA_RE = /android|iphone|ipad|ipod|mobile/i;
 const CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const CHAT_ID_RE = /^-?\d{3,20}$/;
 const MAX_KEYWORDS_PER_USER = 10;
+const MEMBER_MILESTONES = [50, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000];
+const SOURCE_KR_MAP = {
+  arca: "아카라이브",
+  ppomppu: "뽐뿌",
+  ruliweb: "루리웹",
+  dealbada: "딜바다",
+  clien: "클리앙",
+  goldbox: "골드박스",
+};
+
+function publicCorsHeaders(cacheControl = "public, max-age=120") {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": cacheControl,
+  };
+}
+
+function publicJsonResponse(payload, status = 200, cacheControl = "public, max-age=120") {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "Content-Type": "application/json;charset=UTF-8",
+      ...publicCorsHeaders(cacheControl),
+    },
+  });
+}
 
 const SYMMETRIC_ALIAS_GROUPS = [
   ["에어팟", "airpods", "airpod"],
@@ -398,10 +426,10 @@ async function handleStats(request, env, url) {
     .all();
 
   const topTodayRes = await env.DB.prepare(
-    `SELECT l.code, l.title, l.source, l.sale_price, l.discount_rate, COUNT(*) AS clicks
+    `SELECT l.code, l.deal_id, l.product_id, l.title, l.source, l.sale_price, l.discount_rate, COUNT(*) AS clicks
      FROM clicks c JOIN links l ON c.code = l.code
      WHERE c.kst_date = ?
-     GROUP BY l.code, l.title, l.source, l.sale_price, l.discount_rate
+     GROUP BY l.code, l.deal_id, l.product_id, l.title, l.source, l.sale_price, l.discount_rate
      ORDER BY clicks DESC, MAX(c.id) DESC
      LIMIT ?`
   )
@@ -409,10 +437,10 @@ async function handleStats(request, env, url) {
     .all();
 
   const topPeriodRes = await env.DB.prepare(
-    `SELECT l.code, l.title, l.source, l.sale_price, l.discount_rate, COUNT(*) AS clicks
+    `SELECT l.code, l.deal_id, l.product_id, l.title, l.source, l.sale_price, l.discount_rate, COUNT(*) AS clicks
      FROM clicks c JOIN links l ON c.code = l.code
      WHERE c.kst_date >= ?
-     GROUP BY l.code, l.title, l.source, l.sale_price, l.discount_rate
+     GROUP BY l.code, l.deal_id, l.product_id, l.title, l.source, l.sale_price, l.discount_rate
      ORDER BY clicks DESC, MAX(c.id) DESC
      LIMIT ?`
   )
@@ -425,6 +453,10 @@ async function handleStats(request, env, url) {
      ORDER BY c.id DESC
      LIMIT 10`
   ).all();
+
+  const closedDealIds = await getClosedDealIdsArray(env, 2);
+  const attachShortUrl = (rows) =>
+    (rows || []).map((r) => ({ ...r, short_url: r.code ? `${url.origin}/r/${r.code}` : "" }));
 
   return jsonResponse({
     ok: true,
@@ -442,9 +474,10 @@ async function handleStats(request, env, url) {
     by_date: byDateRes?.results || [],
     by_source_today: bySourceTodayRes?.results || [],
     by_source_period: bySourcePeriodRes?.results || [],
-    top_today: topTodayRes?.results || [],
-    top_period: topPeriodRes?.results || [],
+    top_today: attachShortUrl(topTodayRes?.results),
+    top_period: attachShortUrl(topPeriodRes?.results),
     recent: recentRes?.results || [],
+    closed_deal_ids: closedDealIds,
   });
 }
 
@@ -874,6 +907,334 @@ async function handleAlertStats(request, env) {
   });
 }
 
+async function getClosedDealIdsArray(env, days = 3) {
+  const closed = new Set();
+  try {
+    const startIso = new Date(Date.now() - days * 86400 * 1000).toISOString();
+    const res = await env.DB.prepare(
+      "SELECT items_json, all_closed FROM posted_messages WHERE posted_at >= ? ORDER BY posted_at DESC LIMIT 80"
+    )
+      .bind(startIso)
+      .all();
+    for (const row of res?.results || []) {
+      let items = [];
+      try {
+        items = JSON.parse(String(row.items_json || "[]"));
+      } catch {
+        items = [];
+      }
+      for (const it of items) {
+        if ((it?.closed || Number(row.all_closed || 0) === 1) && it?.deal_id) {
+          closed.add(String(it.deal_id));
+        }
+      }
+    }
+  } catch {
+    // Fallback gracefully if posted_messages does not exist yet
+  }
+  return Array.from(closed);
+}
+
+async function handleChannelMembersPost(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const rawCount = Number.parseInt(String(body?.count ?? ""), 10);
+  if (Number.isNaN(rawCount) || rawCount < 0) {
+    return jsonResponse({ ok: false, error: "invalid_count" }, 400);
+  }
+  const count = rawCount;
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const { kstDate } = toKstParts(now);
+
+  const metaRow = await env.DB.prepare(
+    "SELECT value FROM channel_meta WHERE key = 'member_count' LIMIT 1"
+  ).first();
+  const initialized = !metaRow;
+  const prevCount = metaRow ? Number.parseInt(String(metaRow.value || "0"), 10) : null;
+  const delta = prevCount === null || Number.isNaN(prevCount) ? 0 : count - prevCount;
+
+  await env.DB.prepare(
+    `INSERT INTO channel_meta (key, value, updated_at)
+     VALUES ('member_count', ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  )
+    .bind(String(count), nowIso)
+    .run();
+
+  const todayRow = await env.DB.prepare(
+    "SELECT start_count, latest_count, peak_count FROM channel_stats WHERE kst_date = ? LIMIT 1"
+  )
+    .bind(kstDate)
+    .first();
+
+  let todayStart = count;
+  if (!todayRow) {
+    todayStart = prevCount !== null && !Number.isNaN(prevCount) ? prevCount : count;
+    await env.DB.prepare(
+      `INSERT INTO channel_stats (kst_date, start_count, latest_count, peak_count, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+      .bind(kstDate, todayStart, count, Math.max(todayStart, count), nowIso)
+      .run();
+  } else {
+    todayStart = Number(todayRow.start_count ?? count);
+    const peakCount = Math.max(Number(todayRow.peak_count ?? count), count);
+    await env.DB.prepare(
+      `UPDATE channel_stats
+       SET latest_count = ?, peak_count = ?, updated_at = ?
+       WHERE kst_date = ?`
+    )
+      .bind(count, peakCount, nowIso, kstDate)
+      .run();
+  }
+
+  let milestone = 0;
+  if (prevCount !== null && !Number.isNaN(prevCount) && delta > 0) {
+    for (const m of MEMBER_MILESTONES) {
+      if (prevCount < m && count >= m) {
+        milestone = m;
+      }
+    }
+  }
+
+  return jsonResponse({
+    ok: true,
+    prev_count: prevCount === null ? count : prevCount,
+    count,
+    delta,
+    today_start: todayStart,
+    today_net: count - todayStart,
+    milestone,
+    initialized,
+  });
+}
+
+async function handleChannelMembersGet(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const { kstDate } = toKstParts(new Date());
+  const metaRow = await env.DB.prepare(
+    "SELECT value FROM channel_meta WHERE key = 'member_count' LIMIT 1"
+  ).first();
+  const curCount = metaRow ? Number.parseInt(String(metaRow.value || "0"), 10) : 0;
+
+  const todayRow = await env.DB.prepare(
+    "SELECT start_count, latest_count, peak_count FROM channel_stats WHERE kst_date = ? LIMIT 1"
+  )
+    .bind(kstDate)
+    .first();
+  const todayStart = todayRow ? Number(todayRow.start_count ?? curCount) : curCount;
+
+  const histRes = await env.DB.prepare(
+    "SELECT kst_date, start_count, latest_count, peak_count FROM channel_stats ORDER BY kst_date DESC LIMIT 7"
+  ).all();
+
+  return jsonResponse({
+    ok: true,
+    count: curCount,
+    today_start: todayStart,
+    today_net: curCount - todayStart,
+    history: histRes?.results || [],
+  });
+}
+
+async function handleCreatePost(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const messageId = clampInt(body?.message_id, 0, 1, 2147483647000);
+  const chatId = String(body?.chat_id || "").trim();
+  const caption = String(body?.caption || "");
+  const items = Array.isArray(body?.items) ? body.items : [];
+  const inlineKb = Array.isArray(body?.inline_kb) ? body.inline_kb : [];
+  if (!messageId || !chatId) {
+    return jsonResponse({ ok: false, error: "invalid_post" }, 400);
+  }
+  const nowIso = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO posted_messages
+      (message_id, chat_id, caption, items_json, inline_kb_json, all_closed, posted_at, last_checked_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, '')`
+  )
+    .bind(messageId, chatId, caption, JSON.stringify(items), JSON.stringify(inlineKb), nowIso)
+    .run();
+
+  return jsonResponse({ ok: true, message_id: messageId });
+}
+
+async function handleGetActivePosts(request, env, url) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const hours = clampInt(url.searchParams.get("hours"), 6, 1, 24);
+  const minRecheckMin = clampInt(url.searchParams.get("min_recheck_min"), 20, 0, 120);
+  const limit = clampInt(url.searchParams.get("limit"), 4, 1, 10);
+
+  const nowMs = Date.now();
+  const cutoffIso = new Date(nowMs - hours * 3600 * 1000).toISOString();
+  const recheckCutoffIso = new Date(nowMs - minRecheckMin * 60 * 1000).toISOString();
+
+  const res = await env.DB.prepare(
+    `SELECT message_id, chat_id, caption, items_json, inline_kb_json, all_closed, posted_at, last_checked_at
+     FROM posted_messages
+     WHERE COALESCE(all_closed, 0) = 0
+       AND posted_at >= ?
+       AND (last_checked_at = '' OR last_checked_at <= ?)
+     ORDER BY posted_at DESC
+     LIMIT ?`
+  )
+    .bind(cutoffIso, recheckCutoffIso, limit)
+    .all();
+
+  const posts = (res?.results || []).map((r) => {
+    let items = [];
+    let inlineKb = [];
+    try {
+      items = JSON.parse(String(r.items_json || "[]"));
+    } catch {
+      items = [];
+    }
+    try {
+      inlineKb = JSON.parse(String(r.inline_kb_json || "[]"));
+    } catch {
+      inlineKb = [];
+    }
+    return {
+      message_id: Number(r.message_id),
+      chat_id: r.chat_id,
+      caption: r.caption,
+      items,
+      inline_kb: inlineKb,
+      all_closed: Number(r.all_closed || 0),
+      posted_at: r.posted_at,
+      last_checked_at: r.last_checked_at || "",
+    };
+  });
+
+  return jsonResponse({ ok: true, posts });
+}
+
+async function handleUpdatePost(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const messageId = clampInt(body?.message_id, 0, 1, 2147483647000);
+  if (!messageId) {
+    return jsonResponse({ ok: false, error: "invalid_message_id" }, 400);
+  }
+  const existing = await env.DB.prepare(
+    "SELECT caption, items_json, inline_kb_json, all_closed FROM posted_messages WHERE message_id = ? LIMIT 1"
+  )
+    .bind(messageId)
+    .first();
+  if (!existing) {
+    return jsonResponse({ ok: false, error: "not_found" }, 404);
+  }
+
+  const nextCaption = body?.caption !== undefined ? String(body.caption) : existing.caption;
+  const nextItemsJson =
+    body?.items !== undefined ? JSON.stringify(Array.isArray(body.items) ? body.items : []) : existing.items_json;
+  const nextKbJson =
+    body?.inline_kb !== undefined
+      ? JSON.stringify(Array.isArray(body.inline_kb) ? body.inline_kb : [])
+      : existing.inline_kb_json;
+  const nextAllClosed =
+    body?.all_closed !== undefined ? (body.all_closed ? 1 : 0) : Number(existing.all_closed || 0);
+  const nowIso = new Date().toISOString();
+
+  await env.DB.prepare(
+    `UPDATE posted_messages
+     SET caption = ?, items_json = ?, inline_kb_json = ?, all_closed = ?, last_checked_at = ?
+     WHERE message_id = ?`
+  )
+    .bind(nextCaption, nextItemsJson, nextKbJson, nextAllClosed, nowIso, messageId)
+    .run();
+
+  return jsonResponse({ ok: true, message_id: messageId, all_closed: nextAllClosed });
+}
+
+async function handlePublicFeed(env, url) {
+  const limit = clampInt(url.searchParams.get("limit"), 6, 1, 12);
+  const days = clampInt(url.searchParams.get("days"), 3, 1, 7);
+  const startIso = new Date(Date.now() - days * 86400 * 1000).toISOString();
+
+  const [linksRes, closedDealIds, memberRow] = await Promise.all([
+    env.DB.prepare(
+      `SELECT l.code, l.deal_id, l.product_id, l.source, l.title, l.sale_price, l.discount_rate, l.created_at,
+              COUNT(c.id) AS clicks
+       FROM links l
+       LEFT JOIN clicks c ON c.code = l.code
+       WHERE l.created_at >= ?
+         AND l.title != ''
+         AND COALESCE(l.source, '') != 'goldbox'
+       GROUP BY l.code, l.deal_id, l.product_id, l.source, l.title, l.sale_price, l.discount_rate, l.created_at
+       ORDER BY l.created_at DESC
+       LIMIT 60`
+    )
+      .bind(startIso)
+      .all(),
+    getClosedDealIdsArray(env, days),
+    env.DB.prepare("SELECT value FROM channel_meta WHERE key = 'member_count' LIMIT 1")
+      .first()
+      .catch(() => null),
+  ]);
+
+  const closedSet = new Set(closedDealIds);
+  const seenKeys = new Set();
+  const items = [];
+  for (const r of linksRes?.results || []) {
+    const did = String(r.deal_id || "").trim();
+    if (did && closedSet.has(did)) continue;
+    const dedupKey = String(r.product_id || r.code || "").trim();
+    if (!dedupKey || seenKeys.has(dedupKey)) continue;
+    seenKeys.add(dedupKey);
+    const src = String(r.source || "").trim().toLowerCase();
+    items.push({
+      code: r.code,
+      short_url: `${url.origin}/r/${r.code}`,
+      title: r.title || "",
+      source: src,
+      source_kr: SOURCE_KR_MAP[src] || src || "커뮤니티",
+      sale_price: Number(r.sale_price || 0),
+      discount_rate: Number(r.discount_rate || 0),
+      clicks: Number(r.clicks || 0),
+      created_at: r.created_at || "",
+    });
+    if (items.length >= limit) break;
+  }
+
+  return publicJsonResponse({
+    ok: true,
+    updated_at: new Date().toISOString(),
+    channel_url: "https://t.me/HOTpang911",
+    member_count: memberRow ? Number.parseInt(String(memberRow.value || "0"), 10) || 0 : 0,
+    items,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -883,11 +1244,30 @@ export default {
     if (method === "GET" && path === "/health") {
       return jsonResponse({ ok: true, service: "hotpang-click" });
     }
+    if (path === "/api/public/feed") {
+      if (method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: publicCorsHeaders("public, max-age=86400") });
+      }
+      if (method === "GET") return handlePublicFeed(env, url);
+    }
     if (method === "POST" && path === "/api/links") {
       return handleCreateLink(request, env, url.origin);
     }
     if (method === "GET" && path === "/api/stats") {
       return handleStats(request, env, url);
+    }
+    if (path === "/api/channel/members") {
+      if (method === "GET") return handleChannelMembersGet(request, env);
+      if (method === "POST") return handleChannelMembersPost(request, env);
+    }
+    if (method === "POST" && path === "/api/posts") {
+      return handleCreatePost(request, env);
+    }
+    if (method === "GET" && path === "/api/posts/active") {
+      return handleGetActivePosts(request, env, url);
+    }
+    if (method === "POST" && path === "/api/posts/update") {
+      return handleUpdatePost(request, env);
     }
     if (path === "/api/alerts") {
       if (method === "GET") return handleGetAlerts(request, env, url);
