@@ -75,3 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_clicks_kst_date ON clicks(kst_date);
 CREATE INDEX IF NOT EXISTS idx_keyword_alerts_chat ON keyword_alerts(chat_id);
 CREATE INDEX IF NOT EXISTS idx_keyword_alerts_norm ON keyword_alerts(keyword_norm);
 CREATE INDEX IF NOT EXISTS idx_posted_messages_active ON posted_messages(all_closed, posted_at);
+
+CREATE TABLE IF NOT EXISTS bot_sessions (
+  chat_id TEXT PRIMARY KEY,
+  state_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

@@ -44,6 +44,7 @@ from click_tracker import (
     register_tracked_link,
     remove_keyword_alert,
     report_channel_member_count,
+    report_flyer_status,
     update_posted_message,
 )
 from coupang_api import (
@@ -4989,6 +4990,17 @@ def main():
     # 로켓 골드박스 생필품·식품 미끼 4선 전단지 (오전 8~11시 · 저녁 18~21시 2타임)
     if ENABLE_GOLDBOX or "--force-goldbox" in sys.argv:
         total_sent += run_goldbox_staggered(seen, quota)
+
+    # 클라우드 봇 /status 조회용 전단지·대기큐 현황 동기화
+    try:
+        report_flyer_status(
+            str(quota.get("date") or ""),
+            int(quota.get("community_sent", 0) or 0),
+            int(quota.get("goldbox_sent", 0) or 0),
+            len(flyer_queue),
+        )
+    except Exception as st_err:
+        logger.warning(f"전단지 현황 D1 기록 생략: {st_err}")
 
     # 최근 4일 주문 집계 감지 및 마일스톤 알림
     check_and_notify_sales()

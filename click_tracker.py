@@ -962,6 +962,38 @@ def update_posted_message(
         return False
 
 
+def report_flyer_status(
+    date_str: str,
+    community_sent: int,
+    goldbox_sent: int,
+    waiting: int,
+    timeout: float = 4.0,
+) -> bool:
+    """클라우드 /status 조회용 당일 송출·대기큐 현황 D1 저장 (fail-open)."""
+    if not is_click_tracker_enabled():
+        return False
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.post(
+            f"{base_url}/api/channel/status",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "date": str(date_str or "").strip(),
+                "community_sent": int(community_sent or 0),
+                "goldbox_sent": int(goldbox_sent or 0),
+                "waiting": int(waiting or 0),
+            },
+            timeout=timeout,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        logger.warning(f"전단지 현황 기록 실패 (무시): {e}")
+        return False
+
+
 def match_alerts_for_title(
     title: str,
     alerts: Optional[List[Dict[str, Any]]],

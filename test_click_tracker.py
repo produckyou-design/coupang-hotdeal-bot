@@ -731,6 +731,30 @@ class TestUpgradesV2(unittest.TestCase):
             self.assertFalse(push_deals.check_and_notify_channel_members())
             mock_send2.assert_not_called()
 
+    def test_report_flyer_status(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CLICK_TRACKER_BASE_URL": "https://hotpang-click.example.workers.dev",
+                "CLICK_TRACKER_API_KEY": "secret-key",
+            },
+            clear=False,
+        ):
+            ok_resp = MagicMock(status_code=200)
+            with patch.object(click_tracker.requests, "post", return_value=ok_resp) as mock_post:
+                ok = click_tracker.report_flyer_status("20261128", 12, 2, 3)
+            self.assertTrue(ok)
+            mock_post.assert_called_once()
+            self.assertTrue(mock_post.call_args.args[0].endswith("/api/channel/status"))
+            self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer secret-key")
+            self.assertEqual(
+                mock_post.call_args.kwargs["json"],
+                {"date": "20261128", "community_sent": 12, "goldbox_sent": 2, "waiting": 3},
+            )
+
+            with patch.object(click_tracker.requests, "post", side_effect=RuntimeError("boom")):
+                self.assertFalse(click_tracker.report_flyer_status("20261128", 12, 2, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,18 @@ main = "src/index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
 
+[observability]
+enabled = true
+
+[vars]
+TELEGRAM_PUBLIC_CHANNEL_ID = "@HOTpang911"
+GH_REPO_OWNER = "produckyou-design"
+GH_REPO_NAME = "coupang-hotdeal-bot"
+GH_WORKFLOW_FILE = "deal_pusher.yml"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "hotpang-clicks"
