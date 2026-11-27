@@ -755,6 +755,38 @@ class TestUpgradesV2(unittest.TestCase):
             with patch.object(click_tracker.requests, "post", side_effect=RuntimeError("boom")):
                 self.assertFalse(click_tracker.report_flyer_status("20261128", 12, 2, 3))
 
+    def test_daily_report_places_daily_stats_at_bottom(self):
+        import push_deals
+
+        comm_rows = [
+            {"date": "20261126", "subId": "tgarca", "click": 4, "order": 1, "cancel": 0, "gmv": 10000, "commission": 300},
+            {"date": "20261127", "subId": "tgclien", "click": 9, "order": 2, "cancel": 0, "gmv": 30000, "commission": 900},
+        ]
+        order_rows = [
+            {"date": "20261127", "subId": "tgclien", "productName": "코멧 생수", "quantity": 2, "gmv": 30000, "commission": 900},
+        ]
+        seen = set()
+        with patch.object(push_deals.sys, "argv", ["push_deals.py", "--force-report"]), \
+             patch.object(push_deals.coupang_api, "get_commission_report", return_value={"data": comm_rows}), \
+             patch.object(push_deals.coupang_api, "get_order_report", return_value={"data": order_rows}), \
+             patch.object(push_deals, "fetch_click_stats", return_value={"today": {"clicks": 15, "unique_links": 4}, "period_total": {"clicks": 50, "total_links": 10}, "days": 7}), \
+             patch.object(push_deals, "fetch_channel_member_stats", return_value={"count": 50, "today_net": 1}), \
+             patch.object(push_deals, "save_seen"), \
+             patch.object(push_deals, "ADMIN_CHAT_ID", "999001"), \
+             patch.object(push_deals, "send_telegram", return_value=True) as mock_send:
+            res = push_deals.run_daily_report_if_night(seen)
+
+        self.assertEqual(res, 1)
+        sent = mock_send.call_args.kwargs["text"]
+        idx_month = sent.index("월 누적")
+        idx_chan = sent.index("채널별 분리 집계")
+        idx_note = sent.index("※")
+        idx_daily = sent.index("최근 확정일 실적 (2026.11.27)")
+        self.assertGreater(idx_daily, idx_note)
+        self.assertGreater(idx_note, idx_chan)
+        self.assertGreater(idx_chan, idx_month)
+        self.assertIn("구독자 <b>50명</b>", sent[idx_daily:])
+
 
 if __name__ == "__main__":
     unittest.main()

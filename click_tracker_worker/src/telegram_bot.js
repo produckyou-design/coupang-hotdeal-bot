@@ -820,25 +820,12 @@ async function reportCmd(env, chat, user, origin, dbOps) {
 
     const mStats = summarizePartnerStats(commMonthRes?.data || [], orderRes?.data || []);
     const wStats = summarizePartnerStats(commWeekRes?.data || []);
-    let latestBlock = "📌 <b>최근 확정일</b>: 집계 내역 없음\n\n";
-    if (mStats.latest_date) {
-      const ld = mStats.latest_date;
-      const lt = mStats.latest_total;
-      const lFmt = ld.length === 8 ? `${ld.slice(0, 4)}.${ld.slice(4, 6)}.${ld.slice(6, 8)}` : ld;
-      latestBlock =
-        `📌 <b>최근 확정일 (${lFmt})</b>\n` +
-        `• 클릭/주문: <b>${lt.clicks.toLocaleString("en-US")}회</b> / <b>${lt.orders.toLocaleString("en-US")}건</b> | ` +
-        `${lt.gmv.toLocaleString("en-US")}원 (수익 <b>${lt.commission.toLocaleString("en-US")}원</b>)\n\n`;
-    }
-
     const wt = wStats.total;
     const mt = mStats.total;
     const kMonth = k.getUTCMonth() + 1;
     const kDay = k.getUTCDate();
     const channelBlock = formatChannelSplitBlock(mStats, `채널별 분리 집계 (${kMonth}월 누적)`);
     const clickBlock = clickStats ? `${formatClickStatsTelegram(clickStats, 3)}\n\n` : "";
-    const mLine = formatMemberStatsLine(memberStats);
-    const memberBlock = mLine ? `${mLine}\n\n` : "";
 
     const taggedOrders = [...mStats.tagged_orders].sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
     const orderLines = taggedOrders.slice(0, 5).map((it) => {
@@ -856,13 +843,52 @@ async function reportCmd(env, chat, user, origin, dbOps) {
         ? `<b>[최근 7일 주문 품목]</b>\n${orderLines.join("\n")}\n\n`
         : "<b>[최근 7일 주문 품목]</b>\n• 확정 주문 내역 없음\n\n";
 
+    const dailyLines = [];
+    if (mStats.latest_date) {
+      const ld = mStats.latest_date;
+      const lt = mStats.latest_total;
+      const ltg = mStats.latest_telegram;
+      const lpw = mStats.latest_poliwiki;
+      const lFmt = ld.length === 8 ? `${ld.slice(0, 4)}.${ld.slice(4, 6)}.${ld.slice(6, 8)}` : ld;
+      dailyLines.push(
+        `📌 <b>최근 확정일 실적 (${lFmt})</b>`,
+        `• 클릭/주문/취소: <b>${lt.clicks.toLocaleString("en-US")}회</b> / <b>${lt.orders.toLocaleString("en-US")}건</b> / ${lt.cancels.toLocaleString("en-US")}건`,
+        `• 결제액 / 확정 수익: <b>${lt.gmv.toLocaleString("en-US")}원</b> / <b>${lt.commission.toLocaleString("en-US")}원</b>`
+      );
+      if (ltg.clicks + ltg.orders + lpw.clicks + lpw.orders > 0) {
+        dailyLines.push(
+          `• ✈️ 텔레그램: ${ltg.orders.toLocaleString("en-US")}건 (수익 ${ltg.commission.toLocaleString("en-US")}원) · 🌐 폴리위키: ${lpw.orders.toLocaleString("en-US")}건 (수익 ${lpw.commission.toLocaleString("en-US")}원)`
+        );
+      }
+    } else {
+      dailyLines.push("📌 <b>최근 확정일 실적</b>: 집계 내역 없음");
+    }
+
+    const liveParts = [];
+    if (clickStats?.today) {
+      liveParts.push(
+        `⚡ 오늘 실시간 클릭(${kMonth}/${kDay}): <b>${Number(clickStats.today.clicks || 0).toLocaleString("en-US")}회</b> (상품 ${Number(
+          clickStats.today.unique_links || 0
+        ).toLocaleString("en-US")}개)`
+      );
+    }
+    const mCnt = Number(memberStats?.count || 0);
+    if (mCnt > 0) {
+      const net = Number(memberStats?.today_net || 0);
+      const netStr = net > 0 ? `+${net.toLocaleString("en-US")}명` : net < 0 ? `${net.toLocaleString("en-US")}명` : "변동 없음";
+      liveParts.push(`👥 구독자 <b>${mCnt.toLocaleString("en-US")}명</b> (오늘 ${netStr})`);
+    }
+    if (liveParts.length > 0) {
+      dailyLines.push(`• ${liveParts.join(" · ")}`);
+    }
+    const dailyBottomBlock = `━━━━━━━━━━━━━━━━━━\n${dailyLines.join("\n")}`;
+
     const nowLabel = `${k.getUTCFullYear()}.${String(kMonth).padStart(2, "0")}.${String(kDay).padStart(2, "0")} ${String(
       k.getUTCHours()
     ).padStart(2, "0")}:${String(k.getUTCMinutes()).padStart(2, "0")}`;
     const reportText =
       `📊 <b>[쿠팡 파트너스 채널별 통계]</b>\n` +
       `📅 조회 기준: ${nowLabel} KST\n\n` +
-      `${latestBlock}` +
       `🗓️ <b>최근 7일 합계</b>\n` +
       `• 클릭/주문/취소: <b>${wt.clicks.toLocaleString("en-US")}회</b> / <b>${wt.orders.toLocaleString("en-US")}건</b> / ${wt.cancels.toLocaleString("en-US")}건\n` +
       `• 결제액 / 수익: ${wt.gmv.toLocaleString("en-US")}원 / <b>${wt.commission.toLocaleString("en-US")}원</b>\n\n` +
@@ -871,9 +897,9 @@ async function reportCmd(env, chat, user, origin, dbOps) {
       `• 결제액 / 확정 수익: ${mt.gmv.toLocaleString("en-US")}원 / <b>${mt.commission.toLocaleString("en-US")}원</b>\n\n` +
       `${channelBlock}\n\n` +
       `${clickBlock}` +
-      `${memberBlock}` +
       `${ordersBlock}` +
-      `※ <i>쿠팡 API 리포트는 익일 오후(D+1~D+2) 확정 집계됩니다.</i>`;
+      `※ <i>쿠팡 API 리포트는 익일 오후(D+1~D+2) 확정 집계됩니다.</i>\n\n` +
+      `${dailyBottomBlock}`;
 
     if (msgId) await tgApi(env, "editMessageText", { chat_id: chat.id, message_id: msgId, text: reportText, parse_mode: "HTML" });
     else await replyTo(env, chat.id, reportText, { parse_mode: "HTML" });

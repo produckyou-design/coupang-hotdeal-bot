@@ -530,3 +530,71 @@ test("runDailyMaintenance self-heals webhook & watchdog handles 3x dispatch fail
     globalThis.fetch = origFetch;
   }
 });
+
+test("reportCmd places daily performance summary at the very bottom", async () => {
+  const db = createMockD1();
+  db.store.channel_meta.set("member_count", "50");
+  const tgCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : {};
+    tgCalls.push({ u, body });
+    if (u.includes("/reports/commission")) {
+      return new Response(
+        JSON.stringify({
+          rCode: "0",
+          data: [
+            { date: "20261126", subId: "tgarca", click: 5, order: 1, cancel: 0, gmv: 10000, commission: 300 },
+            { date: "20261127", subId: "tgclien", click: 8, order: 2, cancel: 0, gmv: 45000, commission: 1350 },
+          ],
+        }),
+        { status: 200 }
+      );
+    }
+    if (u.includes("/reports/orders")) {
+      return new Response(
+        JSON.stringify({
+          rCode: "0",
+          data: [{ date: "20261127", subId: "tgclien", productName: "코멧 생수", quantity: 2, gmv: 45000, commission: 1350 }],
+        }),
+        { status: 200 }
+      );
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 801 } }), { status: 200 });
+  };
+
+  try {
+    const env = {
+      DB: db,
+      TELEGRAM_BOT_TOKEN: "123:test",
+      TELEGRAM_ADMIN_CHAT_ID: "999001",
+      TELEGRAM_WEBHOOK_SECRET: "sec",
+      COUPANG_ACCESS_KEY: "ak",
+      COUPANG_SECRET_KEY: "sk",
+    };
+    const req = new Request("https://hotpang-click.example.workers.dev/telegram/webhook", {
+      method: "POST",
+      headers: { "X-Telegram-Bot-Api-Secret-Token": "sec", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        update_id: 99,
+        message: { message_id: 1, chat: { id: 999001, type: "private" }, from: { id: 999001 }, text: "/report" },
+      }),
+    });
+    const res = await worker.fetch(req, env);
+    assert.equal(res.status, 200);
+    const editCall = tgCalls.find((c) => c.u.endsWith("/editMessageText"));
+    assert.ok(editCall);
+    const txt = editCall.body.text;
+    const idxMonth = txt.indexOf("월 누적");
+    const idxChan = txt.indexOf("채널별 분리 집계");
+    const idxOrders = txt.indexOf("[최근 7일 주문 품목]");
+    const idxNote = txt.indexOf("※");
+    const idxDaily = txt.indexOf("최근 확정일 실적 (2026.11.27)");
+    assert.ok(idxMonth >= 0 && idxChan > idxMonth && idxOrders > idxChan && idxNote > idxOrders);
+    assert.ok(idxDaily > idxNote, `expected daily section at bottom, got:\n${txt}`);
+    assert.match(txt.slice(idxDaily), /구독자 <b>50명<\/b>/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

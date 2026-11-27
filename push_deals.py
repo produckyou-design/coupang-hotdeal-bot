@@ -4719,10 +4719,13 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         m_gmv = m_tot["gmv"]
         m_comm = m_tot["commission"]
 
-        # 2. 최근 확정일 집계 (D+1~D+2 지연 반영된 가장 최신 날짜)
+        # 2. 최근 확정일 집계 (D+1~D+2 지연 반영된 가장 최신 날짜 -> 리포트 최하단 배치)
         latest_date = stats["latest_date"]
+        daily_lines: List[str] = []
         if latest_date:
             l_tot = stats["latest_total"]
+            l_tg = stats["latest_telegram"]
+            l_pw = stats["latest_poliwiki"]
             l_clicks = l_tot["clicks"]
             l_orders = l_tot["orders"]
             l_cancels = l_tot["cancels"]
@@ -4730,18 +4733,23 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             l_comm = l_tot["commission"]
             l_fmt = f"{latest_date[:4]}.{latest_date[4:6]}.{latest_date[6:8]}" if len(latest_date) == 8 else latest_date
 
+            daily_lines.extend([
+                f"📌 <b>최근 확정일 실적 ({l_fmt})</b>",
+                f"• 클릭/주문/취소: <b>{l_clicks:,}회</b> / <b>{l_orders:,}건</b> / {l_cancels:,}건",
+                f"• 결제액 / 확정 수익: <b>{l_gmv:,}원</b> / <b>{l_comm:,}원</b>",
+            ])
+            if (l_tg["clicks"] + l_tg["orders"] + l_pw["clicks"] + l_pw["orders"]) > 0:
+                daily_lines.append(
+                    f"• ✈️ 텔레그램: {l_tg['orders']:,}건 (수익 {l_tg['commission']:,}원) · 🌐 폴리위키: {l_pw['orders']:,}건 (수익 {l_pw['commission']:,}원)"
+                )
             matched_prods = [str(it.get("productName") or "")[:28] for it in order_items if str(it.get("date") or "") == latest_date and it.get("productName")]
-            prod_note = f"\n• <b>주문 품목</b>: {esc(', '.join(matched_prods[:3]))}" if matched_prods else ""
-            latest_block = (
-                f"📌 <b>최근 확정일 ({l_fmt})</b>\n"
-                f"• 클릭/주문/취소: <b>{l_clicks:,}회</b> / <b>{l_orders:,}건</b> / {l_cancels:,}건\n"
-                f"• 결제 금액: <b>{l_gmv:,}원</b>\n"
-                f"• 확정 수익: <b>{l_comm:,}원</b>{prod_note}\n\n"
-            )
+            if matched_prods:
+                daily_lines.append(f"• <b>주문 품목</b>: {esc(', '.join(matched_prods[:3]))}")
         else:
-            latest_block = "📌 <b>최근 확정일</b>: 집계된 내역 없음\n\n"
+            daily_lines.append("📌 <b>최근 확정일 실적</b>: 집계된 내역 없음")
 
         channel_split_block = format_channel_split_block(stats, f"채널별 분리 집계 ({now.month}월 누적)")
+        click_stats = None
         click_stats_block = ""
         try:
             click_stats = fetch_click_stats(days=7, limit=5)
@@ -4750,26 +4758,37 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
         except Exception as cs_err:
             logger.warning(f"실시간 클릭 통계 조회 생략: {cs_err}")
 
-        member_block = ""
+        live_parts: List[str] = []
+        if click_stats and isinstance(click_stats.get("today"), dict):
+            td = click_stats["today"]
+            live_parts.append(
+                f"⚡ 오늘 실시간 클릭({now.month}/{now.day}): <b>{int(td.get('clicks', 0) or 0):,}회</b> "
+                f"(상품 {int(td.get('unique_links', 0) or 0):,}개)"
+            )
         try:
             m_info = fetch_channel_member_stats()
-            m_line = format_member_stats_line(m_info)
-            if m_line:
-                member_block = f"\n\n{m_line}"
+            m_cnt = int((m_info or {}).get("count", 0) or 0)
+            if m_cnt > 0:
+                m_net = int((m_info or {}).get("today_net", 0) or 0)
+                m_net_str = f"+{m_net:,}명" if m_net > 0 else (f"{m_net:,}명" if m_net < 0 else "변동 없음")
+                live_parts.append(f"👥 구독자 <b>{m_cnt:,}명</b> (오늘 {m_net_str})")
         except Exception:
             pass
+        if live_parts:
+            daily_lines.append(f"• {' · '.join(live_parts)}")
+        daily_bottom_block = "━━━━━━━━━━━━━━━━━━\n" + "\n".join(daily_lines)
 
         report_msg = (
             f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
             f"📅 리포트 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
-            f"{latest_block}"
             f"🗓️ <b>{now.month}월 누적 ({now.month}/1 ~ {now.month}/{now.day})</b>\n"
             f"• 총 클릭 수: <b>{m_clicks:,}회</b>\n"
             f"• 총 주문 / 취소: <b>{m_orders:,}건</b> / {m_cancels:,}건\n"
             f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
             f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
-            f"{channel_split_block}{click_stats_block}{member_block}\n\n"
-            f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>"
+            f"{channel_split_block}{click_stats_block}\n\n"
+            f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>\n\n"
+            f"{daily_bottom_block}"
         )
 
         target_channel = REPORT_CHANNEL_ID or ADMIN_CHAT_ID
