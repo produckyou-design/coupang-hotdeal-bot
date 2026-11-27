@@ -1,1 +1,27 @@
-[]
+[
+  {
+    "deal_id": "arca_190438892",
+    "product_id": "7473901049",
+    "option_key": "pid:7473901049:vid:5464495424",
+    "source": "arca",
+    "track": "B",
+    "category": "food",
+    "evidence_badge": "단가·반응 검증",
+    "evidence_note": "1L당 5,400원 · 반응 확인",
+    "clean_title": "솔리몬 스퀴즈드 레몬즙, 1L, 1개",
+    "short_title": "솔리몬 스퀴즈드 레몬즙",
+    "orig_price": 0,
+    "sale_price": 5400,
+    "discount_rate": 0,
+    "unit_info": "1L당 5,400원",
+    "reaction_text": "",
+    "shipping_fee": 0,
+    "shipping_type": "free",
+    "shipping_condition": "",
+    "shipping_label": "무료배송",
+    "chip": "1L당 5,400원 · 1개",
+    "deeplink": "https://link.coupang.com/a/i0GZRg9iTI",
+    "img_url": "https://ac.arca.live/20261127sac/c3766021e90159bc6802869fb79a643df8170e03accb488254543679d032b121.jpg?expires=1795751236&key=J9zn3ipUOIq7KI1A9i6HSA",
+    "queued_at": 1795747640
+  }
+]
