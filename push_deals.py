@@ -172,6 +172,19 @@ _DOMAIN_STRIP_RE = re.compile(
     r"\b[a-zA-Z0-9.-]+\.(?:com|co\.kr|kr|live|me|gl|ly)(?:/\S*)?",
     re.IGNORECASE,
 )
+_LAUGH_CRY_SPAM_RE = re.compile(r"[ㅋㅎㅠㅜㄷㅇ~!?.,\s]+")
+_TRAILING_CHATTER_RE = re.compile(r"(?:[ㅋㅎㅠㅜ]{2,}|\.{3,}|!{2,})\s*$")
+_BODY_PREFIX_LABEL_RE = re.compile(
+    r"^(?:상품명|가격|할인가|정상가|배송비|배송|링크|구매\s*링크|상품\s*링크|쇼핑몰|옵션|비고|설명|후기|리뷰)\s*[:：\-]\s*",
+    re.IGNORECASE,
+)
+_QUESTION_MARKER_RE = re.compile(
+    r"\?|(?:어떰|어때요|어때|괜찮나요|괜찮을까요|인가요|할까요|맞나요|알려주|궁금|뭐야|뭐임|있나요|있을까요|되나요|될까요|추천점|추천좀)(?:\s|$|[.!])"
+)
+_PRICE_SPEC_ONLY_RE = re.compile(
+    r"^(?:[\d,]+\s*원(?:\s*[/·~]\s*(?:무배|무료배송|유료배송|배송비[\s\d,]*원?|개당[\s\d,]*원?))?|(?:무료배송|무배|와우\s*무료배송|로켓배송|카드할인|쿠폰적용))$",
+    re.IGNORECASE,
+)
 
 _REACTION_BOILERPLATE_TOKENS = (
     "등록된 댓글이 없습니다",
@@ -180,22 +193,48 @@ _REACTION_BOILERPLATE_TOKENS = (
     "로그인 후",
     "업자신고",
     "이 글을 보지 않았다면",
+    "할인은 놓쳐도",
 )
 _REACTION_PROFANITY_TOKENS = (
     "시발", "씨발", "ㅅㅂ", "ㅆㅂ", "병신", "ㅂㅅ", "미친", "ㅁㅊ",
     "개새", "존나", "ㅈㄴ", "지랄", "꺼져", "새끼", "좆", "닥쳐", "ㅗ",
+    "거유", "섹스", "야동", "딸치", "변태",
 )
 _REACTION_NEGATIVE_OR_NOISE_TOKENS = (
     "비싸", "비싼", "안싸", "안 싼", "안삼", "거름", "거르",
     "품절", "끝났", "종료", "마감", "업자", "바이럴", "광고",
     "쿠파스", "파트너스", "수수료", "링크", "로켓아니", "로켓 아니",
     "별로", "노맛", "최악", "취소", "환불", "사기", "낚시", "정가", "불매",
+    "쿠팡 아웃", "쿠팡아웃", "의견 다름", "의견다름", "다른의견", "다른 의견",
+    "비추", "역바이럴", "알리", "테무", "중국산", "짝퉁",
+    "버리는 용도", "버리는용도", "쓰다 버리", "쓰다가 버리",
+    "싼데 비싸", "맛없", "호불호", "글쎄", "고민 중", "고민중",
+    "애매", "굳이", "창렬", "호구", "에바", "사악",
+    "안 먹", "안먹", "안 사", "안사", "못 먹겠", "못먹겠",
+    "불호", "실망", "망가졌", "당근하면", "되팔", "미안해지", "인간이 미안",
 )
-_REACTION_POSITIVE_TOKENS = (
-    "싸", "저렴", "가성비", "최저가", "역대", "꿀딜", "대란",
-    "혜자", "괜찮", "강추", "무조건", "구매", "주문", "쟁여",
-    "쟁임", "득템", "단가", "만원", "개당",
+
+# 가치/가격 메리트 신호 (+4점, 최대 +8점)
+_REACTION_VALUE_TOKENS = (
+    "역대", "최저가", "꿀딜", "대란", "혜자", "가성비", "메리트",
+    "저렴", "많이 내렸", "내려갔", "싸졌", "싼편", "싼듯", "싸네", "싸다",
+    "개당", "한봉", "봉당", "병당", "포당", "팩당", "단가", "만원",
+    "쟁여", "쟁임", "재구매", "또 샀", "또샀", "또삼",
+    "결국 구매", "바로 구매", "구매했", "주문했", "샀네", "샀습", "사뒀",
+    "무조건", "강추", "득템",
 )
+
+# 맛/품질/사용감/활용팁 신호 (+3점, 최대 +6점)
+_REACTION_EXPERIENCE_TOKENS = (
+    "맛있", "맛나", "달달", "고소", "부드럽", "푹신", "향기", "향좋", "향 좋",
+    "잘 먹", "잘먹", "잘 챙겨", "먹기 좋", "먹기 괜찮", "쓰기 좋", "잘 쓰", "잘쓰",
+    "만족", "괜찮", "원픽", "최애", "goat", "고트", "애용", "추천",
+    "섞으면", "레모네이드", "실온", "튼튼", "편하", "부담 없", "부담없",
+    "필수", "좋더라", "좋네요", "좋아요", "좋음", "좋았", "도움", "유용", "깔끔",
+)
+
+# 하위 호환을 위한 긍정 토큰 합집합
+_REACTION_POSITIVE_TOKENS = _REACTION_VALUE_TOKENS + _REACTION_EXPERIENCE_TOKENS
 
 
 def _collect_comment_texts(soup: Any, selector: str, limit: int = 15) -> List[str]:
@@ -218,11 +257,20 @@ def _clean_reaction_candidate(text: str) -> str:
     s = _URL_STRIP_RE.sub("", str(text or ""))
     s = _DOMAIN_STRIP_RE.sub("", s)
     s = _COMMENT_EXPAND_TRAIL_RE.sub("", s)
+    s = _BODY_PREFIX_LABEL_RE.sub("", s)
+    s = _TRAILING_CHATTER_RE.sub("", s)
     return " ".join(s.split()).strip(" /·|-")
 
 
 def _is_safe_reaction_candidate(text: str) -> bool:
-    if len(text) < 6:
+    if len(text) < 6 or len(text) > 120:
+        return False
+    if _QUESTION_MARKER_RE.search(text):
+        return False
+    if _PRICE_SPEC_ONLY_RE.match(text):
+        return False
+    stripped_chatter = _LAUGH_CRY_SPAM_RE.sub("", text)
+    if len(stripped_chatter) < 5:
         return False
     low = text.lower()
     if any(tok in low for tok in _REACTION_BOILERPLATE_TOKENS):
@@ -240,18 +288,75 @@ def _truncate_reaction_quote(text: str, max_len: int) -> str:
     return text
 
 
+def _extract_body_reaction_candidates(body_text: str, limit: int = 12) -> List[str]:
+    """작성자 본문에서 URL·가격표·단순 메타 줄을 걸러낸 추천 한줄 후보 분리"""
+    if not body_text:
+        return []
+    out: List[str] = []
+    seen_ln: Set[str] = set()
+    for raw_line in str(body_text).splitlines():
+        chunks = re.split(r"(?<=[.!])\s+", raw_line.strip())
+        for chunk in chunks:
+            cleaned = _clean_reaction_candidate(chunk)
+            if not cleaned or cleaned in seen_ln:
+                continue
+            if not _is_safe_reaction_candidate(cleaned):
+                continue
+            seen_ln.add(cleaned)
+            out.append(cleaned)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _score_reaction_candidate(text: str, *, is_comment: bool = True) -> int:
+    """안전·가치·사용경험 기반 한줄평 점수화 (신호 미달 0점 반환)"""
+    if not _is_safe_reaction_candidate(text):
+        return 0
+    low = text.lower()
+    val_hits = sum(1 for kw in _REACTION_VALUE_TOKENS if kw in low)
+    exp_hits = sum(1 for kw in _REACTION_EXPERIENCE_TOKENS if kw in low)
+    signal_score = min(8, val_hits * 4) + min(6, exp_hits * 3)
+    if signal_score < 3:
+        return 0
+
+    src_bonus = 2 if is_comment else 1
+    if 10 <= len(text) <= 44:
+        len_bonus = 2
+    elif 6 <= len(text) < 10 or 44 < len(text) <= 70:
+        len_bonus = 1
+    else:
+        len_bonus = -1
+    return signal_score + src_bonus + len_bonus
+
+
 def extract_best_reaction_quote(
     comment_texts: List[str],
     fallback_reaction: str = "",
     max_len: int = 34,
+    body_text: str = "",
 ) -> str:
-    """안전·긍정 필터를 통과한 가장 설득력 있는 커뮤니티 한줄 반응 추출"""
-    for raw in comment_texts or []:
+    """댓글 + 글쓴이 추천 본문에서 노이즈를 거른 최고 점수의 커뮤니티 반응 1줄 추출"""
+    best_text = ""
+    best_score = 0
+
+    for idx, raw in enumerate(comment_texts or []):
         cleaned = _clean_reaction_candidate(raw)
-        if not _is_safe_reaction_candidate(cleaned):
-            continue
-        if any(kw in cleaned for kw in _REACTION_POSITIVE_TOKENS):
-            return _truncate_reaction_quote(cleaned, max_len)
+        sc = _score_reaction_candidate(cleaned, is_comment=True)
+        if sc > best_score:
+            best_score = sc
+            best_text = cleaned
+            if sc >= 12 and idx < 3 and len(cleaned) <= max_len:
+                break
+
+    for raw in _extract_body_reaction_candidates(body_text, limit=12):
+        sc = _score_reaction_candidate(raw, is_comment=False)
+        if sc > best_score:
+            best_score = sc
+            best_text = raw
+
+    if best_text:
+        return _truncate_reaction_quote(best_text, max_len)
 
     fb = _clean_reaction_candidate(fallback_reaction)
     if _is_safe_reaction_candidate(fb):
@@ -1653,34 +1758,14 @@ def parse_pricing_details(title: str, body: str, ocr_text: str = "", extra_shipp
         if raw_unit:
             unit_info = raw_unit.replace("• <b>단가계산</b>: ", "").replace("\n", "").strip()
 
-    # 커뮤니티 반응 (URL/쿠파스 링크, 테이블 헤더, 단순 감상평 원천 배제)
-    community_reactions: List[str] = []
-    for line in body.splitlines():
-        # 줄 내부에 포함된 모든 URL 및 도메인 주소 완전 제거
-        ln = re.sub(r"https?://\S+", "", line)
-        ln = re.sub(r"www\.\S+", "", ln)
-        ln = re.sub(r"\b[a-zA-Z0-9.-]+\.(?:com|co\.kr|kr|live|me|gl|ly)(?:/\S*)?", "", ln, flags=re.IGNORECASE)
-        ln = re.sub(r"(?:구매\s*링크|상품\s*링크|링크)\s*[:：\-]?\s*$", "", ln).strip()
-        if not ln or len(ln) < 5:
-            continue
-        if any(
-            bad in ln.lower()
-            for bad in [
-                "맛있", "맛나", "좋네", "샀습", "추천합", "감사", "양도 많고",
-                "구매링크", "상품링크", "링크", "쇼핑몰", "쿠파스", "파트너스", "수수료", "일정액",
-                "coupang", "unsafelink", "http",
-            ]
-        ):
-            continue
-        if any(kw in ln for kw in ["최저가", "역대", "마트", "당근", "가성비", "단가", "품절", "싼듯", "저렴"]):
-            community_reactions.append(ln)
-
-    reaction_text = ""
-    if community_reactions:
-        combined = " / ".join(community_reactions[:2])
-        if len(combined) > 70:
-            combined = combined[:67] + "..."
-        reaction_text = combined
+    # 커뮤니티 반응 (본문 추천 문장 중 스코어링·노이즈 필터 통과 후보 추출)
+    scored_body: List[Tuple[int, str]] = []
+    for cand in _extract_body_reaction_candidates(body, limit=12):
+        sc = _score_reaction_candidate(cand, is_comment=False)
+        if sc > 0:
+            scored_body.append((sc, cand))
+    scored_body.sort(key=lambda x: x[0], reverse=True)
+    reaction_text = _truncate_reaction_quote(scored_body[0][1], 67) if scored_body else ""
 
     return {
         "orig_price": orig_price,
@@ -2015,6 +2100,52 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
     return deals
 
 
+def _fetch_ppomppu_comments(
+    post_no: str,
+    referer_url: str,
+    limit: int = 15,
+) -> List[str]:
+    """뽐뿌 게시글 AJAX(comment.php)에서 실제 댓글 텍스트 목록 추출 (실패 시 빈 목록 반환)"""
+    if not post_no:
+        return []
+    try:
+        res = requests.get(
+            "https://www.ppomppu.co.kr/zboard/comment.php",
+            params={
+                "id": "ppomppu",
+                "no": str(post_no),
+                "c_page": 1,
+                "comment_mode": "sort_desc",
+                "cmd": "get_comment_json",
+            },
+            headers={**HEADERS, "Referer": referer_url},
+            timeout=5,
+        )
+        if res.status_code != 200:
+            return []
+        data = res.json()
+        rows = data.get("comments") or []
+        out: List[str] = []
+        seen_txt: Set[str] = set()
+        for c in rows:
+            if not isinstance(c, dict) or c.get("is_accuse"):
+                continue
+            raw_html = str(c.get("memo") or "").strip()
+            if not raw_html:
+                continue
+            txt = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
+            txt = " ".join(txt.replace("\xa0", " ").split()).strip()
+            if not txt or txt in seen_txt:
+                continue
+            seen_txt.add(txt)
+            out.append(txt)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
+
+
 def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         time.sleep(0.25)
@@ -2067,12 +2198,21 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
         )
         photo_url = content_imgs[0] if content_imgs else (thumb_candidates[0] if thumb_candidates else None)
 
+        m_no = re.search(r"no=(\d+)", url)
+        cmt_cnt_m = re.search(r"var\s+G_CMT_CNT\s*=\s*(\d+)", res.text)
+        has_cmts = True if (not cmt_cnt_m or int(cmt_cnt_m.group(1)) > 0) else False
+        ppom_comments = (
+            _fetch_ppomppu_comments(m_no.group(1), url, limit=15)
+            if (m_no and has_cmts)
+            else []
+        )
+
         return {
             "coupang_url": cp_url,
             "body_text": body_text,
             "img_url": photo_url,
             "ocr_img_urls": content_imgs[:2],
-            "comment_texts": [],
+            "comment_texts": ppom_comments,
         }
     except requests.Timeout as e:
         logger.warning(f"⏳ 뽐뿌 상세 타임아웃 ({url}): {e}")
@@ -3279,6 +3419,8 @@ def process_deal(
     reaction_quote = extract_best_reaction_quote(
         detail.get("comment_texts") or [],
         fallback_reaction=str(p_info.get("reaction_text") or ""),
+        max_len=40,
+        body_text=body_text,
     )
 
     # 전단지 큐 모드: 검증 완료 즉시 큐에 적재하고 중복 방지를 위해 seen 기록

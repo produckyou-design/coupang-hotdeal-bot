@@ -1107,6 +1107,86 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertEqual(len(kb_e), 3)
         self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 저녁]</b>", cap_e)
 
+    def test_ppomppu_comments_writer_body_and_smart_reaction_filter(self):
+        import flyer_renderer
+        from unittest.mock import MagicMock
+
+        # 1) 뽐뿌 상세 + comment.php JSON 댓글 수집 (is_accuse 제외, HTML 태그 제거)
+        ppom_html = """
+        <html><body>
+          <script>var G_CMT_CNT = 3;</script>
+          <td class="board-contents">재질도 부드럽고 푹신하더라구요. 가격 메리트 있어서 재구매합니다.<br>https://www.coupang.com/vp/products/752343</td>
+        </body></html>
+        """
+        ppom_cmt_json = {
+            "comments": [
+                {"is_accuse": 1, "memo": "<p>신고된 댓글</p>"},
+                {"is_accuse": 0, "memo": "<p>쿠팡 아웃</p>"},
+                {"is_accuse": 0, "memo": "<p>재구매했는데&nbsp;단가 저렴하고 좋네요</p>"},
+            ]
+        }
+
+        def fake_get(url, **_kwargs):
+            if "comment.php" in url:
+                res = MagicMock(status_code=200)
+                res.json.return_value = ppom_cmt_json
+                return res
+            res = MagicMock(status_code=200, text=ppom_html)
+            return res
+
+        with patch.object(push_deals.requests, "get", side_effect=fake_get):
+            d_pp = push_deals.parse_ppomppu_detail("https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no=752343")
+        self.assertEqual(d_pp["comment_texts"], ["쿠팡 아웃", "재구매했는데 단가 저렴하고 좋네요"])
+        q_pp = push_deals.extract_best_reaction_quote(d_pp["comment_texts"], body_text=d_pp["body_text"], max_len=40)
+        self.assertEqual(q_pp, "재구매했는데 단가 저렴하고 좋네요")
+
+        # 2) 글쓴이 추천 본문 추출 (댓글이 비어있거나 밈/잡담뿐일 때 작성자 추천의 글이 채택되어야 함)
+        q_body = push_deals.extract_best_reaction_quote(
+            ["병아리에게 미안해지는구나...", "이거 어때요?", "ㅋㅋㅋ"],
+            body_text="정제알약 잘 못먹는 사람들이 먹기 괜찮음\n가격 괜찮은 듯",
+            max_len=40,
+        )
+        self.assertEqual(q_body, "정제알약 잘 못먹는 사람들이 먹기 괜찮음")
+
+        # 3) 되팔이/반쿠팡/부정/질문/잡담 필터 검증 -> 신호 없으면 빈 문자열
+        q_noise = push_deals.extract_best_reaction_quote(
+            [
+                "쿠팡은 다른의견",
+                "의견 다름",
+                "쓰다가 버리는 용도인감 가격은 겁나 싸네",
+                "쌈? 맛있음?",
+                "오곡 코코볼",
+            ],
+            body_text="필요는 없는데 당근하면 20은 받지 않을까해서",
+            max_len=40,
+        )
+        self.assertEqual(q_noise, "")
+
+        # 4) 4건 전단지 묶음 캡션에서도 커뮤니티 반응 한줄평이 최대한 보존되는지 확인
+        base_item = {
+            "source": "ppomppu",
+            "orig_price": 30000,
+            "sale_price": 19900,
+            "discount_rate": 34,
+            "unit_info": "100g당 500원",
+            "shipping_label": "로켓 무료배송",
+            "votes": 4,
+            "comments": 7,
+            "reaction_text": "가성비 좋고 맛있어서 쟁여둡니다",
+        }
+        batch4 = [
+            {
+                **base_item,
+                "clean_title": f"프리미엄 닭가슴살 스테이크 소포장 {i}호 1kg",
+                "short_title": f"닭가슴살 {i}호",
+                "deeplink": f"https://link.coupang.com/a/d{i}",
+            }
+            for i in range(1, 5)
+        ]
+        cap4, _ = flyer_renderer.format_flyer_caption_and_buttons(batch4)
+        self.assertLessEqual(len(cap4), 1020)
+        self.assertIn("가성비 좋고 맛있어서 쟁여둡니다", cap4)
+
 
 if __name__ == "__main__":
     unittest.main()

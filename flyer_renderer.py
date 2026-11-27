@@ -1089,7 +1089,7 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     return buf.getvalue()
 
 
-def _build_community_line(d: Dict[str, Any], quote_cap: int = 34) -> str:
+def _build_community_line(d: Dict[str, Any], quote_cap: int = 38) -> str:
     """출처·추천·댓글 및 한줄 반응을 캡션용 1줄 문자열로 구성 (0건 통계는 출처만 명확히 표기)"""
     if _is_goldbox_deal(d):
         return ""
@@ -1125,7 +1125,7 @@ def _build_community_line(d: Dict[str, Any], quote_cap: int = 34) -> str:
     return ""
 
 
-def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, max_quote_len: int = 34) -> str:
+def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, max_quote_len: int = 38) -> str:
     n = len(batch)
     has_half = any(is_half_off_mega(d) for d in batch)
     has_vip = any(is_high_ticket_mega(d) for d in batch)
@@ -1243,7 +1243,7 @@ def format_flyer_caption_and_buttons(
     """텔레그램 sendPhoto용 1,024자 안전 캡션과 번호별 초록(success) CTA 버튼 생성"""
     batch = deals[:4]
     caption = ""
-    for title_cap, quote_cap in ((60, 34), (48, 24), (40, 0), (28, 0), (18, 0), (12, 0)):
+    for title_cap, quote_cap in ((60, 38), (50, 32), (42, 26), (34, 22), (28, 18), (24, 0), (16, 0), (12, 0)):
         caption = _build_caption_with_limit(batch, title_cap, max_quote_len=quote_cap)
         if len(caption) <= 980:
             break
