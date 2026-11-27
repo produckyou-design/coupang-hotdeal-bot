@@ -5,7 +5,8 @@ import html
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -166,6 +167,135 @@ def format_click_stats_telegram(stats: Dict[str, Any], top_n: int = 5) -> str:
             )
 
     return "\n".join(lines)
+
+
+def normalize_alert_keyword(keyword: str) -> str:
+    """알림 키워드 정규화(공백 제거 + 소문자)."""
+    return re.sub(r"\s+", "", str(keyword or "").strip()).lower()
+
+
+def list_keyword_alerts(
+    chat_id: Optional[Any] = None,
+    timeout: float = 5.0,
+) -> Optional[List[Dict[str, Any]]]:
+    """등록된 맞춤 키워드 알림 목록 조회 (chat_id 생략 시 전체 구독자 목록)."""
+    if not is_click_tracker_enabled():
+        return None
+    base_url, api_key = _get_tracker_config()
+    params = {"chat_id": str(chat_id)} if chat_id is not None and str(chat_id).strip() else None
+    try:
+        res = requests.get(
+            f"{base_url}/api/alerts",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params=params,
+            timeout=timeout,
+        )
+        if res.status_code != 200:
+            logger.warning(f"키워드 알림 조회 HTTP {res.status_code}")
+            return None
+        data = res.json()
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("alerts"), list):
+            return data["alerts"]
+    except Exception as e:
+        logger.warning(f"키워드 알림 조회 실패: {e}")
+    return None
+
+
+def add_keyword_alert(
+    chat_id: Any,
+    keyword: str,
+    timeout: float = 5.0,
+) -> Tuple[bool, str]:
+    """구독자 맞춤 키워드 등록 후 (성공 여부, 안내 문구) 반환."""
+    kw = " ".join(str(keyword or "").strip().split())
+    kw_norm = normalize_alert_keyword(kw)
+    if len(kw) < 2 or len(kw) > 24 or len(kw_norm) < 2:
+        return False, "키워드는 2~24자로 입력해 주세요."
+    if not is_click_tracker_enabled():
+        return False, "알림 서버가 아직 설정되지 않았습니다."
+
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.post(
+            f"{base_url}/api/alerts",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"chat_id": str(chat_id), "keyword": kw},
+            timeout=timeout,
+        )
+        data = res.json() if res.content else {}
+        if res.status_code == 200 and data.get("ok"):
+            saved_kw = str(data.get("keyword") or kw)
+            if data.get("already_exists"):
+                return True, f"이미 등록된 키워드예요: '{saved_kw}'"
+            return True, f"알림 등록 완료: '{saved_kw}' ({int(data.get('count', 1) or 1)}/10)"
+        err_code = str(data.get("error") or "")
+        if err_code == "limit_exceeded":
+            return False, "키워드는 최대 10개까지 등록할 수 있어요. 기존 키워드를 지운 뒤 다시 등록해 주세요."
+        if err_code == "invalid_keyword":
+            return False, "키워드는 2~24자로 입력해 주세요."
+        logger.warning(f"키워드 알림 등록 HTTP {res.status_code}: {err_code}")
+    except Exception as e:
+        logger.warning(f"키워드 알림 등록 실패: {e}")
+    return False, "일시적인 오류로 등록하지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+
+def remove_keyword_alert(
+    chat_id: Any,
+    keyword: str = "",
+    remove_all: bool = False,
+    timeout: float = 5.0,
+) -> bool:
+    """구독자 맞춤 키워드 단건 또는 전체 삭제."""
+    if not is_click_tracker_enabled():
+        return False
+    base_url, api_key = _get_tracker_config()
+    params: Dict[str, str] = {"chat_id": str(chat_id)}
+    if remove_all:
+        params["all"] = "1"
+    else:
+        kw_norm = normalize_alert_keyword(keyword)
+        if not kw_norm:
+            return False
+        params["keyword"] = kw_norm
+    try:
+        res = requests.delete(
+            f"{base_url}/api/alerts",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params=params,
+            timeout=timeout,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            return bool(isinstance(data, dict) and data.get("ok"))
+        logger.warning(f"키워드 알림 삭제 HTTP {res.status_code}")
+    except Exception as e:
+        logger.warning(f"키워드 알림 삭제 실패: {e}")
+    return False
+
+
+def match_alerts_for_title(
+    title: str,
+    alerts: Optional[List[Dict[str, Any]]],
+) -> Dict[str, List[str]]:
+    """상품 제목과 매칭되는 구독자별 키워드 목록 {chat_id: [keyword, ...]} 반환."""
+    title_norm = normalize_alert_keyword(title)
+    if not title_norm or not alerts:
+        return {}
+    matched: Dict[str, List[str]] = {}
+    for row in alerts:
+        cid = str(row.get("chat_id") or "").strip()
+        kw = str(row.get("keyword") or "").strip()
+        kw_norm = str(row.get("keyword_norm") or normalize_alert_keyword(kw)).strip()
+        if not cid or not kw_norm or len(kw_norm) < 2:
+            continue
+        if kw_norm in title_norm:
+            bucket = matched.setdefault(cid, [])
+            if kw not in bucket:
+                bucket.append(kw)
+    return matched
 
 
 def main() -> int:

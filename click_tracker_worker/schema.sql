@@ -22,7 +22,18 @@ CREATE TABLE IF NOT EXISTS clicks (
   ua_short TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS keyword_alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  keyword TEXT NOT NULL,
+  keyword_norm TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(chat_id, keyword_norm)
+);
+
 CREATE INDEX IF NOT EXISTS idx_links_deal_id ON links(deal_id);
 CREATE INDEX IF NOT EXISTS idx_links_created ON links(created_at);
 CREATE INDEX IF NOT EXISTS idx_clicks_code ON clicks(code);
 CREATE INDEX IF NOT EXISTS idx_clicks_kst_date ON clicks(kst_date);
+CREATE INDEX IF NOT EXISTS idx_keyword_alerts_chat ON keyword_alerts(chat_id);
+CREATE INDEX IF NOT EXISTS idx_keyword_alerts_norm ON keyword_alerts(keyword_norm);

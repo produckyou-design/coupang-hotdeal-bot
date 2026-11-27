@@ -33,6 +33,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 from click_tracker import (
     fetch_click_stats,
     format_click_stats_telegram,
+    list_keyword_alerts,
+    match_alerts_for_title,
     register_tracked_link,
 )
 from coupang_api import (
@@ -99,7 +101,7 @@ LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한, 전단지 배치 및 24시간 전단지 송출 설정 (KST)
-ENABLE_GOLDBOX = True
+ENABLE_GOLDBOX = False
 ENABLE_QUIET_HOURS = False
 DAILY_MAX_COMMUNITY_DEALS = 200
 GOLDBOX_PER_SLOT = 4
@@ -2833,6 +2835,69 @@ def _can_reenter_recent_product(
     return False, 0.0
 
 
+def _format_mega_log_tag(item: Dict[str, Any]) -> str:
+    disc = int(item.get("discount_rate", 0) or 0)
+    if is_half_off_mega(item):
+        if disc >= 70:
+            return "70%+ 대폭 할인"
+        if disc >= 60:
+            return "반값 이상"
+        return "반값 할인"
+    return "100만+ 고가"
+
+
+def notify_keyword_subscribers(
+    item: Dict[str, Any],
+    alerts: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """등록된 구독자 맞춤 키워드와 매칭되면 개인 DM으로 즉시 알림 발송 (실패 시 격리)."""
+    if alerts is None or not alerts:
+        return 0
+    clean_title = str(item.get("clean_title") or "").strip()
+    deeplink = str(item.get("deeplink") or "").strip()
+    if not clean_title or not deeplink:
+        return 0
+
+    matched = match_alerts_for_title(clean_title, alerts)
+    if not matched:
+        return 0
+
+    sale_p = int(item.get("sale_price", 0) or 0)
+    orig_p = int(item.get("orig_price", 0) or 0)
+    disc_r = int(item.get("discount_rate", 0) or 0)
+    ship_lbl = str(item.get("shipping_label") or "").strip()
+    src_kr = get_source_label(str(item.get("source") or ""))
+    price_str = f"<b>{sale_p:,}원</b>" if sale_p >= 1000 else "<b>가격 확인</b>"
+    orig_part = f"<s>{orig_p:,}원</s> → " if (orig_p > sale_p >= 1000 and disc_r >= 3) else ""
+    rate_part = f"<b>{disc_r}%↓</b> " if disc_r > 0 else ""
+    ship_part = f" · {esc(ship_lbl)}" if ship_lbl else ""
+    btn_text = f"🛒 {sale_p:,}원 바로가기 ↗" if sale_p >= 1000 else "🛒 쿠팡 바로가기 ↗"
+
+    sent_cnt = 0
+    for chat_id, kws in matched.items():
+        kw_str = ", ".join(kws[:3])
+        dm_text = (
+            f"🔔 <b>[키워드 알림: {esc(kw_str)}]</b>\n\n"
+            f"📌 <b>{esc(clean_title)}</b>\n"
+            f"💵 {rate_part}{orig_part}{price_str}{ship_part} ({esc(src_kr)})\n\n"
+            f"<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>"
+        )
+        try:
+            if send_telegram(
+                chat_id=chat_id,
+                text=dm_text,
+                button_text=btn_text,
+                button_url=deeplink,
+                button_style="success",
+            ):
+                sent_cnt += 1
+        except Exception as e:
+            logger.warning(f"키워드 알림 DM 실패 (chat={chat_id}): {e}")
+    if sent_cnt > 0:
+        logger.info(f"🔔 [키워드 알림] {clean_title[:30]} -> {sent_cnt}명 DM 발송")
+    return sent_cnt
+
+
 def process_deal(
     d: Dict[str, Any],
     detail_parser,
@@ -2842,6 +2907,7 @@ def process_deal(
     quota: Optional[Dict[str, Any]] = None,
     run_stats: Optional[Dict[str, int]] = None,
     ocr_cache: Optional[Dict[str, Any]] = None,
+    alerts_cache: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
@@ -3131,15 +3197,16 @@ def process_deal(
                         save_post_quota(quota)
                     if run_stats is not None:
                         run_stats["sent"] = run_stats.get("sent", 0) + 1
-                    tag = "반값 특가" if is_half_off_mega(item) else "100만+ 고가"
+                    tag = _format_mega_log_tag(item)
                     logger.info(
                         f"🚨 [{source_name}] {tag} 단독 리치전단지 즉시 송출 완료: {clean_title} "
                         f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
                     )
+                    notify_keyword_subscribers(item, alerts=alerts_cache)
                     time.sleep(2)
                     return True
             except Exception as e:
-                logger.warning(f"초특가 단독 전단지 즉시 송출 실패 (큐 폴백): {e}")
+                logger.warning(f"대형 할인 단독 전단지 즉시 송출 실패 (큐 폴백): {e}")
 
         flyer_queue.append(item)
         seen.add(deal_id)
@@ -3154,12 +3221,13 @@ def process_deal(
             f"📥 [{source_name}/Track{track}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
             f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
         )
+        notify_keyword_subscribers(item, alerts=alerts_cache)
         return True
 
     p_info["reaction_text"] = reaction_quote
     msg = format_deal_message(clean_title, p_info, deal_url=deeplink)
     btn_price = p_info["final_price"]
-    btn_text = f"🛒 쿠팡에서 {btn_price:,}원에 구매하기 ↗" if btn_price >= 1000 else "🛒 쿠팡 특가 바로가기 ↗"
+    btn_text = f"🛒 쿠팡에서 {btn_price:,}원에 구매하기 ↗" if btn_price >= 1000 else "🛒 쿠팡에서 보기 ↗"
 
     ok = send_telegram(
         chat_id=CHANNEL_ID,
@@ -3179,6 +3247,18 @@ def process_deal(
         logger.info(
             f"✅ [{source_name}/Track{track}] 송출 완료: {clean_title} "
             f"(정가={p_info['orig_price']:,}원, 특가={p_info['final_price']:,}원, 할인율={p_info['discount_rate']}%)"
+        )
+        notify_keyword_subscribers(
+            {
+                "clean_title": clean_title,
+                "orig_price": int(p_info["orig_price"]),
+                "sale_price": int(p_info["final_price"]),
+                "discount_rate": int(p_info["discount_rate"]),
+                "shipping_label": str(p_info.get("shipping_label") or ""),
+                "source": source_name,
+                "deeplink": deeplink,
+            },
+            alerts=alerts_cache,
         )
         time.sleep(2)
         return True
@@ -3439,7 +3519,7 @@ def run_goldbox_staggered(
             sale_price=p_price,
             discount_rate=0,
         )
-        evidence_note = f"{unit_short} · 오늘 자정 마감" if unit_short else "쿠팡 공식 오늘의 특가 · 자정 마감"
+        evidence_note = f"{unit_short} · 오늘 자정 마감" if unit_short else "오늘 자정 마감"
 
         flyer_items.append({
             "deal_id": f"goldbox_{today_str}_{prod_id}",
@@ -3448,7 +3528,7 @@ def run_goldbox_staggered(
             "track": "G",
             "slot_label": slot_label,
             "category": classify_deal_category(clean_title, ""),
-            "evidence_badge": "골드박스 특가",
+            "evidence_badge": "골드박스",
             "evidence_note": evidence_note,
             "clean_title": clean_title,
             "short_title": shorten_card_title(clean_title),
@@ -3842,6 +3922,7 @@ def main():
                 _drop_ocr_cache_entry(ocr_cache, post_id)
         save_seen(seen)
         logger.info(f"🧹 [대기열 정리] 만료된 대기 딜 {len(expired_waits)}건 seen 영구 제외 및 정리 완료")
+    alerts_cache = list_keyword_alerts() or []
     run_stats = {"queued": 0, "sent": 0}
 
     def _remaining_daily_room() -> int:
@@ -3921,6 +4002,7 @@ def main():
                         quota=quota,
                         run_stats=run_stats,
                         ocr_cache=ocr_cache,
+                        alerts_cache=alerts_cache,
                     )
                     processed_one = True
                 if price_db.get_source_cooldown(src):

@@ -11,6 +11,12 @@ const BOT_UA_RE =
 
 const MOBILE_UA_RE = /android|iphone|ipad|ipod|mobile/i;
 const CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const CHAT_ID_RE = /^-?\d{3,20}$/;
+const MAX_KEYWORDS_PER_USER = 10;
+
+export function normalizeAlertKeyword(raw) {
+  return String(raw || "").trim().replace(/\s+/g, "").toLowerCase();
+}
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -331,6 +337,124 @@ async function handleStats(request, env, url) {
   });
 }
 
+async function handleGetAlerts(request, env, url) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const chatId = String(url.searchParams.get("chat_id") || "").trim();
+  if (chatId) {
+    if (!CHAT_ID_RE.test(chatId)) {
+      return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
+    }
+    const res = await env.DB.prepare(
+      "SELECT id, chat_id, keyword, keyword_norm, created_at FROM keyword_alerts WHERE chat_id = ? ORDER BY id ASC LIMIT ?"
+    )
+      .bind(chatId, MAX_KEYWORDS_PER_USER)
+      .all();
+    return jsonResponse({ ok: true, alerts: res?.results || [] });
+  }
+  const res = await env.DB.prepare(
+    "SELECT id, chat_id, keyword, keyword_norm, created_at FROM keyword_alerts ORDER BY id ASC LIMIT 2000"
+  ).all();
+  return jsonResponse({ ok: true, alerts: res?.results || [] });
+}
+
+async function handleCreateAlert(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const chatId = String(body?.chat_id ?? "").trim();
+  if (!CHAT_ID_RE.test(chatId)) {
+    return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
+  }
+  const keyword = String(body?.keyword || "").trim().replace(/\s+/g, " ");
+  const keywordNorm = normalizeAlertKeyword(keyword);
+  if (keyword.length < 2 || keyword.length > 24 || keywordNorm.length < 2) {
+    return jsonResponse({ ok: false, error: "invalid_keyword" }, 400);
+  }
+
+  const existing = await env.DB.prepare(
+    "SELECT keyword FROM keyword_alerts WHERE chat_id = ? AND keyword_norm = ? LIMIT 1"
+  )
+    .bind(chatId, keywordNorm)
+    .first();
+  if (existing && existing.keyword) {
+    const cntRow = await env.DB.prepare(
+      "SELECT COUNT(*) AS cnt FROM keyword_alerts WHERE chat_id = ?"
+    )
+      .bind(chatId)
+      .first();
+    return jsonResponse({
+      ok: true,
+      keyword: existing.keyword,
+      keyword_norm: keywordNorm,
+      count: Number(cntRow?.cnt || 1),
+      already_exists: true,
+    });
+  }
+
+  const cntRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS cnt FROM keyword_alerts WHERE chat_id = ?"
+  )
+    .bind(chatId)
+    .first();
+  const currentCnt = Number(cntRow?.cnt || 0);
+  if (currentCnt >= MAX_KEYWORDS_PER_USER) {
+    return jsonResponse(
+      { ok: false, error: "limit_exceeded", max_keywords: MAX_KEYWORDS_PER_USER },
+      400
+    );
+  }
+
+  const createdAt = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO keyword_alerts (chat_id, keyword, keyword_norm, created_at) VALUES (?, ?, ?, ?)"
+  )
+    .bind(chatId, keyword, keywordNorm, createdAt)
+    .run();
+
+  return jsonResponse({
+    ok: true,
+    keyword,
+    keyword_norm: keywordNorm,
+    count: currentCnt + 1,
+    already_exists: false,
+  });
+}
+
+async function handleDeleteAlert(request, env, url) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const chatId = String(url.searchParams.get("chat_id") || "").trim();
+  if (!CHAT_ID_RE.test(chatId)) {
+    return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
+  }
+  const delAll = url.searchParams.get("all") === "1";
+  if (delAll) {
+    const info = await env.DB.prepare("DELETE FROM keyword_alerts WHERE chat_id = ?")
+      .bind(chatId)
+      .run();
+    return jsonResponse({ ok: true, deleted: Number(info?.meta?.changes ?? 0) });
+  }
+  const keywordNorm = normalizeAlertKeyword(url.searchParams.get("keyword") || "");
+  if (!keywordNorm) {
+    return jsonResponse({ ok: false, error: "invalid_keyword" }, 400);
+  }
+  const info = await env.DB.prepare(
+    "DELETE FROM keyword_alerts WHERE chat_id = ? AND keyword_norm = ?"
+  )
+    .bind(chatId, keywordNorm)
+    .run();
+  return jsonResponse({ ok: true, deleted: Number(info?.meta?.changes ?? 0) });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -345,6 +469,11 @@ export default {
     }
     if (method === "GET" && path === "/api/stats") {
       return handleStats(request, env, url);
+    }
+    if (path === "/api/alerts") {
+      if (method === "GET") return handleGetAlerts(request, env, url);
+      if (method === "POST") return handleCreateAlert(request, env);
+      if (method === "DELETE") return handleDeleteAlert(request, env, url);
     }
     if ((method === "GET" || method === "HEAD") && path.startsWith("/r/")) {
       const code = path.slice(3).split("/")[0];

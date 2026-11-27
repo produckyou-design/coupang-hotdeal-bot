@@ -278,6 +278,97 @@ class ClickTrackerTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_keyword_alerts_client_matcher_notifier_and_guide(self):
+        import pin_channel_guide
+
+        os.environ["CLICK_TRACKER_BASE_URL"] = "https://hotpang-click.example.workers.dev"
+        os.environ["CLICK_TRACKER_API_KEY"] = "secret-key"
+
+        ok_add = MagicMock(status_code=200, content=b"{}")
+        ok_add.json.return_value = {"ok": True, "keyword": "삼다수", "count": 1, "already_exists": False}
+        with patch.object(click_tracker.requests, "post", return_value=ok_add):
+            ok, msg = click_tracker.add_keyword_alert(7525598874, "삼다수")
+        self.assertTrue(ok)
+        self.assertIn("삼다수", msg)
+
+        ok_lim = MagicMock(status_code=400, content=b"{}")
+        ok_lim.json.return_value = {"ok": False, "error": "limit_exceeded", "max_keywords": 10}
+        with patch.object(click_tracker.requests, "post", return_value=ok_lim):
+            ok2, msg2 = click_tracker.add_keyword_alert(7525598874, "생수")
+        self.assertFalse(ok2)
+        self.assertIn("10개", msg2)
+
+        alerts_rows = [
+            {"chat_id": "1001", "keyword": "생수", "keyword_norm": "생수"},
+            {"chat_id": "1001", "keyword": "삼다수", "keyword_norm": "삼다수"},
+            {"chat_id": "1002", "keyword": "에어팟", "keyword_norm": "에어팟"},
+        ]
+        ok_list = MagicMock(status_code=200)
+        ok_list.json.return_value = {"ok": True, "alerts": alerts_rows}
+        with patch.object(click_tracker.requests, "get", return_value=ok_list):
+            got_list = click_tracker.list_keyword_alerts()
+        self.assertEqual(len(got_list), 3)
+
+        ok_del = MagicMock(status_code=200)
+        ok_del.json.return_value = {"ok": True, "deleted": 1}
+        with patch.object(click_tracker.requests, "delete", return_value=ok_del):
+            self.assertTrue(click_tracker.remove_keyword_alert(1001, "삼다수"))
+
+        # 유저 1001은 생수+삼다수 모두 매칭돼도 DM 1통으로 묶여야 함
+        matched = click_tracker.match_alerts_for_title("제주 삼다수 생수 2L 12병", alerts_rows)
+        self.assertEqual(matched, {"1001": ["생수", "삼다수"]})
+
+        sample_item = {
+            "clean_title": "제주 삼다수 생수 2L 12병",
+            "orig_price": 15000,
+            "sale_price": 10500,
+            "discount_rate": 30,
+            "shipping_label": "로켓 무료배송",
+            "source": "arca",
+            "deeplink": "https://hotpang-click.example.workers.dev/r/Abc123",
+        }
+        with patch.object(push_deals, "send_telegram", return_value=True) as mock_send:
+            dm_cnt = push_deals.notify_keyword_subscribers(sample_item, alerts=alerts_rows)
+        self.assertEqual(dm_cnt, 1)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args.kwargs["chat_id"], "1001")
+        self.assertIn("생수, 삼다수", mock_send.call_args.kwargs["text"])
+        self.assertIn("10,500원", mock_send.call_args.kwargs["text"])
+
+        guide_text, guide_btns = pin_channel_guide.build_guide_payload()
+        self.assertIn("200% 활용 가이드", guide_text)
+        flat_urls = [b["url"] for row in guide_btns for b in row]
+        self.assertIn("https://t.me/coupang_deal_hub_bot?start=alert", flat_urls)
+        self.assertIn("https://t.me/coupang_deal_hub_bot?start=compare", flat_urls)
+        self.assertIn("https://t.me/coupang_deal_hub_bot?start=water", flat_urls)
+
+        try:
+            import bot
+        except Exception as exc:
+            self.skipTest(f"bot module unavailable: {exc}")
+        if not hasattr(bot, "alert_menu"):
+            self.skipTest("bot.alert_menu not present")
+
+        async def _run_bot_alert():
+            msg_mock = SimpleNamespace(reply_text=AsyncMock())
+            upd = SimpleNamespace(
+                effective_chat=SimpleNamespace(type="private", id=1001),
+                effective_user=SimpleNamespace(id=1001),
+                effective_message=msg_mock,
+                callback_query=None,
+            )
+            ctx = SimpleNamespace(user_data={})
+            with (
+                patch.object(bot, "is_click_tracker_enabled", return_value=True),
+                patch.object(bot, "list_keyword_alerts", return_value=[{"keyword": "삼다수", "keyword_norm": "삼다수"}]),
+            ):
+                await bot.alert_menu(upd, ctx)
+            sent = msg_mock.reply_text.await_args.args[0]
+            self.assertIn("맞춤 키워드 알림 (1/10개)", sent)
+            self.assertIn("삼다수", sent)
+
+        asyncio.run(_run_bot_alert())
+
 
 if __name__ == "__main__":
     unittest.main()

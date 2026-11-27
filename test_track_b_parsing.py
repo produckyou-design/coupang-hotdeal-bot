@@ -797,10 +797,10 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertIn("아카라이브 추천 6 · 댓글 12", item["evidence_note"])
         self.assertEqual(item["reaction_text"], "이거 달달고소해서 맛있더라 가격 괜찮네")
 
-        # 5) 캡션 출처·추천·댓글·반응 표기 + 0건 숨김 + 4건 길이 제한 + 전단지 렌더링 검증
+        # 5) 캡션 출처·추천·댓글·반응 표기 + 0건 출처 표기 + 할인율 구간별 문구 + 4건 길이 제한 + 전단지 렌더링 검증
         cap_b2, _ = flyer_renderer.format_flyer_caption_and_buttons([item])
         self.assertIn("[아카라이브 인기]", cap_b2)
-        self.assertIn("💬 아카라이브 추천 6 · 댓글 12 — \"이거 달달고소해서 맛있더라 가격 괜찮네\"", cap_b2)
+        self.assertIn('💬 커뮤니티 반응 (아카라이브 · 추천 6 · 댓글 12): "이거 달달고소해서 맛있더라 가격 괜찮네"', cap_b2)
 
         track_a_zero = {
             "clean_title": "QCY 무선 오픈형 이어폰 블루투스",
@@ -817,9 +817,25 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             "reaction_text": "",
         }
         cap_a0, _ = flyer_renderer.format_flyer_caption_and_buttons([track_a_zero])
-        self.assertIn("· 아카라이브", cap_a0)
+        self.assertIn("📌 출처: 아카라이브", cap_a0)
         self.assertNotIn("추천 0", cap_a0)
         self.assertNotIn("댓글 0", cap_a0)
+
+        # 78%는 반값 특가가 아니라 대폭 할인으로 표기 확인
+        mega_78 = {**track_a_zero, "orig_price": 25000, "sale_price": 5400, "discount_rate": 78}
+        cap_78, _ = flyer_renderer.format_flyer_caption_and_buttons([mega_78])
+        self.assertIn("78%↓ 대폭 할인", cap_78)
+        self.assertIn("🚨<b>[대폭 할인]</b>", cap_78)
+        self.assertNotIn("반값", cap_78)
+
+        mega_65 = {**track_a_zero, "discount_rate": 65}
+        cap_65, _ = flyer_renderer.format_flyer_caption_and_buttons([mega_65])
+        self.assertIn("65%↓ 반값 이상 할인", cap_65)
+
+        mega_55 = {**track_a_zero, "discount_rate": 55}
+        cap_55, _ = flyer_renderer.format_flyer_caption_and_buttons([mega_55])
+        self.assertIn("55%↓ 반값 할인", cap_55)
+        self.assertNotIn("특가", cap_55)
 
         verbose_batch = [
             {
@@ -840,13 +856,15 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         with patch.object(flyer_renderer, "resolve_clean_product_image", return_value=white_img):
             png_1 = flyer_renderer.render_hotdeal_flyer([item])
             png_2 = flyer_renderer.render_hotdeal_flyer([item, track_a_zero])
+            png_78 = flyer_renderer.render_hotdeal_flyer([mega_78])
         self.assertTrue(png_1.startswith(b"\x89PNG"))
         self.assertTrue(png_2.startswith(b"\x89PNG"))
+        self.assertTrue(png_78.startswith(b"\x89PNG"))
 
     def test_default_min_20_percent_and_track_b2_disabled(self):
         from datetime import datetime, timedelta
 
-        self.assertTrue(push_deals.ENABLE_GOLDBOX)
+        self.assertFalse(push_deals.ENABLE_GOLDBOX)
         self.assertEqual(push_deals.GOLDBOX_PER_SLOT, 4)
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MAX_PRICE, 15_000)
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MIN_RATE, 15)
@@ -1078,15 +1096,16 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         png_m, cap_m, kb_m = sent_calls[0]
         self.assertTrue(png_m.startswith(b"\x89PNG"))
         self.assertEqual(len(kb_m), 4)
-        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 오전 특가]</b>", cap_m)
-        self.assertIn("🍯[골드박스 특가]", cap_m)
+        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 오전]</b>", cap_m)
+        self.assertNotIn("[골드박스 특가]", cap_m)
+        self.assertNotIn("특가", cap_m)
         self.assertNotIn("· 골드박스", cap_m)
         self.assertEqual(cap_m.count("<b>"), cap_m.count("</b>"))
         self.assertTrue(all(src == "goldbox" and trk == "G" for src, trk, _ in registered_sources))
 
         _png_e, cap_e, kb_e = sent_calls[1]
         self.assertEqual(len(kb_e), 3)
-        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 저녁 특가]</b>", cap_e)
+        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 저녁]</b>", cap_e)
 
 
 if __name__ == "__main__":
