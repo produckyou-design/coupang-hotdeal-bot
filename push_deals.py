@@ -128,6 +128,7 @@ SOURCE_403_COOLDOWN_MINUTES = 120
 PRICE_DROP_REENTRY_PCT = 5.0
 
 ENABLE_TRACK_B2_NO_ORIG_FOOD = False  # 정가 미확인(할인율 0%) 식품 단가·반응 단독 송출 비활성화
+ENABLE_COMMUNITY_HOT_NO_ORIG = True  # 정가 미표기라도 커뮤니티 추천·댓글 검증 + 가치신호 확인 시 인기딜 송출
 
 CATEGORY_MIN_DISCOUNT_MAP = {
     "food": 20,
@@ -138,6 +139,8 @@ CATEGORY_MIN_DISCOUNT_MAP = {
 HIGH_TICKET_MIN_ORIG_PRICE = 300_000
 IT_HIGH_SAVINGS_MIN_RATE = 12
 IT_HIGH_SAVINGS_MIN_WON = 50000
+HIGH_TICKET_LARGE_SAVE_MIN_WON = 100_000
+HIGH_TICKET_LARGE_SAVE_MIN_RATE = 10
 LOW_PRICE_BAIT_MAX_PRICE = 15_000
 LOW_PRICE_BAIT_MIN_RATE = 15
 LOW_PRICE_BAIT_CATEGORIES = ("food", "living")
@@ -365,6 +368,7 @@ def extract_best_reaction_quote(
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
 MIN_HOTDEAL_DISCOUNT_RATE = 20
+AUTO_PASS_DISCOUNT_RATE = 30
 STRONG_HOTDEAL_DISCOUNT_RATE = 40
 
 PROMO_SKIP_KEYWORDS = [
@@ -2788,6 +2792,29 @@ def _has_track_b_food_reaction(
     return False
 
 
+def _has_community_hot_reaction(
+    d: Dict[str, Any],
+    source_name: str,
+) -> bool:
+    """정가 미표기 딜의 커뮤니티 호응도(비추천 차단 + 추천/댓글 합의) 검증"""
+    votes = int(d.get("votes", 0) or 0)
+    downvotes = int(d.get("downvotes", 0) or 0)
+    comments = int(d.get("comments", 0) or 0)
+    if votes < 0:
+        return False
+    if downvotes >= 1 and votes < 5:
+        return False
+    if downvotes >= 2 and not (votes >= 8 and votes >= downvotes * 4):
+        return False
+    if votes >= 5:
+        return True
+    if downvotes == 0 and votes >= 3 and comments >= 6:
+        return True
+    if source_name == "dealbada" and downvotes == 0 and votes >= 4 and comments >= 3:
+        return True
+    return False
+
+
 def evaluate_deal_quality(
     d: Dict[str, Any],
     source_name: str,
@@ -2796,13 +2823,17 @@ def evaluate_deal_quality(
     body_text: str,
     option_key: str = "",
     price_db: Optional[PriceHistoryDB] = None,
+    comment_texts: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     투트랙 + 카테고리별 품질 게이트 평가.
     - Track A: 명시적 정상가 검증 + 기본 전 카테고리 최소 20% 할인
-      (15,000원 이하 식품/생필품 무료·와우배송 미끼 상품은 15%+ 허용, 정가 30만원 이상 고가 상품은 12%+ & 5만원+ 절약 예외 허용)
+      (30%+ 검증 할인은 비추천 가드만 통과하면 추천/댓글 수와 무관하게 즉시 통과,
+       15,000원 이하 식품/생필품 무료·와우배송 미끼 상품은 15%+ 허용,
+       정가 30만원 이상 고가 상품은 12%+ & 5만원+ 절약 또는 10%+ & 10만원+ 절약 예외 허용)
     - Track B1: 정상가 미확인 딜 중 30일 DB 관측(5일+ 중앙값) 대비 20%+ 하락 검증
     - Track B2: ENABLE_TRACK_B2_NO_ORIG_FOOD 활성화 시에만 동작 (기본 False)
+    - Track B3: ENABLE_COMMUNITY_HOT_NO_ORIG 활성화 시 커뮤니티 고호응 + 가치신호 확인 인기딜 통과 ('커뮤니티 반응 높음' 배지)
     반환 dict: {passed, reason, track, category, evidence_badge, evidence_note, baseline_price, observed_disc_rate, effective_unit_display}
     """
     category = classify_deal_category(base_title, body_text)
@@ -2853,10 +2884,9 @@ def evaluate_deal_quality(
     if orig_p > final_p >= 1000:
         min_rate = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
         save_amt = orig_p - final_p
-        high_ticket_save = (
-            orig_p >= HIGH_TICKET_MIN_ORIG_PRICE
-            and save_amt >= IT_HIGH_SAVINGS_MIN_WON
-            and disc_rate >= IT_HIGH_SAVINGS_MIN_RATE
+        high_ticket_save = orig_p >= HIGH_TICKET_MIN_ORIG_PRICE and (
+            (save_amt >= IT_HIGH_SAVINGS_MIN_WON and disc_rate >= IT_HIGH_SAVINGS_MIN_RATE)
+            or (save_amt >= HIGH_TICKET_LARGE_SAVE_MIN_WON and disc_rate >= HIGH_TICKET_LARGE_SAVE_MIN_RATE)
         )
         low_price_bait = (
             category in LOW_PRICE_BAIT_CATEGORIES
@@ -2870,6 +2900,9 @@ def evaluate_deal_quality(
             return base_res
 
         if disc_rate >= STRONG_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
+            base_res.update({"passed": True, "reason": "ok", "track": "A"})
+            return base_res
+        if disc_rate >= AUTO_PASS_DISCOUNT_RATE and (downvotes < 2 or votes >= 2):
             base_res.update({"passed": True, "reason": "ok", "track": "A"})
             return base_res
         if (orig_p >= 1_000_000 or final_p >= 1_000_000) and disc_rate >= MIN_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
@@ -2944,6 +2977,48 @@ def evaluate_deal_quality(
             return base_res
         base_res["reason"] = "wait"
         return base_res
+
+    # Track B3: 정가 미표기라도 커뮤니티 추천·댓글 호응이 확실한 인기딜 ('반응 높음' 솔직 표기)
+    if ENABLE_COMMUNITY_HOT_NO_ORIG:
+        if obs_ship_type not in ("free", "paid", "wow_free"):
+            base_res["reason"] = "wait"
+            return base_res
+        if not effective_unit_display and re.search(
+            r"\d+(?:\.\d+)?\s*(?:kg|g|ml|l|개입|개|병|팩|봉|캔|롤|매)\s*[,/]\s*\d+(?:\.\d+)?\s*(?:kg|g|ml|l|개입|개|병|팩|봉|캔|롤|매)",
+            base_title.lower(),
+        ):
+            base_res["reason"] = "wait"
+            return base_res
+        votes_n = int(d.get("votes", 0) or 0)
+        downvotes_n = int(d.get("downvotes", 0) or 0)
+        comments_n = int(d.get("comments", 0) or 0)
+        if _has_community_hot_reaction(d, source_name):
+            has_value_signal = bool(effective_unit_display) or bool(
+                extract_best_reaction_quote(comment_texts or [], body_text=body_text)
+            )
+            if votes_n >= 5 or has_value_signal:
+                src_kr = get_source_label(source_name)
+                stat_parts: List[str] = []
+                if votes_n > 0:
+                    stat_parts.append(f"추천 {votes_n}")
+                if comments_n > 0:
+                    stat_parts.append(f"댓글 {comments_n}")
+                stat_str = " · ".join(stat_parts) if stat_parts else "반응 확인"
+                ship_note = ""
+                if effective_unit_display:
+                    ship_note = f"배송포함 {effective_unit_display}" if ship_fee > 0 else effective_unit_display
+                ev_note = f"{ship_note} · {src_kr} {stat_str}" if ship_note else f"{src_kr} {stat_str}"
+                base_res.update({
+                    "passed": True,
+                    "reason": "ok",
+                    "track": "B",
+                    "evidence_badge": f"{src_kr} 반응 높음",
+                    "evidence_note": ev_note,
+                })
+                return base_res
+        elif downvotes_n == 0 and (votes_n >= 2 or comments_n >= 4):
+            base_res["reason"] = "wait"
+            return base_res
 
     base_res["reason"] = "low_discount"
     return base_res
@@ -3317,6 +3392,7 @@ def process_deal(
         body_text,
         option_key=option_key,
         price_db=price_db,
+        comment_texts=detail.get("comment_texts") or [],
     )
     if (
         eval_res["reason"] != "permanent"

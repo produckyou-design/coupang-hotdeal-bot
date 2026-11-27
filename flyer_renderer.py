@@ -1150,6 +1150,9 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, m
             header = f"🚨 <b>[{disc0}%↓ 반값 할인]</b>"
         elif is_high_ticket_mega(d0):
             header = f"💎 <b>[고가 할인 · {_format_save_kor(save0)}↓]</b>"
+        elif "반응 높음" in str(d0.get("evidence_badge") or "") and disc0 == 0:
+            ev0 = str(d0.get("evidence_badge") or "").strip()
+            header = f"🔥 <b>[{html.escape(ev0, quote=False)} · 쿠팡 인기딜]</b>"
         else:
             header = "🔥 <b>[쿠팡 실시간 핫딜]</b>"
     elif max_rate >= 70:

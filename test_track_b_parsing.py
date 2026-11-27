@@ -62,6 +62,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         votes: int = 5,
         comments: int = 2,
         enable_track_b2: bool = True,
+        source_name: str = "arca",
     ):
         seen = set()
         flyer_queue = []
@@ -97,7 +98,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             ok = push_deals.process_deal(
                 deal,
                 fake_detail,
-                "arca",
+                source_name,
                 seen,
                 flyer_queue=flyer_queue,
                 ocr_cache=ocr_cache,
@@ -869,23 +870,25 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MAX_PRICE, 15_000)
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MIN_RATE, 15)
         self.assertFalse(push_deals.ENABLE_TRACK_B2_NO_ORIG_FOOD)
+        self.assertTrue(push_deals.ENABLE_COMMUNITY_HOT_NO_ORIG)
         self.assertEqual(
             push_deals.CATEGORY_MIN_DISCOUNT_MAP,
             {"food": 20, "living": 20, "it": 20, "general": 20},
         )
         self.assertEqual(push_deals.HIGH_TICKET_MIN_ORIG_PRICE, 300_000)
 
-        # 1) 기본(Track B2 비활성): 정가 없는 식품 딜은 추천이 많아도 송출 제외, 단 관측 DB에는 적재
-        ok_b2, seen_b2, q_b2 = self._run_process_deal(
-            deal_id="arca_b2_disabled_lemon",
-            title="솔리몬 스퀴즈드 레몬즙, 1L, 1개 5,400원",
-            body_text="무료배송",
-            product_id="60001",
-            extra_shipping="무료배송",
-            votes=10,
-            comments=20,
-            enable_track_b2=False,
-        )
+        # 1) 비활성 모드 회귀: 정가 없는 식품 딜은 추천이 많아도 송출 제외, 단 관측 DB에는 적재
+        with patch.object(push_deals, "ENABLE_COMMUNITY_HOT_NO_ORIG", False):
+            ok_b2, seen_b2, q_b2 = self._run_process_deal(
+                deal_id="arca_b2_disabled_lemon",
+                title="솔리몬 스퀴즈드 레몬즙, 1L, 1개 5,400원",
+                body_text="무료배송",
+                product_id="60001",
+                extra_shipping="무료배송",
+                votes=10,
+                comments=20,
+                enable_track_b2=False,
+            )
         self.assertFalse(ok_b2)
         self.assertEqual(len(q_b2), 0)
         self.assertIn("arca_b2_disabled_lemon", seen_b2)
@@ -1186,6 +1189,179 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         cap4, _ = flyer_renderer.format_flyer_caption_and_buttons(batch4)
         self.assertLessEqual(len(cap4), 1020)
         self.assertIn("가성비 좋고 맛있어서 쟁여둡니다", cap4)
+
+    def test_track_a_30_percent_auto_passes_without_votes(self):
+        # 30~39% 정가 검증 할인은 추천/댓글 0이어도 즉시 통과 (비추 가드 유지)
+        for disc, orig, final in ((30, 20000, 14000), (37, 29900, 18700)):
+            with self.subTest(disc=disc):
+                res = push_deals.evaluate_deal_quality(
+                    {"votes": 0, "downvotes": 0, "comments": 0, "hits": 10},
+                    "arca",
+                    {
+                        "orig_price": orig,
+                        "final_price": final,
+                        "discount_rate": disc,
+                        "shipping_fee": 0,
+                        "shipping_type": "free",
+                        "shipping_condition": "",
+                    },
+                    "코카콜라 제로 350ml 24개",
+                    "무료배송",
+                )
+                self.assertTrue(res["passed"])
+                self.assertEqual(res["reason"], "ok")
+                self.assertEqual(res["track"], "A")
+
+        # 비추천 2건 이상 & 추천 0인 35% 딜은 비추 가드로 보류
+        res_dw = push_deals.evaluate_deal_quality(
+            {"votes": 0, "downvotes": 2, "comments": 0, "hits": 10},
+            "arca",
+            {
+                "orig_price": 20000,
+                "final_price": 13000,
+                "discount_rate": 35,
+                "shipping_fee": 0,
+                "shipping_type": "free",
+                "shipping_condition": "",
+            },
+            "테스트 식품 500g",
+            "무료배송",
+        )
+        self.assertFalse(res_dw["passed"])
+        self.assertEqual(res_dw["reason"], "wait")
+
+        # 20~29% 구간은 기존처럼 추천/댓글 없으면 대기, 추천 1+면 통과
+        p25 = {
+            "orig_price": 20000,
+            "final_price": 15000,
+            "discount_rate": 25,
+            "shipping_fee": 0,
+            "shipping_type": "free",
+            "shipping_condition": "",
+        }
+        res_wait = push_deals.evaluate_deal_quality(
+            {"votes": 0, "downvotes": 0, "comments": 0, "hits": 10},
+            "arca",
+            p25,
+            "테스트 생수 2L 12병",
+            "무료배송",
+        )
+        self.assertFalse(res_wait["passed"])
+        self.assertEqual(res_wait["reason"], "wait")
+
+        res_ok = push_deals.evaluate_deal_quality(
+            {"votes": 1, "downvotes": 0, "comments": 0, "hits": 10},
+            "arca",
+            p25,
+            "테스트 생수 2L 12병",
+            "무료배송",
+        )
+        self.assertTrue(res_ok["passed"])
+        self.assertEqual(res_ok["track"], "A")
+
+    def test_high_ticket_100k_10pct_and_community_hot_no_orig(self):
+        import flyer_renderer
+
+        # Option 2: 정가 30만+ & 10만원 이상 절약 & 10%+ (예: 186만 -> 166만, 20만원 절약) 즉시 통과
+        ok_mini, _sm, q_mini = self._run_process_deal(
+            deal_id="ppom_mini_200k",
+            title="HP 2026 옴니 데스크 미니 PC 16GB 512GB",
+            body_text="정가 1,860,000원 -> 특가 1,660,000원 무료배송",
+            product_id="70001",
+            extra_shipping="무료배송",
+            votes=0,
+            comments=0,
+            enable_track_b2=False,
+        )
+        self.assertTrue(ok_mini)
+        self.assertEqual(q_mini[0]["track"], "A")
+        self.assertEqual(q_mini[0]["discount_rate"], 10)
+
+        # 9만원 절약(9%)은 여전히 차단
+        ok_mini_no, _smn, q_mini_no = self._run_process_deal(
+            deal_id="ppom_mini_90k_reject",
+            title="데스크 미니 PC 16GB 256GB",
+            body_text="정가 1,000,000원 -> 특가 910,000원 무료배송",
+            product_id="70002",
+            extra_shipping="무료배송",
+            votes=3,
+            comments=5,
+            enable_track_b2=False,
+        )
+        self.assertFalse(ok_mini_no)
+        self.assertEqual(len(q_mini_no), 0)
+
+        # Option 3: 정가 미표기 + 커뮤니티 반응 높음 + 가치신호 확인 시 '반응 높음' 배지로 송출
+        ok_cable, _sc, q_cable = self._run_process_deal(
+            deal_id="ppom_toocki_hot",
+            title="Toocki PD 60W C타입 고속충전 케이블 1m 5,400원",
+            body_text="이전 할인가 대비 더 할인중이라 확실히 메리트 있습니다. 무료배송",
+            product_id="70003",
+            extra_shipping="무료배송",
+            votes=3,
+            comments=21,
+            enable_track_b2=False,
+            source_name="ppomppu",
+        )
+        self.assertTrue(ok_cable)
+        self.assertEqual(q_cable[0]["track"], "B")
+        self.assertEqual(q_cable[0]["evidence_badge"], "뽐뿌 반응 높음")
+        cap_c, _ = flyer_renderer.format_flyer_caption_and_buttons([q_cable[0]])
+        self.assertIn("[뽐뿌 반응 높음 · 쿠팡 인기딜]", cap_c)
+        self.assertIn("[뽐뿌 반응 높음]", cap_c)
+        self.assertNotIn("특가", cap_c)
+
+        # 루리웹 멀티탭 (추천 3 · 댓글 6 · 본문 가격 인하 코멘트)
+        ok_tab, _st, q_tab = self._run_process_deal(
+            deal_id="ruli_tab_hot",
+            title="브레넨스툴 수퍼솔리드 멀티탭 8구 2.5m 53,000원",
+            body_text="예전에 네이버로 8만원쯤에 산거같은데 많이 내렸음 무료배송",
+            product_id="70004",
+            extra_shipping="무료배송",
+            votes=3,
+            comments=6,
+            enable_track_b2=False,
+            source_name="ruliweb",
+        )
+        self.assertTrue(ok_tab)
+        self.assertEqual(q_tab[0]["evidence_badge"], "루리웹 반응 높음")
+
+        # 가드레일 검증: 비추 포함(downvotes=1), 댓글만 많은 무추천(v=0, c=20), 밈/잡담뿐(v=3, c=6)은 모두 차단
+        p0 = {
+            "orig_price": 0,
+            "final_price": 12000,
+            "discount_rate": 0,
+            "shipping_fee": 0,
+            "shipping_type": "free",
+            "shipping_condition": "",
+        }
+        r_dw = push_deals.evaluate_deal_quality(
+            {"votes": 3, "downvotes": 1, "comments": 10},
+            "arca",
+            p0,
+            "잡다한 전자제품 12,000원",
+            "가성비 좋고 저렴함 무료배송",
+        )
+        self.assertFalse(r_dw["passed"])
+
+        r_c_only = push_deals.evaluate_deal_quality(
+            {"votes": 0, "downvotes": 0, "comments": 20},
+            "ppomppu",
+            p0,
+            "논란 중인 상품 12,000원",
+            "가성비 좋고 저렴함 무료배송",
+        )
+        self.assertFalse(r_c_only["passed"])
+
+        r_meme = push_deals.evaluate_deal_quality(
+            {"votes": 3, "downvotes": 0, "comments": 6},
+            "arca",
+            p0,
+            "특수 굿즈 피규어 12,000원",
+            "오곡 코코볼 무료배송",
+            comment_texts=["ㅇㅇ", "ㅋㅋㅋ"],
+        )
+        self.assertFalse(r_meme["passed"])
 
 
 if __name__ == "__main__":
