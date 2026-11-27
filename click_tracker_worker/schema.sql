@@ -27,8 +27,20 @@ CREATE TABLE IF NOT EXISTS keyword_alerts (
   chat_id TEXT NOT NULL,
   keyword TEXT NOT NULL,
   keyword_norm TEXT NOT NULL,
+  max_price INTEGER DEFAULT 0,
+  min_discount INTEGER DEFAULT 0,
+  exclude_terms TEXT DEFAULT '',
+  hit_count INTEGER DEFAULT 0,
+  last_notified_at TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   UNIQUE(chat_id, keyword_norm)
+);
+
+CREATE TABLE IF NOT EXISTS alert_prefs (
+  chat_id TEXT PRIMARY KEY,
+  paused INTEGER DEFAULT 0,
+  quiet_night INTEGER DEFAULT 1,
+  updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_links_deal_id ON links(deal_id);

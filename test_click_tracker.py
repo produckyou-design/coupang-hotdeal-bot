@@ -369,6 +369,216 @@ class ClickTrackerTests(unittest.TestCase):
 
         asyncio.run(_run_bot_alert())
 
+    def test_smart_keyword_parser_matcher_and_rich_dm(self):
+        # 1) 자연어 조건 파서 검증
+        p1 = click_tracker.parse_alert_input("에어팟 프로 25만원이하 -케이스 -이어팁")
+        self.assertEqual(p1["keyword"], "에어팟 프로")
+        self.assertEqual(p1["max_price"], 250000)
+        self.assertEqual(p1["exclude_terms"], ["케이스", "이어팁"])
+
+        p2 = click_tracker.parse_alert_input("닭가슴살 30%이상 1.5만원 이하")
+        self.assertEqual(p2["keyword"], "닭가슴살")
+        self.assertEqual(p2["min_discount"], 30)
+        self.assertEqual(p2["max_price"], 15000)
+
+        # 모델명 하이픈(-1000XM5)이나 용량(2L)은 조건/제외어로 오인하지 않아야 함
+        p3 = click_tracker.parse_alert_input("소니 WH-1000XM5 35만원이하")
+        self.assertEqual(p3["keyword"], "소니 WH-1000XM5")
+        self.assertEqual(p3["max_price"], 350000)
+        self.assertEqual(p3["exclude_terms"], [])
+
+        p4 = click_tracker.parse_alert_input("삼다수 2L")
+        self.assertEqual(p4["keyword"], "삼다수 2L")
+        self.assertEqual(p4["max_price"], 0)
+
+        # 2) 스마트 매칭 (복합어 AND, 동의어, 단방향 브랜드 격리, 제외어, 가격상한, 일시정지)
+        smart_alerts = [
+            {
+                "id": 11,
+                "chat_id": "2001",
+                "keyword": "에어팟",
+                "keyword_norm": "에어팟",
+                "max_price": 250000,
+                "min_discount": 20,
+                "exclude_terms": "케이스",
+                "paused": 0,
+                "quiet_night": 1,
+            },
+            {
+                "id": 12,
+                "chat_id": "2002",
+                "keyword": "생수",
+                "keyword_norm": "생수",
+                "paused": 0,
+                "quiet_night": 0,
+            },
+            {
+                "id": 13,
+                "chat_id": "2003",
+                "keyword": "백산수",
+                "keyword_norm": "백산수",
+                "paused": 0,
+                "quiet_night": 1,
+            },
+            {
+                "id": 14,
+                "chat_id": "2004",
+                "keyword": "삼다수",
+                "keyword_norm": "삼다수",
+                "paused": 1,
+                "quiet_night": 1,
+            },
+        ]
+        # 영문 AirPods + 가격상한 통과 -> 2001 매칭
+        m1 = click_tracker.match_alerts_for_deal(
+            "Apple AirPods 4 액티브 노이즈 캔슬링", smart_alerts, sale_price=199000, discount_rate=22
+        )
+        self.assertEqual(list(m1.keys()), ["2001"])
+        self.assertEqual(m1["2001"]["alert_ids"], [11])
+
+        # 제외어 '케이스' 포함 -> 2001 제외
+        m2 = click_tracker.match_alerts_for_deal(
+            "에어팟 프로 정품 실리콘 케이스", smart_alerts, sale_price=29000, discount_rate=35
+        )
+        self.assertEqual(m2, {})
+
+        # 가격상한(250,000) 초과 -> 2001 제외
+        m3 = click_tracker.match_alerts_for_deal(
+            "애플 에어팟 프로 2세대", smart_alerts, sale_price=289000, discount_rate=20
+        )
+        self.assertEqual(m3, {})
+
+        # '생수'는 '삼다수' 매칭(O), '백산수'는 '삼다수' 미매칭(X), 일시정지 2004 스킵
+        m4 = click_tracker.match_alerts_for_deal(
+            "제주 삼다수 2L 12병", smart_alerts, sale_price=10500, discount_rate=30
+        )
+        self.assertEqual(list(m4.keys()), ["2002"])
+
+        # 3) 리치 DM 발송 + 사진 + 2단 버튼 + 야간 무음 + 403 자동 정리 + 중복 deal_id 차단
+        alerts_copy = list(smart_alerts)
+        sample_item = {
+            "deal_id": "arca_dm_1",
+            "clean_title": "Apple AirPods 4 노캔",
+            "orig_price": 260000,
+            "sale_price": 199000,
+            "discount_rate": 23,
+            "unit_info": "",
+            "shipping_label": "로켓 무료배송",
+            "reaction_text": "역대가 수준이라 바로 탔습니다",
+            "img_url": "https://thumbnail.coupangcdn.com/sample.jpg",
+            "source": "arca",
+            "deeplink": "https://hotpang-click.example.workers.dev/r/Ap4",
+        }
+        # 403 차단 반환 시 자동 정리 호출 + alerts_copy에서 제거되어야 함
+        sent_ids = set()
+        with (
+            patch.object(push_deals, "send_telegram", return_value=(False, 403, "Forbidden: bot was blocked by the user")) as mock_send,
+            patch.object(push_deals, "remove_keyword_alert", return_value=True) as mock_remove,
+            patch.object(push_deals, "record_alert_hits") as mock_hits,
+        ):
+            cnt = push_deals.notify_keyword_subscribers(sample_item, alerts=alerts_copy, notified_deal_ids=sent_ids)
+        self.assertEqual(cnt, 0)
+        mock_remove.assert_called_once_with("2001", remove_all=True, purge_prefs=True)
+        self.assertNotIn("2001", [r["chat_id"] for r in alerts_copy])
+        mock_hits.assert_not_called()
+        # 동일 deal_id 재호출 시 중복 발송 방지
+        self.assertIn("arca_dm_1", sent_ids)
+        with patch.object(push_deals, "send_telegram") as mock_send2:
+            self.assertEqual(push_deals.notify_keyword_subscribers(sample_item, alerts=smart_alerts, notified_deal_ids=sent_ids), 0)
+            mock_send2.assert_not_called()
+
+        # 정상 발송 시 사진 + 2단 버튼(alert:muteid:12) + hit 기록 검증
+        sample_water = {
+            "deal_id": "ppom_dm_2",
+            "clean_title": "제주 삼다수 2L 12병",
+            "orig_price": 15000,
+            "sale_price": 10500,
+            "discount_rate": 30,
+            "unit_info": "100ml당 44원",
+            "shipping_label": "로켓 무료배송",
+            "reaction_text": "물 떨어졌는데 딱 좋네요",
+            "img_url": "https://thumbnail.coupangcdn.com/water.jpg",
+            "source": "ppomppu",
+            "deeplink": "https://hotpang-click.example.workers.dev/r/Wtr2",
+        }
+        with (
+            patch.object(push_deals, "send_telegram", return_value=(True, 0, "")) as mock_send_ok,
+            patch.object(push_deals, "record_alert_hits", return_value=True) as mock_hits_ok,
+        ):
+            cnt2 = push_deals.notify_keyword_subscribers(sample_water, alerts=smart_alerts, notified_deal_ids=sent_ids)
+        self.assertEqual(cnt2, 1)
+        kw_call = mock_send_ok.call_args.kwargs
+        self.assertEqual(kw_call["photo_url"], "https://thumbnail.coupangcdn.com/water.jpg")
+        self.assertIn("100ml당 44원", kw_call["text"])
+        self.assertIn("물 떨어졌는데 딱 좋네요", kw_call["text"])
+        self.assertEqual(kw_call["inline_keyboard"][1][0]["callback_data"], "alert:muteid:12")
+        self.assertEqual(kw_call["inline_keyboard"][1][1]["callback_data"], "alert:menu")
+        mock_hits_ok.assert_called_once_with([("2002", "생수")])
+
+        # 4) bot.py 스마트 메뉴 및 DM 원클릭 끄기 콜백 검증
+        try:
+            import bot
+        except Exception as exc:
+            self.skipTest(f"bot module unavailable: {exc}")
+
+        async def _run_smart_bot():
+            msg_mock = SimpleNamespace(reply_text=AsyncMock())
+            upd = SimpleNamespace(
+                effective_chat=SimpleNamespace(type="private", id=2001),
+                effective_user=SimpleNamespace(id=2001),
+                effective_message=msg_mock,
+                callback_query=None,
+            )
+            ctx = SimpleNamespace(user_data={})
+            with (
+                patch.object(bot, "is_click_tracker_enabled", return_value=True),
+                patch.object(
+                    bot,
+                    "list_keyword_alerts_with_prefs",
+                    return_value=(
+                        [
+                            {
+                                "id": 11,
+                                "keyword": "에어팟",
+                                "max_price": 250000,
+                                "min_discount": 20,
+                                "exclude_terms": "케이스",
+                                "hit_count": 3,
+                            }
+                        ],
+                        {"paused": 0, "quiet_night": 1},
+                    ),
+                ),
+            ):
+                await bot.alert_menu(upd, ctx)
+            sent_txt = msg_mock.reply_text.await_args.args[0]
+            markup = msg_mock.reply_text.await_args.kwargs["reply_markup"]
+            cb_list = [b.callback_data for row in markup.inline_keyboard for b in row]
+            self.assertIn("25만↓ · 20%↑ · -케이스", sent_txt)
+            self.assertIn("누적 3회", sent_txt)
+            self.assertIn("alert:delid:11", cb_list)
+            self.assertIn("alert:toggle_pause", cb_list)
+            self.assertIn("alert:toggle_quiet", cb_list)
+
+            # DM에서 '🔕 끄기' 콜백 테스트
+            mute_reply = AsyncMock()
+            cb_upd = SimpleNamespace(
+                effective_chat=SimpleNamespace(type="private", id=2001),
+                effective_user=SimpleNamespace(id=2001),
+                effective_message=SimpleNamespace(reply_text=mute_reply),
+                callback_query=SimpleNamespace(
+                    data="alert:muteid:11",
+                    answer=AsyncMock(),
+                    message=None,
+                ),
+            )
+            with patch.object(bot, "remove_keyword_alert", return_value=True) as mock_rm_cb:
+                await bot.alert_callback(cb_upd, ctx)
+            mock_rm_cb.assert_called_once_with(2001, alert_id=11)
+            mute_reply.assert_awaited_once()
+
+        asyncio.run(_run_smart_bot())
+
 
 if __name__ == "__main__":
     unittest.main()

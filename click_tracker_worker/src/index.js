@@ -14,8 +14,119 @@ const CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 const CHAT_ID_RE = /^-?\d{3,20}$/;
 const MAX_KEYWORDS_PER_USER = 10;
 
+const SYMMETRIC_ALIAS_GROUPS = [
+  ["에어팟", "airpods", "airpod"],
+  ["아이폰", "iphone"],
+  ["아이패드", "ipad"],
+  ["맥북", "macbook"],
+  ["애플워치", "applewatch"],
+  ["갤럭시", "galaxy"],
+  ["버즈", "buds"],
+  ["소니", "sony"],
+  ["다이슨", "dyson"],
+  ["로지텍", "logitech"],
+  ["닌텐도", "nintendo"],
+  ["플스", "플레이스테이션", "ps5", "playstation"],
+  ["코카콜라", "cocacola"],
+  ["펩시", "pepsi"],
+  ["스타벅스", "starbucks"],
+  ["네스프레소", "nespresso"],
+  ["나이키", "nike"],
+  ["아디다스", "adidas"],
+  ["뉴발란스", "newbalance"],
+  ["필립스", "philips"],
+  ["브라운", "braun"],
+  ["레고", "lego"],
+  ["샤오미", "xiaomi"],
+  ["앤커", "anker"],
+];
+
+const ONE_WAY_CATEGORY_EXPANSIONS = {
+  생수: ["삼다수", "백산수", "아이시스", "탐사수", "몽베스트", "스파클", "평창수", "에비앙", "동원샘물"],
+  즉석밥: ["햇반", "오뚜기밥", "비비고밥"],
+  물티슈: ["베베숲", "브라운물티슈", "페넬로페", "순둥이", "도담이", "탐사물티슈"],
+  기저귀: ["하기스", "팸퍼스", "마미포코", "보솜이"],
+  화장지: ["휴지", "롤휴지", "두루마리", "크리넥스", "깨끗한나라", "잘풀리는집", "코디"],
+  휴지: ["화장지", "롤휴지", "두루마리", "크리넥스", "깨끗한나라", "잘풀리는집", "코디"],
+  제로콜라: ["코카콜라제로", "펩시제로"],
+  프로틴: ["단백질", "셀렉스", "마이프로틴", "신타6", "옵티멈"],
+  단백질: ["프로틴", "셀렉스", "마이프로틴", "신타6", "옵티멈"],
+};
+
+const TOKEN_VARIANT_MAP = (() => {
+  const map = new Map();
+  for (const group of SYMMETRIC_ALIAS_GROUPS) {
+    const norms = group.map((g) => normalizeAlertKeyword(g)).filter(Boolean);
+    for (const k of norms) {
+      map.set(k, Array.from(new Set([...(map.get(k) || [k]), ...norms])));
+    }
+  }
+  for (const [key, extras] of Object.entries(ONE_WAY_CATEGORY_EXPANSIONS)) {
+    const kNorm = normalizeAlertKeyword(key);
+    const eNorms = extras.map((g) => normalizeAlertKeyword(g)).filter(Boolean);
+    map.set(kNorm, Array.from(new Set([...(map.get(kNorm) || [kNorm]), ...eNorms])));
+  }
+  return map;
+})();
+
 export function normalizeAlertKeyword(raw) {
   return String(raw || "").trim().replace(/\s+/g, "").toLowerCase();
+}
+
+function sanitizeExcludeTerms(raw) {
+  const parts = Array.isArray(raw) ? raw : String(raw || "").split(",");
+  const seen = new Set();
+  const clean = [];
+  for (const p of parts) {
+    const t = String(p || "").trim().replace(/^-+/, "").replace(/\s+/g, " ");
+    const n = normalizeAlertKeyword(t);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    clean.push(t.slice(0, 20));
+    if (clean.length >= 8) break;
+  }
+  return clean.join(", ").slice(0, 120);
+}
+
+export function matchLinkAgainstRule(linkRow, rule) {
+  const titleNorm = normalizeAlertKeyword(linkRow?.title || "");
+  if (!titleNorm) return false;
+  if (Number(rule?.paused || 0) === 1) return false;
+
+  const rawKw = String(rule?.keyword || "").trim();
+  const tokens = (rawKw ? rawKw.split(/\s+/) : [String(rule?.keyword_norm || "")])
+    .map((t) => normalizeAlertKeyword(t))
+    .filter(Boolean);
+  if (tokens.length === 0) return false;
+
+  for (const tok of tokens) {
+    const variants = TOKEN_VARIANT_MAP.get(tok) || [tok];
+    if (!variants.some((v) => titleNorm.includes(v))) {
+      return false;
+    }
+  }
+
+  const exclRaw = String(rule?.exclude_terms || "");
+  if (exclRaw) {
+    const exclList = exclRaw.split(",").map((x) => normalizeAlertKeyword(x)).filter(Boolean);
+    for (const ex of exclList) {
+      if (titleNorm.includes(ex)) return false;
+    }
+  }
+
+  const maxPrice = Number(rule?.max_price || 0);
+  const salePrice = Number(linkRow?.sale_price || 0);
+  if (maxPrice > 0 && (salePrice <= 0 || salePrice > maxPrice)) {
+    return false;
+  }
+
+  const minDisc = Number(rule?.min_discount || 0);
+  const discRate = Number(linkRow?.discount_rate || 0);
+  if (minDisc > 0 && discRate < minDisc) {
+    return false;
+  }
+
+  return true;
 }
 
 function jsonResponse(payload, status = 200) {
@@ -337,6 +448,60 @@ async function handleStats(request, env, url) {
   });
 }
 
+async function readUserPrefs(env, chatId) {
+  const row = await env.DB.prepare(
+    "SELECT paused, quiet_night FROM alert_prefs WHERE chat_id = ? LIMIT 1"
+  )
+    .bind(chatId)
+    .first();
+  return {
+    paused: Number(row?.paused ?? 0) === 1 ? 1 : 0,
+    quiet_night: row ? (Number(row.quiet_night ?? 1) === 1 ? 1 : 0) : 1,
+  };
+}
+
+async function findRecentMatches(env, origin, rules, days = 14, limit = 5) {
+  if (!Array.isArray(rules) || rules.length === 0) return [];
+  const startIso = new Date(Date.now() - days * 86400 * 1000).toISOString();
+  const res = await env.DB.prepare(
+    `SELECT code, title, source, sale_price, discount_rate, created_at
+     FROM links
+     WHERE created_at >= ? AND title != ''
+     ORDER BY created_at DESC
+     LIMIT 150`
+  )
+    .bind(startIso)
+    .all();
+  const rows = res?.results || [];
+  const out = [];
+  const seenCodes = new Set();
+  for (const row of rows) {
+    if (!row?.code || seenCodes.has(row.code)) continue;
+    const matchedKws = [];
+    for (const rule of rules) {
+      if (matchLinkAgainstRule(row, rule)) {
+        const kwLabel = String(rule.keyword || "").trim();
+        if (kwLabel && !matchedKws.includes(kwLabel)) matchedKws.push(kwLabel);
+      }
+    }
+    if (matchedKws.length > 0) {
+      seenCodes.add(row.code);
+      out.push({
+        code: row.code,
+        short_url: `${origin}/r/${row.code}`,
+        title: row.title || "",
+        source: row.source || "",
+        sale_price: Number(row.sale_price || 0),
+        discount_rate: Number(row.discount_rate || 0),
+        created_at: row.created_at || "",
+        matched_keywords: matchedKws,
+      });
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
+
 async function handleGetAlerts(request, env, url) {
   if (!isAuthorized(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
@@ -347,19 +512,45 @@ async function handleGetAlerts(request, env, url) {
       return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
     }
     const res = await env.DB.prepare(
-      "SELECT id, chat_id, keyword, keyword_norm, created_at FROM keyword_alerts WHERE chat_id = ? ORDER BY id ASC LIMIT ?"
+      `SELECT a.id, a.chat_id, a.keyword, a.keyword_norm,
+              COALESCE(a.max_price, 0) AS max_price,
+              COALESCE(a.min_discount, 0) AS min_discount,
+              COALESCE(a.exclude_terms, '') AS exclude_terms,
+              COALESCE(a.hit_count, 0) AS hit_count,
+              COALESCE(a.last_notified_at, '') AS last_notified_at,
+              a.created_at,
+              COALESCE(p.paused, 0) AS paused,
+              COALESCE(p.quiet_night, 1) AS quiet_night
+       FROM keyword_alerts a
+       LEFT JOIN alert_prefs p ON p.chat_id = a.chat_id
+       WHERE a.chat_id = ?
+       ORDER BY a.id ASC
+       LIMIT ?`
     )
       .bind(chatId, MAX_KEYWORDS_PER_USER)
       .all();
-    return jsonResponse({ ok: true, alerts: res?.results || [] });
+    const prefs = await readUserPrefs(env, chatId);
+    return jsonResponse({ ok: true, alerts: res?.results || [], prefs });
   }
   const res = await env.DB.prepare(
-    "SELECT id, chat_id, keyword, keyword_norm, created_at FROM keyword_alerts ORDER BY id ASC LIMIT 2000"
+    `SELECT a.id, a.chat_id, a.keyword, a.keyword_norm,
+            COALESCE(a.max_price, 0) AS max_price,
+            COALESCE(a.min_discount, 0) AS min_discount,
+            COALESCE(a.exclude_terms, '') AS exclude_terms,
+            COALESCE(a.hit_count, 0) AS hit_count,
+            COALESCE(a.last_notified_at, '') AS last_notified_at,
+            a.created_at,
+            COALESCE(p.paused, 0) AS paused,
+            COALESCE(p.quiet_night, 1) AS quiet_night
+     FROM keyword_alerts a
+     LEFT JOIN alert_prefs p ON p.chat_id = a.chat_id
+     ORDER BY a.id ASC
+     LIMIT 2000`
   ).all();
   return jsonResponse({ ok: true, alerts: res?.results || [] });
 }
 
-async function handleCreateAlert(request, env) {
+async function handleCreateAlert(request, env, origin) {
   if (!isAuthorized(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
@@ -379,23 +570,60 @@ async function handleCreateAlert(request, env) {
     return jsonResponse({ ok: false, error: "invalid_keyword" }, 400);
   }
 
+  const maxPrice = clampInt(body?.max_price, 0, 0, 100000000);
+  const minDiscount = clampInt(body?.min_discount, 0, 0, 95);
+  const excludeTerms = sanitizeExcludeTerms(body?.exclude_terms || "");
+
   const existing = await env.DB.prepare(
-    "SELECT keyword FROM keyword_alerts WHERE chat_id = ? AND keyword_norm = ? LIMIT 1"
+    `SELECT id, keyword, COALESCE(max_price, 0) AS max_price,
+            COALESCE(min_discount, 0) AS min_discount,
+            COALESCE(exclude_terms, '') AS exclude_terms
+     FROM keyword_alerts WHERE chat_id = ? AND keyword_norm = ? LIMIT 1`
   )
     .bind(chatId, keywordNorm)
     .first();
+
   if (existing && existing.keyword) {
+    const changed =
+      Number(existing.max_price || 0) !== maxPrice ||
+      Number(existing.min_discount || 0) !== minDiscount ||
+      String(existing.exclude_terms || "") !== excludeTerms ||
+      String(existing.keyword || "") !== keyword;
+    if (changed) {
+      await env.DB.prepare(
+        `UPDATE keyword_alerts
+         SET keyword = ?, max_price = ?, min_discount = ?, exclude_terms = ?
+         WHERE chat_id = ? AND keyword_norm = ?`
+      )
+        .bind(keyword, maxPrice, minDiscount, excludeTerms, chatId, keywordNorm)
+        .run();
+    }
     const cntRow = await env.DB.prepare(
       "SELECT COUNT(*) AS cnt FROM keyword_alerts WHERE chat_id = ?"
     )
       .bind(chatId)
       .first();
+    const ruleObj = {
+      keyword,
+      keyword_norm: keywordNorm,
+      max_price: maxPrice,
+      min_discount: minDiscount,
+      exclude_terms: excludeTerms,
+      paused: 0,
+    };
+    const recentMatches = changed ? await findRecentMatches(env, origin, [ruleObj], 14, 3) : [];
     return jsonResponse({
       ok: true,
-      keyword: existing.keyword,
+      id: Number(existing.id || 0),
+      keyword: changed ? keyword : existing.keyword,
       keyword_norm: keywordNorm,
+      max_price: maxPrice,
+      min_discount: minDiscount,
+      exclude_terms: excludeTerms,
       count: Number(cntRow?.cnt || 1),
       already_exists: true,
+      updated: changed,
+      recent_matches: recentMatches,
     });
   }
 
@@ -413,18 +641,43 @@ async function handleCreateAlert(request, env) {
   }
 
   const createdAt = new Date().toISOString();
-  await env.DB.prepare(
-    "INSERT OR IGNORE INTO keyword_alerts (chat_id, keyword, keyword_norm, created_at) VALUES (?, ?, ?, ?)"
+  const insRes = await env.DB.prepare(
+    `INSERT OR IGNORE INTO keyword_alerts
+      (chat_id, keyword, keyword_norm, max_price, min_discount, exclude_terms, hit_count, last_notified_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, '', ?)`
   )
-    .bind(chatId, keyword, keywordNorm, createdAt)
+    .bind(chatId, keyword, keywordNorm, maxPrice, minDiscount, excludeTerms, createdAt)
     .run();
+
+  const recentMatches = await findRecentMatches(
+    env,
+    origin,
+    [
+      {
+        keyword,
+        keyword_norm: keywordNorm,
+        max_price: maxPrice,
+        min_discount: minDiscount,
+        exclude_terms: excludeTerms,
+        paused: 0,
+      },
+    ],
+    14,
+    3
+  );
 
   return jsonResponse({
     ok: true,
+    id: Number(insRes?.meta?.last_row_id || 0),
     keyword,
     keyword_norm: keywordNorm,
+    max_price: maxPrice,
+    min_discount: minDiscount,
+    exclude_terms: excludeTerms,
     count: currentCnt + 1,
     already_exists: false,
+    updated: false,
+    recent_matches: recentMatches,
   });
 }
 
@@ -441,6 +694,22 @@ async function handleDeleteAlert(request, env, url) {
     const info = await env.DB.prepare("DELETE FROM keyword_alerts WHERE chat_id = ?")
       .bind(chatId)
       .run();
+    if (url.searchParams.get("purge_prefs") === "1") {
+      await env.DB.prepare("DELETE FROM alert_prefs WHERE chat_id = ?").bind(chatId).run();
+    }
+    return jsonResponse({ ok: true, deleted: Number(info?.meta?.changes ?? 0) });
+  }
+  const idParam = url.searchParams.get("id");
+  if (idParam !== null && String(idParam).trim() !== "") {
+    const alertId = clampInt(idParam, 0, 1, 2147483647);
+    if (!alertId) {
+      return jsonResponse({ ok: false, error: "invalid_id" }, 400);
+    }
+    const info = await env.DB.prepare(
+      "DELETE FROM keyword_alerts WHERE chat_id = ? AND id = ?"
+    )
+      .bind(chatId, alertId)
+      .run();
     return jsonResponse({ ok: true, deleted: Number(info?.meta?.changes ?? 0) });
   }
   const keywordNorm = normalizeAlertKeyword(url.searchParams.get("keyword") || "");
@@ -453,6 +722,156 @@ async function handleDeleteAlert(request, env, url) {
     .bind(chatId, keywordNorm)
     .run();
   return jsonResponse({ ok: true, deleted: Number(info?.meta?.changes ?? 0) });
+}
+
+async function handleAlertPrefs(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const chatId = String(body?.chat_id ?? "").trim();
+  if (!CHAT_ID_RE.test(chatId)) {
+    return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
+  }
+  const cur = await readUserPrefs(env, chatId);
+  const paused =
+    body?.paused === undefined ? cur.paused : Number(Boolean(body.paused)) ? 1 : 0;
+  const quietNight =
+    body?.quiet_night === undefined ? cur.quiet_night : Number(Boolean(body.quiet_night)) ? 1 : 0;
+  const updatedAt = new Date().toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO alert_prefs (chat_id, paused, quiet_night, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       paused = excluded.paused,
+       quiet_night = excluded.quiet_night,
+       updated_at = excluded.updated_at`
+  )
+    .bind(chatId, paused, quietNight, updatedAt)
+    .run();
+
+  return jsonResponse({ ok: true, prefs: { paused, quiet_night: quietNight } });
+}
+
+async function handleAlertHits(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const hits = Array.isArray(body?.hits) ? body.hits.slice(0, 100) : [];
+  if (hits.length === 0) {
+    return jsonResponse({ ok: true, updated: 0 });
+  }
+  const nowIso = new Date().toISOString();
+  const stmts = [];
+  for (const h of hits) {
+    const cid = String(h?.chat_id ?? "").trim();
+    const kn = normalizeAlertKeyword(h?.keyword_norm || h?.keyword || "");
+    if (!CHAT_ID_RE.test(cid) || !kn) continue;
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE keyword_alerts
+         SET hit_count = COALESCE(hit_count, 0) + 1, last_notified_at = ?
+         WHERE chat_id = ? AND keyword_norm = ?`
+      ).bind(nowIso, cid, kn)
+    );
+  }
+  if (stmts.length > 0) {
+    await env.DB.batch(stmts);
+  }
+  return jsonResponse({ ok: true, updated: stmts.length });
+}
+
+async function handleRecentAlertMatches(request, env, url) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const days = clampInt(url.searchParams.get("days"), 14, 1, 30);
+  const limit = clampInt(url.searchParams.get("limit"), 5, 1, 10);
+  const chatId = String(url.searchParams.get("chat_id") || "").trim();
+
+  let rules = [];
+  if (chatId) {
+    if (!CHAT_ID_RE.test(chatId)) {
+      return jsonResponse({ ok: false, error: "invalid_chat_id" }, 400);
+    }
+    const res = await env.DB.prepare(
+      `SELECT keyword, keyword_norm,
+              COALESCE(max_price, 0) AS max_price,
+              COALESCE(min_discount, 0) AS min_discount,
+              COALESCE(exclude_terms, '') AS exclude_terms
+       FROM keyword_alerts WHERE chat_id = ? ORDER BY id ASC LIMIT ?`
+    )
+      .bind(chatId, MAX_KEYWORDS_PER_USER)
+      .all();
+    rules = (res?.results || []).map((r) => ({ ...r, paused: 0 }));
+  } else {
+    const kw = String(url.searchParams.get("keyword") || "").trim().replace(/\s+/g, " ");
+    const kn = normalizeAlertKeyword(kw);
+    if (!kn) {
+      return jsonResponse({ ok: false, error: "invalid_keyword" }, 400);
+    }
+    rules = [
+      {
+        keyword: kw,
+        keyword_norm: kn,
+        max_price: clampInt(url.searchParams.get("max_price"), 0, 0, 100000000),
+        min_discount: clampInt(url.searchParams.get("min_discount"), 0, 0, 95),
+        exclude_terms: sanitizeExcludeTerms(url.searchParams.get("exclude_terms") || ""),
+        paused: 0,
+      },
+    ];
+  }
+
+  const matches = await findRecentMatches(env, url.origin, rules, days, limit);
+  return jsonResponse({ ok: true, matches });
+}
+
+async function handleAlertStats(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const summary = await env.DB.prepare(
+    `SELECT COUNT(*) AS total_keywords,
+            COUNT(DISTINCT chat_id) AS total_users,
+            COALESCE(SUM(hit_count), 0) AS total_hits
+     FROM keyword_alerts`
+  ).first();
+  const pausedRow = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT a.chat_id) AS paused_users
+     FROM keyword_alerts a
+     JOIN alert_prefs p ON p.chat_id = a.chat_id
+     WHERE COALESCE(p.paused, 0) = 1`
+  ).first();
+  const topRes = await env.DB.prepare(
+    `SELECT MIN(keyword) AS keyword, keyword_norm,
+            COUNT(DISTINCT chat_id) AS subscribers,
+            COALESCE(SUM(hit_count), 0) AS hits
+     FROM keyword_alerts
+     GROUP BY keyword_norm
+     ORDER BY subscribers DESC, hits DESC, MIN(id) ASC
+     LIMIT 15`
+  ).all();
+
+  return jsonResponse({
+    ok: true,
+    total_users: Number(summary?.total_users || 0),
+    total_keywords: Number(summary?.total_keywords || 0),
+    paused_users: Number(pausedRow?.paused_users || 0),
+    total_hits: Number(summary?.total_hits || 0),
+    top_keywords: topRes?.results || [],
+  });
 }
 
 export default {
@@ -472,8 +891,20 @@ export default {
     }
     if (path === "/api/alerts") {
       if (method === "GET") return handleGetAlerts(request, env, url);
-      if (method === "POST") return handleCreateAlert(request, env);
+      if (method === "POST") return handleCreateAlert(request, env, url.origin);
       if (method === "DELETE") return handleDeleteAlert(request, env, url);
+    }
+    if (method === "POST" && path === "/api/alerts/prefs") {
+      return handleAlertPrefs(request, env);
+    }
+    if (method === "POST" && path === "/api/alerts/hits") {
+      return handleAlertHits(request, env);
+    }
+    if (method === "GET" && path === "/api/alerts/recent") {
+      return handleRecentAlertMatches(request, env, url);
+    }
+    if (method === "GET" && path === "/api/alerts/stats") {
+      return handleAlertStats(request, env);
     }
     if ((method === "GET" || method === "HEAD") && path.startsWith("/r/")) {
       const code = path.slice(3).split("/")[0];

@@ -34,8 +34,11 @@ from click_tracker import (
     fetch_click_stats,
     format_click_stats_telegram,
     list_keyword_alerts,
+    match_alerts_for_deal,
     match_alerts_for_title,
+    record_alert_hits,
     register_tracked_link,
+    remove_keyword_alert,
 )
 from coupang_api import (
     CoupangPartnersAPI,
@@ -1700,12 +1703,19 @@ def send_telegram(
     button_text: Optional[str] = None,
     button_url: Optional[str] = None,
     button_style: Optional[str] = None,
-) -> bool:
+    inline_keyboard: Optional[List[List[Dict[str, Any]]]] = None,
+    disable_notification: bool = False,
+    return_detail: bool = False,
+) -> Any:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "parse_mode": "HTML",
     }
-    if button_text and button_url:
+    if disable_notification:
+        payload["disable_notification"] = True
+    if inline_keyboard:
+        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+    elif button_text and button_url:
         btn: Dict[str, Any] = {"text": button_text, "url": button_url}
         if button_style:
             btn["style"] = button_style
@@ -1723,7 +1733,12 @@ def send_telegram(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", json=p_payload, timeout=10
             ).json()
             if res.get("ok"):
-                return True
+                return (True, 0, "") if return_detail else True
+            err_code = int(res.get("error_code", 0) or 0)
+            err_desc = str(res.get("description") or "")
+            low_desc = err_desc.lower()
+            if err_code == 403 or "blocked" in low_desc or "deactivated" in low_desc or "chat not found" in low_desc:
+                return (False, err_code, err_desc) if return_detail else False
         except Exception as e:
             logger.warning(f"사진 전송 실패, 텍스트 전송으로 자동 전환 ({photo_url[:50]}...): {e}")
 
@@ -1735,10 +1750,13 @@ def send_telegram(
         res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=t_payload, timeout=10
         ).json()
-        return res.get("ok", False)
+        ok = bool(res.get("ok", False))
+        if return_detail:
+            return ok, int(res.get("error_code", 0) or 0), str(res.get("description") or "")
+        return ok
     except Exception as e:
         logger.error(f"텔레그램 메시지 전송 최종 실패: {e}")
-        return False
+        return (False, 0, str(e)) if return_detail else False
 
 
 def send_telegram_photo_bytes(
@@ -2846,11 +2864,28 @@ def _format_mega_log_tag(item: Dict[str, Any]) -> str:
     return "100만+ 고가"
 
 
+def _safe_cb_data(prefix: str, value: str, max_bytes: int = 64) -> str:
+    """Telegram callback_data 64 UTF-8 바이트 제한 안전 절삭."""
+    raw = str(value or "").strip()
+    prefix_bytes = len(prefix.encode("utf-8"))
+    budget = max(1, max_bytes - prefix_bytes)
+    out = []
+    used = 0
+    for ch in raw:
+        ch_b = len(ch.encode("utf-8"))
+        if used + ch_b > budget:
+            break
+        out.append(ch)
+        used += ch_b
+    return prefix + "".join(out)
+
+
 def notify_keyword_subscribers(
     item: Dict[str, Any],
     alerts: Optional[List[Dict[str, Any]]] = None,
+    notified_deal_ids: Optional[Set[str]] = None,
 ) -> int:
-    """등록된 구독자 맞춤 키워드와 매칭되면 개인 DM으로 즉시 알림 발송 (실패 시 격리)."""
+    """등록된 구독자 맞춤 키워드(동의어·가격상한·할인율·제외어 반영) 매칭 시 리치 DM 즉시 발송."""
     if alerts is None or not alerts:
         return 0
     clean_title = str(item.get("clean_title") or "").strip()
@@ -2858,41 +2893,141 @@ def notify_keyword_subscribers(
     if not clean_title or not deeplink:
         return 0
 
-    matched = match_alerts_for_title(clean_title, alerts)
-    if not matched:
+    deal_id = str(item.get("deal_id") or "").strip()
+    if notified_deal_ids is not None and deal_id and deal_id in notified_deal_ids:
         return 0
 
     sale_p = int(item.get("sale_price", 0) or 0)
     orig_p = int(item.get("orig_price", 0) or 0)
     disc_r = int(item.get("discount_rate", 0) or 0)
+
+    matched = match_alerts_for_deal(clean_title, alerts, sale_price=sale_p, discount_rate=disc_r)
+    if not matched:
+        return 0
+
     ship_lbl = str(item.get("shipping_label") or "").strip()
+    unit_info = str(item.get("unit_info") or "").strip()
+    reaction_txt = str(item.get("reaction_text") or "").strip()
+    if len(reaction_txt) > 70:
+        reaction_txt = reaction_txt[:69].rstrip() + "…"
+    raw_img = str(item.get("img_url") or "").strip()
+    img_url = raw_img if raw_img.startswith(("http://", "https://")) else None
     src_kr = get_source_label(str(item.get("source") or ""))
+
     price_str = f"<b>{sale_p:,}원</b>" if sale_p >= 1000 else "<b>가격 확인</b>"
     orig_part = f"<s>{orig_p:,}원</s> → " if (orig_p > sale_p >= 1000 and disc_r >= 3) else ""
     rate_part = f"<b>{disc_r}%↓</b> " if disc_r > 0 else ""
+    unit_part = f" · {esc(unit_info)}" if unit_info else ""
     ship_part = f" · {esc(ship_lbl)}" if ship_lbl else ""
+    src_part = f" ({esc(src_kr)})" if src_kr else ""
     btn_text = f"🛒 {sale_p:,}원 바로가기 ↗" if sale_p >= 1000 else "🛒 쿠팡 바로가기 ↗"
 
+    now_hour = datetime.now(KST).hour
+    is_night = now_hour >= 23 or now_hour < 8
+
     sent_cnt = 0
-    for chat_id, kws in matched.items():
+    sent_hits: List[Tuple[str, str]] = []
+    dead_chat_ids: Set[str] = set()
+
+    for idx, (chat_id, info) in enumerate(matched.items()):
+        kws = list(info.get("keywords") or [])
+        kw_norms = list(info.get("keyword_norms") or [])
+        alert_ids = list(info.get("alert_ids") or [])
+        quiet_night = bool(info.get("quiet_night", True))
+
         kw_str = ", ".join(kws[:3])
+        first_kw = kws[0] if kws else "키워드"
+        first_kw_short = (first_kw[:9] + "…") if len(first_kw) > 10 else first_kw
+        if alert_ids:
+            mute_cb = f"alert:muteid:{alert_ids[0]}"
+        else:
+            mute_cb = _safe_cb_data("alert:mute:", first_kw)
+
+        react_block = f'\n💬 <i>"{esc(reaction_txt)}"</i>' if reaction_txt else ""
         dm_text = (
-            f"🔔 <b>[키워드 알림: {esc(kw_str)}]</b>\n\n"
+            f"⚡ <b>[초고속 키워드 알림: {esc(kw_str)}]</b>\n\n"
             f"📌 <b>{esc(clean_title)}</b>\n"
-            f"💵 {rate_part}{orig_part}{price_str}{ship_part} ({esc(src_kr)})\n\n"
+            f"💵 {rate_part}{orig_part}{price_str}{unit_part}{ship_part}{src_part}"
+            f"{react_block}\n\n"
             f"<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>"
         )
+        inline_kb = [
+            [{"text": btn_text, "url": deeplink, "style": "success"}],
+            [
+                {"text": f"🔕 '{first_kw_short}' 끄기", "callback_data": mute_cb},
+                {"text": "⚙️ 키워드 관리", "callback_data": "alert:menu"},
+            ],
+        ]
+        disable_notif = bool(is_night and quiet_night)
+
         try:
-            if send_telegram(
+            res = send_telegram(
                 chat_id=chat_id,
                 text=dm_text,
-                button_text=btn_text,
-                button_url=deeplink,
-                button_style="success",
-            ):
+                photo_url=img_url,
+                inline_keyboard=inline_kb,
+                disable_notification=disable_notif,
+                return_detail=True,
+            )
+            if isinstance(res, tuple):
+                ok, err_code, err_desc = bool(res[0]), int(res[1] or 0), str(res[2] or "")
+            else:
+                ok, err_code, err_desc = bool(res), 0, ""
+
+            if not ok and err_code == 429:
+                m_wait = re.search(r"retry after (\d+)", err_desc, re.I)
+                wait_s = min(3.0, max(0.5, float(m_wait.group(1)) if m_wait else 1.0))
+                time.sleep(wait_s)
+                res2 = send_telegram(
+                    chat_id=chat_id,
+                    text=dm_text,
+                    photo_url=img_url,
+                    inline_keyboard=inline_kb,
+                    disable_notification=disable_notif,
+                    return_detail=True,
+                )
+                if isinstance(res2, tuple):
+                    ok, err_code, err_desc = bool(res2[0]), int(res2[1] or 0), str(res2[2] or "")
+                else:
+                    ok, err_code, err_desc = bool(res2), 0, ""
+
+            if ok:
                 sent_cnt += 1
+                for kn in kw_norms:
+                    sent_hits.append((chat_id, kn))
+            else:
+                low_err = err_desc.lower()
+                if (
+                    err_code == 403
+                    or "blocked" in low_err
+                    or "deactivated" in low_err
+                    or "chat not found" in low_err
+                ):
+                    dead_chat_ids.add(chat_id)
         except Exception as e:
             logger.warning(f"키워드 알림 DM 실패 (chat={chat_id}): {e}")
+
+        if idx + 1 < len(matched):
+            time.sleep(0.05)
+
+    if dead_chat_ids:
+        for dead_cid in dead_chat_ids:
+            try:
+                remove_keyword_alert(dead_cid, remove_all=True, purge_prefs=True)
+            except Exception:
+                pass
+        alerts[:] = [r for r in alerts if str(r.get("chat_id") or "").strip() not in dead_chat_ids]
+        logger.info(f"🧹 [키워드 알림] 봇 차단/탈퇴 구독자 {len(dead_chat_ids)}명 자동 정리 완료")
+
+    if sent_hits:
+        try:
+            record_alert_hits(sent_hits)
+        except Exception:
+            pass
+
+    if notified_deal_ids is not None and deal_id:
+        notified_deal_ids.add(deal_id)
+
     if sent_cnt > 0:
         logger.info(f"🔔 [키워드 알림] {clean_title[:30]} -> {sent_cnt}명 DM 발송")
     return sent_cnt
@@ -2908,6 +3043,7 @@ def process_deal(
     run_stats: Optional[Dict[str, int]] = None,
     ocr_cache: Optional[Dict[str, Any]] = None,
     alerts_cache: Optional[List[Dict[str, Any]]] = None,
+    notified_deal_ids: Optional[Set[str]] = None,
 ) -> bool:
     deal_id = d["id"]
     if deal_id in seen:
@@ -3202,7 +3338,11 @@ def process_deal(
                         f"🚨 [{source_name}] {tag} 단독 리치전단지 즉시 송출 완료: {clean_title} "
                         f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
                     )
-                    notify_keyword_subscribers(item, alerts=alerts_cache)
+                    notify_keyword_subscribers(
+                        item,
+                        alerts=alerts_cache,
+                        notified_deal_ids=notified_deal_ids,
+                    )
                     time.sleep(2)
                     return True
             except Exception as e:
@@ -3221,7 +3361,11 @@ def process_deal(
             f"📥 [{source_name}/Track{track}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
             f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
         )
-        notify_keyword_subscribers(item, alerts=alerts_cache)
+        notify_keyword_subscribers(
+            item,
+            alerts=alerts_cache,
+            notified_deal_ids=notified_deal_ids,
+        )
         return True
 
     p_info["reaction_text"] = reaction_quote
@@ -3250,15 +3394,20 @@ def process_deal(
         )
         notify_keyword_subscribers(
             {
+                "deal_id": deal_id,
                 "clean_title": clean_title,
                 "orig_price": int(p_info["orig_price"]),
                 "sale_price": int(p_info["final_price"]),
                 "discount_rate": int(p_info["discount_rate"]),
+                "unit_info": display_unit,
                 "shipping_label": str(p_info.get("shipping_label") or ""),
+                "reaction_text": reaction_quote,
+                "img_url": img_url,
                 "source": source_name,
                 "deeplink": deeplink,
             },
             alerts=alerts_cache,
+            notified_deal_ids=notified_deal_ids,
         )
         time.sleep(2)
         return True
@@ -3923,6 +4072,7 @@ def main():
         save_seen(seen)
         logger.info(f"🧹 [대기열 정리] 만료된 대기 딜 {len(expired_waits)}건 seen 영구 제외 및 정리 완료")
     alerts_cache = list_keyword_alerts() or []
+    notified_deal_ids: Set[str] = set()
     run_stats = {"queued": 0, "sent": 0}
 
     def _remaining_daily_room() -> int:
@@ -4003,6 +4153,7 @@ def main():
                         run_stats=run_stats,
                         ocr_cache=ocr_cache,
                         alerts_cache=alerts_cache,
+                        notified_deal_ids=notified_deal_ids,
                     )
                     processed_one = True
                 if price_db.get_source_cooldown(src):
