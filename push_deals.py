@@ -30,6 +30,11 @@ load_dotenv()
 
 from urllib.parse import parse_qs, unquote, urlparse
 
+from click_tracker import (
+    fetch_click_stats,
+    format_click_stats_telegram,
+    register_tracked_link,
+)
 from coupang_api import (
     CoupangPartnersAPI,
     classify_sub_id,
@@ -94,10 +99,10 @@ LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한, 전단지 배치 및 24시간 전단지 송출 설정 (KST)
-ENABLE_GOLDBOX = False
+ENABLE_GOLDBOX = True
 ENABLE_QUIET_HOURS = False
 DAILY_MAX_COMMUNITY_DEALS = 200
-GOLDBOX_PER_SLOT = 3
+GOLDBOX_PER_SLOT = 4
 DAILY_MAX_TOTAL_DEALS = 200
 MAX_COMMUNITY_PER_RUN = 20
 MAX_PER_SOURCE_PER_RUN = 6
@@ -117,14 +122,20 @@ SOURCE_429_DEFAULT_COOLDOWN_MINUTES = 30
 SOURCE_403_COOLDOWN_MINUTES = 120
 PRICE_DROP_REENTRY_PCT = 5.0
 
+ENABLE_TRACK_B2_NO_ORIG_FOOD = False  # 정가 미확인(할인율 0%) 식품 단가·반응 단독 송출 비활성화
+
 CATEGORY_MIN_DISCOUNT_MAP = {
-    "food": 15,
-    "living": 18,
+    "food": 20,
+    "living": 20,
     "it": 20,
     "general": 20,
 }
+HIGH_TICKET_MIN_ORIG_PRICE = 300_000
 IT_HIGH_SAVINGS_MIN_RATE = 12
 IT_HIGH_SAVINGS_MIN_WON = 50000
+LOW_PRICE_BAIT_MAX_PRICE = 15_000
+LOW_PRICE_BAIT_MIN_RATE = 15
+LOW_PRICE_BAIT_CATEGORIES = ("food", "living")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
@@ -136,6 +147,111 @@ SOURCE_SUB_ID_MAP = {
     "ppomppu": "tgppom",
     "dealbada": "tgdealbada",
 }
+
+SOURCE_LABEL_MAP = {
+    "arca": "아카라이브",
+    "ppomppu": "뽐뿌",
+    "ruliweb": "루리웹",
+    "dealbada": "딜바다",
+}
+
+
+def get_source_label(source_name: str) -> str:
+    """출처 코드를 한국어 커뮤니티 이름으로 변환"""
+    return SOURCE_LABEL_MAP.get(str(source_name or "").strip().lower(), "커뮤니티")
+
+
+_COMMENT_EXPAND_TRAIL_RE = re.compile(r"\s*펼쳐보기\s*[▼▾]?\s*$")
+_URL_STRIP_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_DOMAIN_STRIP_RE = re.compile(
+    r"\b[a-zA-Z0-9.-]+\.(?:com|co\.kr|kr|live|me|gl|ly)(?:/\S*)?",
+    re.IGNORECASE,
+)
+
+_REACTION_BOILERPLATE_TOKENS = (
+    "등록된 댓글이 없습니다",
+    "핫딜을 공유하기 위해서는",
+    "글쓴이를 배려하여",
+    "로그인 후",
+    "업자신고",
+    "이 글을 보지 않았다면",
+)
+_REACTION_PROFANITY_TOKENS = (
+    "시발", "씨발", "ㅅㅂ", "ㅆㅂ", "병신", "ㅂㅅ", "미친", "ㅁㅊ",
+    "개새", "존나", "ㅈㄴ", "지랄", "꺼져", "새끼", "좆", "닥쳐", "ㅗ",
+)
+_REACTION_NEGATIVE_OR_NOISE_TOKENS = (
+    "비싸", "비싼", "안싸", "안 싼", "안삼", "거름", "거르",
+    "품절", "끝났", "종료", "마감", "업자", "바이럴", "광고",
+    "쿠파스", "파트너스", "수수료", "링크", "로켓아니", "로켓 아니",
+    "별로", "노맛", "최악", "취소", "환불", "사기", "낚시", "정가", "불매",
+)
+_REACTION_POSITIVE_TOKENS = (
+    "싸", "저렴", "가성비", "최저가", "역대", "꿀딜", "대란",
+    "혜자", "괜찮", "강추", "무조건", "구매", "주문", "쟁여",
+    "쟁임", "득템", "단가", "만원", "개당",
+)
+
+
+def _collect_comment_texts(soup: Any, selector: str, limit: int = 15) -> List[str]:
+    """이미 파싱된 게시글 HTML에서 중복 제거한 댓글 텍스트 목록 추출"""
+    out: List[str] = []
+    seen_txt: Set[str] = set()
+    for el in soup.select(selector):
+        txt = " ".join(el.get_text(" ", strip=True).split())
+        txt = _COMMENT_EXPAND_TRAIL_RE.sub("", txt).strip()
+        if not txt or txt in seen_txt:
+            continue
+        seen_txt.add(txt)
+        out.append(txt)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _clean_reaction_candidate(text: str) -> str:
+    s = _URL_STRIP_RE.sub("", str(text or ""))
+    s = _DOMAIN_STRIP_RE.sub("", s)
+    s = _COMMENT_EXPAND_TRAIL_RE.sub("", s)
+    return " ".join(s.split()).strip(" /·|-")
+
+
+def _is_safe_reaction_candidate(text: str) -> bool:
+    if len(text) < 6:
+        return False
+    low = text.lower()
+    if any(tok in low for tok in _REACTION_BOILERPLATE_TOKENS):
+        return False
+    if any(tok in low for tok in _REACTION_PROFANITY_TOKENS):
+        return False
+    if any(tok in low for tok in _REACTION_NEGATIVE_OR_NOISE_TOKENS):
+        return False
+    return True
+
+
+def _truncate_reaction_quote(text: str, max_len: int) -> str:
+    if max_len > 1 and len(text) > max_len:
+        return text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def extract_best_reaction_quote(
+    comment_texts: List[str],
+    fallback_reaction: str = "",
+    max_len: int = 34,
+) -> str:
+    """안전·긍정 필터를 통과한 가장 설득력 있는 커뮤니티 한줄 반응 추출"""
+    for raw in comment_texts or []:
+        cleaned = _clean_reaction_candidate(raw)
+        if not _is_safe_reaction_candidate(cleaned):
+            continue
+        if any(kw in cleaned for kw in _REACTION_POSITIVE_TOKENS):
+            return _truncate_reaction_quote(cleaned, max_len)
+
+    fb = _clean_reaction_candidate(fallback_reaction)
+    if _is_safe_reaction_candidate(fb):
+        return _truncate_reaction_quote(fb, max_len)
+    return ""
 
 CLOSED_KEYWORDS = ["이미 정상화", "가격 정상화", "종료", "품절", "마감", "솔드아웃", "sold out"]
 MIN_HOTDEAL_DISCOUNT_RATE = 20
@@ -1773,6 +1889,9 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
             "body_text": body_text,
             "img_url": img_urls[0] if img_urls else None,
             "ocr_img_urls": img_urls[:2],
+            "comment_texts": _collect_comment_texts(
+                soup, ".comment_view .text_wrapper .text, .comment_element .text", limit=15
+            ),
         }
     except requests.Timeout as e:
         logger.warning(f"⏳ 루리웹 상세 타임아웃 ({url}): {e}")
@@ -1933,6 +2052,7 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
             "body_text": body_text,
             "img_url": photo_url,
             "ocr_img_urls": content_imgs[:2],
+            "comment_texts": [],
         }
     except requests.Timeout as e:
         logger.warning(f"⏳ 뽐뿌 상세 타임아웃 ({url}): {e}")
@@ -2143,6 +2263,9 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
             "extracted_title": extracted_title,
             "extracted_price": extracted_price,
             "extracted_shipping": extracted_shipping,
+            "comment_texts": _collect_comment_texts(
+                soup, ".comment-item .message .text", limit=15
+            ),
         }
     except requests.Timeout as e:
         logger.warning(f"⏳ 아카라이브 상세 타임아웃 ({url}): {e}")
@@ -2349,6 +2472,9 @@ def parse_dealbada_detail(url: str) -> Optional[Dict[str, Any]]:
             "img_url": img_urls[0] if img_urls else None,
             "ocr_img_urls": img_urls[:2],
             "extracted_title": extracted_title,
+            "comment_texts": _collect_comment_texts(
+                soup, "#bo_vc article p", limit=15
+            ),
         }
     except requests.Timeout as e:
         logger.warning(f"⏳ 딜바다 상세 타임아웃 ({url}): {e}")
@@ -2487,18 +2613,17 @@ def _has_track_b_food_reaction(
     votes = int(d.get("votes", 0) or 0)
     downvotes = int(d.get("downvotes", 0) or 0)
     comments = int(d.get("comments", 0) or 0)
-    if downvotes >= 3 and votes < 3:
+    if votes < 0:
         return False
-    if votes >= 3:
+    if downvotes >= 2 and not (votes >= 8 and votes >= downvotes * 4):
+        return False
+    if downvotes >= 1 and votes < 5:
+        return False
+    if votes >= 5:
         return True
-    if downvotes == 0 and comments >= 3:
+    if downvotes == 0 and votes >= 3 and comments >= 10:
         return True
-    if comments >= 2 and votes >= 1:
-        return True
-    combined = f"{base_title}\n{body_text}"
-    if comments >= 2 and any(kw in combined for kw in ("구매", "주문", "단가", "최저가", "역대", "역대가", "가성비")):
-        return True
-    if source_name == "dealbada" and (votes >= 2 and comments >= 1):
+    if source_name == "dealbada" and downvotes == 0 and votes >= 4 and comments >= 3:
         return True
     return False
 
@@ -2514,9 +2639,10 @@ def evaluate_deal_quality(
 ) -> Dict[str, Any]:
     """
     투트랙 + 카테고리별 품질 게이트 평가.
-    - Track A: 명시적 정상가 검증 + 카테고리별 최소 할인율(food 15%, living 18%, general/it 20%, it 5만원+ 절약 시 12%+)
-    - Track B1: 정상가 미확인 딜 중 30일 DB 관측(5일+ 중앙값) 대비 카테고리 기준 할인율 이상 하락
-    - Track B2: 정상가 미확인 식품 딜 중 배송비 포함 유효 단가 산출 + 강한 반응 검증
+    - Track A: 명시적 정상가 검증 + 기본 전 카테고리 최소 20% 할인
+      (15,000원 이하 식품/생필품 무료·와우배송 미끼 상품은 15%+ 허용, 정가 30만원 이상 고가 상품은 12%+ & 5만원+ 절약 예외 허용)
+    - Track B1: 정상가 미확인 딜 중 30일 DB 관측(5일+ 중앙값) 대비 20%+ 하락 검증
+    - Track B2: ENABLE_TRACK_B2_NO_ORIG_FOOD 활성화 시에만 동작 (기본 False)
     반환 dict: {passed, reason, track, category, evidence_badge, evidence_note, baseline_price, observed_disc_rate, effective_unit_display}
     """
     category = classify_deal_category(base_title, body_text)
@@ -2567,9 +2693,19 @@ def evaluate_deal_quality(
     if orig_p > final_p >= 1000:
         min_rate = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
         save_amt = orig_p - final_p
-        it_high_save = (category == "it" and save_amt >= IT_HIGH_SAVINGS_MIN_WON and disc_rate >= IT_HIGH_SAVINGS_MIN_RATE)
+        high_ticket_save = (
+            orig_p >= HIGH_TICKET_MIN_ORIG_PRICE
+            and save_amt >= IT_HIGH_SAVINGS_MIN_WON
+            and disc_rate >= IT_HIGH_SAVINGS_MIN_RATE
+        )
+        low_price_bait = (
+            category in LOW_PRICE_BAIT_CATEGORIES
+            and final_p <= LOW_PRICE_BAIT_MAX_PRICE
+            and obs_ship_type in ("free", "wow_free")
+            and disc_rate >= LOW_PRICE_BAIT_MIN_RATE
+        )
 
-        if disc_rate < min_rate and not it_high_save:
+        if disc_rate < min_rate and not high_ticket_save and not low_price_bait:
             base_res["reason"] = "low_discount"
             return base_res
 
@@ -2579,7 +2715,7 @@ def evaluate_deal_quality(
         if (orig_p >= 1_000_000 or final_p >= 1_000_000) and disc_rate >= MIN_HOTDEAL_DISCOUNT_RATE and (downvotes < 3 or votes >= 2):
             base_res.update({"passed": True, "reason": "ok", "track": "A"})
             return base_res
-        if it_high_save and (downvotes < 3 or votes >= 2):
+        if high_ticket_save and (downvotes < 3 or votes >= 2):
             base_res.update({"passed": True, "reason": "ok", "track": "A"})
             return base_res
         if _has_verified_reaction(d, source_name, base_title, body_text):
@@ -2622,19 +2758,28 @@ def evaluate_deal_quality(
                 })
                 return base_res
 
-    # Track B2: 식품/반복소비재 단일 구성 단가 + 확정 배송 + 반응 게이트
-    if category == "food" and effective_unit_display:
+    # Track B2: 식품/반복소비재 단일 구성 단가 + 확정 배송 + 반응 게이트 (기본 비활성화)
+    if ENABLE_TRACK_B2_NO_ORIG_FOOD and category == "food" and effective_unit_display:
         if obs_ship_type not in ("free", "paid", "wow_free"):
             base_res["reason"] = "wait"
             return base_res
         if _has_track_b_food_reaction(d, source_name, base_title, body_text):
             ship_note = f"배송포함 {effective_unit_display}" if ship_fee > 0 else effective_unit_display
+            src_kr = get_source_label(source_name)
+            votes_n = int(d.get("votes", 0) or 0)
+            comments_n = int(d.get("comments", 0) or 0)
+            stat_parts: List[str] = []
+            if votes_n > 0:
+                stat_parts.append(f"추천 {votes_n}")
+            if comments_n > 0:
+                stat_parts.append(f"댓글 {comments_n}")
+            stat_str = " · ".join(stat_parts) if stat_parts else "반응 확인"
             base_res.update({
                 "passed": True,
                 "reason": "ok",
                 "track": "B",
-                "evidence_badge": "단가·반응 검증",
-                "evidence_note": f"{ship_note} · 반응 확인",
+                "evidence_badge": f"{src_kr} 인기",
+                "evidence_note": f"{ship_note} · {src_kr} {stat_str}",
             })
             return base_res
         base_res["reason"] = "wait"
@@ -2911,12 +3056,28 @@ def process_deal(
         logger.error(f"딥링크 생성 실패: {e}")
         return False
 
+    deeplink = register_tracked_link(
+        deeplink,
+        deal_id=deal_id,
+        product_id=product_id,
+        source=source_name,
+        track=track,
+        title=clean_title,
+        sale_price=int(p_info["final_price"]),
+        discount_rate=int(p_info["discount_rate"]),
+    )
+
     display_unit = str(p_info.get("unit_info") or "")
     eff_unit = str(eval_res.get("effective_unit_display") or "")
     if eval_res.get("is_ambiguous"):
         display_unit = ""
     elif eff_unit:
         display_unit = f"{eff_unit} (배송포함)" if int(p_info.get("shipping_fee", 0) or 0) > 0 else eff_unit
+
+    reaction_quote = extract_best_reaction_quote(
+        detail.get("comment_texts") or [],
+        fallback_reaction=str(p_info.get("reaction_text") or ""),
+    )
 
     # 전단지 큐 모드: 검증 완료 즉시 큐에 적재하고 중복 방지를 위해 seen 기록
     if flyer_queue is not None:
@@ -2935,7 +3096,9 @@ def process_deal(
             "sale_price": int(p_info["final_price"]),
             "discount_rate": int(p_info["discount_rate"]),
             "unit_info": display_unit,
-            "reaction_text": p_info.get("reaction_text", ""),
+            "votes": int(d.get("votes", 0) or 0),
+            "comments": int(d.get("comments", 0) or 0),
+            "reaction_text": reaction_quote,
             "shipping_fee": int(p_info.get("shipping_fee", 0) or 0),
             "shipping_type": str(p_info.get("shipping_type") or ""),
             "shipping_condition": str(p_info.get("shipping_condition") or ""),
@@ -2993,6 +3156,7 @@ def process_deal(
         )
         return True
 
+    p_info["reaction_text"] = reaction_quote
     msg = format_deal_message(clean_title, p_info, deal_url=deeplink)
     btn_price = p_info["final_price"]
     btn_text = f"🛒 쿠팡에서 {btn_price:,}원에 구매하기 ↗" if btn_price >= 1000 else "🛒 쿠팡 특가 바로가기 ↗"
@@ -3153,29 +3317,74 @@ def flush_flyer_queue(
 # ==========================================
 # 5. 시간대 분산 로켓 골드박스 & D+1~D+2 지연 대응 쿠파스 결산
 # ==========================================
-GOLDBOX_EXCLUDE_CATS = ("국내투어", "여행", "티켓", "렌탈", "콘도", "호텔", "리프트", "숙박")
+GOLDBOX_EXCLUDE_CATS = (
+    "국내투어", "여행", "티켓", "렌탈", "콘도", "호텔", "리프트", "숙박", "공연", "전시",
+)
+GOLDBOX_BAIT_TIER0_CATS = (
+    "식품", "로켓프레시", "생활용품", "주방용품", "출산/유아동", "반려동물용품", "헬스/건강식품",
+)
+GOLDBOX_BAIT_TIER1_CATS = (
+    "뷰티", "문구/오피스", "자동차용품", "스포츠/레저", "가전디지털",
+)
 
 
-def run_goldbox_staggered(seen: Set[str], quota: Dict[str, Any]) -> int:
-    """로켓배송 골드박스 상품만 선별하여 오전(7~10시)·점심(12~15시)·저녁(18~20시) 3개 타임에 GOLDBOX_PER_SLOT(3)개씩 분산 송출"""
-    now = datetime.now(KST)
+def select_goldbox_bait_items(
+    raw_items: List[Dict[str, Any]],
+    seen: Set[str],
+    max_items: int = 4,
+    max_price: int = 30_000,
+    fallback_max_price: int = 50_000,
+) -> List[Dict[str, Any]]:
+    """로켓배송 골드박스 상품 중 클릭 유도력 높은 생필품·식품(3만원 이하 우선) 엄선"""
+    candidates: List[Tuple[Tuple[int, int, int, int], Dict[str, Any]]] = []
+    seen_pids: Set[str] = set()
+    for idx, it in enumerate(raw_items or []):
+        if it.get("isRocket") is not True:
+            continue
+        cat = str(it.get("categoryName") or "")
+        pname = str(it.get("productName") or "")
+        if any(ex in cat or ex in pname for ex in GOLDBOX_EXCLUDE_CATS):
+            continue
+        prod_id = str(it.get("productId") or "").strip()
+        if not prod_id or prod_id in seen_pids or is_product_recently_seen(prod_id, seen):
+            continue
+        p_price = int(round(float(it.get("productPrice", 0) or 0)))
+        if p_price < 1000 or p_price > fallback_max_price:
+            continue
+
+        seen_pids.add(prod_id)
+        price_band = 0 if p_price <= max_price else 1
+        if any(t0 in cat for t0 in GOLDBOX_BAIT_TIER0_CATS):
+            cat_tier = 0
+        elif any(t1 in cat for t1 in GOLDBOX_BAIT_TIER1_CATS):
+            cat_tier = 1
+        else:
+            cat_tier = 2
+        sub_price_band = 0 if p_price <= 20_000 else 1
+        rank_val = int(it.get("rank", idx + 1) or (idx + 1))
+        candidates.append(((price_band, cat_tier, sub_price_band, rank_val), it))
+
+    candidates.sort(key=lambda pair: pair[0])
+    return [it for _, it in candidates[:max(0, max_items)]]
+
+
+def run_goldbox_staggered(
+    seen: Set[str],
+    quota: Dict[str, Any],
+    now_dt: Optional[datetime] = None,
+) -> int:
+    """로켓배송 골드박스 생필품·식품 미끼 4선 전단지를 오전(8~11시)·저녁(18~21시) 2회 분산 송출"""
+    now = now_dt or datetime.now(KST)
     if is_quiet_hours(now) and "--force-goldbox" not in sys.argv:
         return 0
 
     today_str = now.strftime("%Y%m%d")
-    per_slot = GOLDBOX_PER_SLOT
-
-    slot_num = 0
-    slice_start, slice_end = 0, per_slot
-    slot_label = "오전"
     if "--force-goldbox" in sys.argv:
-        slot_num, slice_start, slice_end, slot_label = 1, 0, per_slot, "오전(강제)"
-    elif 7 <= now.hour < 11:
-        slot_num, slice_start, slice_end, slot_label = 1, 0, per_slot, "아침"
-    elif 12 <= now.hour < 16:
-        slot_num, slice_start, slice_end, slot_label = 2, per_slot, per_slot * 2, "점심"
-    elif 18 <= now.hour < 21:
-        slot_num, slice_start, slice_end, slot_label = 3, per_slot * 2, per_slot * 3, "저녁"
+        slot_num, slot_label = 1, "오전(강제)"
+    elif 8 <= now.hour < 12:
+        slot_num, slot_label = 1, "오전"
+    elif 18 <= now.hour < 22:
+        slot_num, slot_label = 2, "저녁"
     else:
         return 0
 
@@ -3185,86 +3394,106 @@ def run_goldbox_staggered(seen: Set[str], quota: Dict[str, Any]) -> int:
         if slot_key in seen or (slot_num == 1 and legacy_key in seen):
             return 0
 
-    if (int(quota.get("community_sent", 0) or 0) + int(quota.get("goldbox_sent", 0) or 0)) >= DAILY_MAX_TOTAL_DEALS:
+    comm_cnt = int(quota.get("community_sent", 0) or 0)
+    gb_cnt = int(quota.get("goldbox_sent", 0) or 0)
+    room = DAILY_MAX_TOTAL_DEALS - comm_cnt - gb_cnt
+    if room <= 0:
         logger.info("⏸️ [송출 제한] 일일 총 송출 상한 도달로 골드박스 생략")
         return 0
 
-    logger.info(f"🍯 [{slot_label}] 로켓배송 골드박스 슬롯 {slot_num} ({slice_start+1}~{slice_end}위) 자동 송출 시작...")
-    res = coupang_api.get_goldbox_products(sub_id="tggold")
+    logger.info(f"🍯 [{slot_label}] 로켓배송 골드박스 {GOLDBOX_PER_SLOT}선 미끼 전단지 준비 중...")
+    res = coupang_api.get_goldbox_products(sub_id="tggoldbox")
     raw_items = res.get("data", []) or []
 
-    # 로켓배송 + 여행/숙박/티켓 잡상품 제외 필터
-    filtered_items = []
-    for it in raw_items:
-        if it.get("isRocket") is not True:
-            continue
-        cat = str(it.get("categoryName") or "")
-        pname = str(it.get("productName") or "")
-        if any(ex in cat or ex in pname for ex in GOLDBOX_EXCLUDE_CATS):
-            continue
-        filtered_items.append(it)
-
-    batch = filtered_items[slice_start:slice_end]
+    take_n = min(GOLDBOX_PER_SLOT, room)
+    batch = select_goldbox_bait_items(raw_items, seen, max_items=take_n)
     if not batch:
         seen.add(slot_key)
         save_seen(seen)
         return 0
 
-    sent = 0
-    for idx_in_batch, it in enumerate(batch):
-        if (int(quota.get("community_sent", 0) or 0) + int(quota.get("goldbox_sent", 0) or 0)) >= DAILY_MAX_TOTAL_DEALS:
-            logger.info("⏸️ [송출 제한] 일일 총 송출 상한 도달로 잔여 골드박스 중단")
-            break
-        rank_num = slice_start + idx_in_batch + 1
-        prod_id = str(it.get("productId") or "")
-        if prod_id and is_product_recently_seen(prod_id, seen):
-            continue
-
-        raw_name = it.get("productName", "")
+    flyer_items: List[Dict[str, Any]] = []
+    for it in batch:
+        prod_id = str(it.get("productId") or "").strip()
+        raw_name = str(it.get("productName") or "").strip()
         p_price = int(round(float(it.get("productPrice", 0) or 0)))
         if p_price < 1000:
             continue
-        p_url = it.get("productUrl", "")
+        p_url = str(it.get("productUrl") or "").strip()
         img_url = it.get("productImage")
-        cat = it.get("categoryName", "")
 
-        p_name = enrich_product_spec(raw_name, p_url, img_url)
-        unit_str = compute_unit_pricing(p_name, p_price)
+        enriched_name = enrich_product_spec(raw_name, p_url, img_url)
+        clean_title = clean_display_title(enriched_name) or enriched_name
+        raw_unit = compute_unit_pricing(clean_title, p_price)
+        unit_info = re.sub(r"<[^>]+>", "", raw_unit).replace("단가계산:", "").replace("•", "").strip() if raw_unit else ""
+        unit_short = unit_info.split("(")[0].strip() if unit_info else ""
+        shipping_label = "로켓 무료배송" if it.get("isFreeShipping") is True else "로켓배송"
 
-        msg = (
-            f"🍯 <b>[쿠팡 공식 골드박스 · {slot_label} 타임] 👑 와우회원 단독 특가</b>\n"
-            f"🏆 <b>오늘의 로켓 골드박스 #{rank_num}!</b>\n\n"
-            f"📌 <b>{esc(p_name)}</b>\n\n"
-            f"💵 <b>특가 정보</b>\n"
-            f"• <b>골드특가</b>: <b>{p_price:,}원</b> (와우회원 한정가)\n"
-            f"{unit_str}"
-            f"• <b>카테고리</b>: {esc(cat)}\n"
-            f"⏰ <b>특가시간</b>: 오늘 자정(24:00) 마감 또는 한정수량 소진 시 종료\n\n"
-            f'🔗 <b><a href="{html.escape(p_url, quote=True)}">👉 쿠팡 골드박스 바로가기 (클릭)</a></b>\n\n'
-            f"🚚 🚀 <b>로켓배송 (내일 도착 보장)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>쿠팡 공식 엄선 당일 최저가 상품입니다.</i>\n"
-            f"※ 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
-        )
-
-        if send_telegram(
-            CHANNEL_ID,
-            msg,
-            img_url,
-            f"🛒 쿠팡에서 {p_price:,}원에 구매하기 ↗",
+        tracked_url = register_tracked_link(
             p_url,
-            button_style="success",
-        ):
-            sent += 1
-            quota["goldbox_sent"] = int(quota.get("goldbox_sent", 0) or 0) + 1
-            save_post_quota(quota)
-            if prod_id:
-                mark_product_seen(prod_id, seen)
-            time.sleep(2)
+            deal_id=f"goldbox_{today_str}_{prod_id}",
+            product_id=prod_id,
+            source="goldbox",
+            track="G",
+            title=clean_title,
+            sale_price=p_price,
+            discount_rate=0,
+        )
+        evidence_note = f"{unit_short} · 오늘 자정 마감" if unit_short else "쿠팡 공식 오늘의 특가 · 자정 마감"
 
+        flyer_items.append({
+            "deal_id": f"goldbox_{today_str}_{prod_id}",
+            "product_id": prod_id,
+            "source": "goldbox",
+            "track": "G",
+            "slot_label": slot_label,
+            "category": classify_deal_category(clean_title, ""),
+            "evidence_badge": "골드박스 특가",
+            "evidence_note": evidence_note,
+            "clean_title": clean_title,
+            "short_title": shorten_card_title(clean_title),
+            "orig_price": 0,
+            "sale_price": p_price,
+            "discount_rate": 0,
+            "unit_info": unit_info,
+            "reaction_text": "",
+            "shipping_fee": 0,
+            "shipping_type": "free" if it.get("isFreeShipping") is True else "unknown",
+            "shipping_condition": "",
+            "shipping_label": shipping_label,
+            "chip": build_card_chip(clean_title, 0, p_price, unit_info, shipping_label=shipping_label),
+            "deeplink": tracked_url,
+            "img_url": img_url,
+            "votes": 0,
+            "comments": 0,
+        })
+
+    if not flyer_items:
+        seen.add(slot_key)
+        save_seen(seen)
+        return 0
+
+    try:
+        png_bytes = render_hotdeal_flyer(flyer_items, coupang_api=coupang_api)
+        caption, inline_kb = format_flyer_caption_and_buttons(flyer_items)
+    except Exception as e:
+        logger.error(f"골드박스 전단지 렌더링 오류: {e}")
+        return 0
+
+    if not send_telegram_photo_bytes(CHANNEL_ID, png_bytes, caption, inline_kb):
+        logger.warning("골드박스 전단지 텔레그램 전송 실패 — 다음 회차 재시도")
+        return 0
+
+    quota["goldbox_sent"] = gb_cnt + len(flyer_items)
+    save_post_quota(quota)
+    for item in flyer_items:
+        if item.get("product_id"):
+            mark_product_seen(item["product_id"], seen)
     seen.add(slot_key)
     save_seen(seen)
-    return sent
+    logger.info(f"🍯 [골드박스({len(flyer_items)}건) 전단지 송출 완료] (슬롯={slot_label}, 금일 골드박스={quota['goldbox_sent']}건)")
+    time.sleep(2)
+    return len(flyer_items)
 
 
 def load_sales_tracker() -> Dict[str, Any]:
@@ -3492,6 +3721,13 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             latest_block = "📌 <b>최근 확정일</b>: 집계된 내역 없음\n\n"
 
         channel_split_block = format_channel_split_block(stats, f"채널별 분리 집계 ({now.month}월 누적)")
+        click_stats_block = ""
+        try:
+            click_stats = fetch_click_stats(days=7, limit=5)
+            if click_stats:
+                click_stats_block = f"\n\n{format_click_stats_telegram(click_stats, top_n=3)}"
+        except Exception as cs_err:
+            logger.warning(f"실시간 클릭 통계 조회 생략: {cs_err}")
 
         report_msg = (
             f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
@@ -3502,7 +3738,7 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             f"• 총 주문 / 취소: <b>{m_orders:,}건</b> / {m_cancels:,}건\n"
             f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
             f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
-            f"{channel_split_block}\n\n"
+            f"{channel_split_block}{click_stats_block}\n\n"
             f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>"
         )
 
@@ -3700,7 +3936,7 @@ def main():
     # 전단지 큐 플러시 (4건 모이면 즉시, 미만 시 대기 타임아웃/긴급할인 조건에 따라 송출)
     total_sent += flush_flyer_queue(flyer_queue, quota)
 
-    # 골드박스: 메리트 부족으로 기본 비활성화 (--force-goldbox 수동 호출 또는 ENABLE_GOLDBOX=True 시만 동작)
+    # 로켓 골드박스 생필품·식품 미끼 4선 전단지 (오전 8~11시 · 저녁 18~21시 2타임)
     if ENABLE_GOLDBOX or "--force-goldbox" in sys.argv:
         total_sent += run_goldbox_staggered(seen, quota)
 

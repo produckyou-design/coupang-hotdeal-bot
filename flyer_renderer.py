@@ -48,6 +48,27 @@ HEADERS = {
 
 NUM_ICONS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
 
+SOURCE_LABEL_MAP = {
+    "arca": "아카라이브",
+    "ppomppu": "뽐뿌",
+    "ruliweb": "루리웹",
+    "dealbada": "딜바다",
+    "goldbox": "골드박스",
+}
+
+
+def format_source_label(source: str) -> str:
+    """출처 코드를 한국어 커뮤니티 이름으로 변환"""
+    return SOURCE_LABEL_MAP.get(str(source or "").strip().lower(), "")
+
+
+def _is_goldbox_deal(deal: Dict[str, Any]) -> bool:
+    return str(deal.get("source") or "").strip().lower() == "goldbox" or str(deal.get("track") or "").strip().upper() == "G"
+
+
+def _is_goldbox_batch(batch: List[Dict[str, Any]]) -> bool:
+    return bool(batch) and all(_is_goldbox_deal(d) for d in batch)
+
 
 def _find_font_file(candidates: Tuple[str, ...]) -> Optional[str]:
     for d in FONT_SEARCH_DIRS:
@@ -484,9 +505,11 @@ def _deal_badge_style(
         save_str = _format_save_kor(save_p) if save_p >= 10000 else f"{disc_r}%"
         return f"고가 특가 · {save_str}↓", (15, 23, 42), (253, 224, 71), (245, 158, 11)
     ev_badge = str(deal.get("evidence_badge") or "").strip()
+    if _is_goldbox_deal(deal) and disc_r <= 0:
+        return (ev_badge or "골드박스 특가"), (217, 119, 6), (255, 255, 255), None
     if ev_badge and disc_r <= 0:
         return ev_badge, (5, 150, 105), (255, 255, 255), None
-    lbl, col = _tier_badge(disc_r) if disc_r >= 12 else ("단가·반응 선별" if not ev_badge else ev_badge, (5, 150, 105))
+    lbl, col = _tier_badge(disc_r) if disc_r >= 12 else ("커뮤니티 인기" if not ev_badge else ev_badge, (5, 150, 105))
     return lbl, col, (255, 255, 255), None
 
 
@@ -656,10 +679,19 @@ def _draw_single_rich_card(
         card_bd, card_bd_w = (245, 158, 11), 6
     else:
         _draw_vertical_gradient(canvas, (0, 0, W, header_h), (11, 18, 33), (30, 41, 59))
-        hdr_title = "쿠팡 실시간 특가"
+        is_gb = _is_goldbox_deal(deal)
+        hdr_title = "쿠팡 오늘의 골드박스" if is_gb else "쿠팡 실시간 특가"
         ev_badge = str(deal.get("evidence_badge") or "").strip()
-        hdr_badge_txt = f"{disc_r}%↓ 특가" if disc_r > 0 else (ev_badge or "단가·반응 선별")
-        hb_bg, hb_fg, hb_bd = (225, 29, 72), (255, 255, 255), None
+        if disc_r > 0:
+            hdr_badge_txt = f"{disc_r}%↓ 특가"
+            hb_bg = (225, 29, 72)
+        elif is_gb:
+            hdr_badge_txt = "자정 마감"
+            hb_bg = (217, 119, 6)
+        else:
+            hdr_badge_txt = ev_badge or "커뮤니티 인기"
+            hb_bg = (225, 29, 72)
+        hb_fg, hb_bd = (255, 255, 255), None
         card_bd, card_bd_w = (226, 232, 240), 3
 
     draw = ImageDraw.Draw(canvas)
@@ -729,7 +761,9 @@ def _draw_single_rich_card(
     if (cur_y + 72) <= box_y1:
         if reaction:
             f_react = _load_font(eb_font, 28)
-            r_lines = _wrap_title_lines(draw, f"반응: {reaction}", f_react, rw - 32, max_lines=1)
+            src_kr = format_source_label(str(deal.get("source") or ""))
+            react_prefix = f"{src_kr} 반응" if src_kr else "반응"
+            r_lines = _wrap_title_lines(draw, f"{react_prefix}: {reaction}", f_react, rw - 32, max_lines=1)
             _draw_pill(draw, rx1, cur_y + 10, r_lines[0], f_react, bg=(241, 245, 249), fg=(71, 85, 105), pad_x=18, pad_y=10, radius=12)
         elif theme == "half":
             f_react = _load_font(hv_font, 28)
@@ -914,7 +948,9 @@ def _draw_wide_card_item(
     reaction = str(deal.get("reaction_text") or "").strip()
     if reaction and (cur_y + 62) <= box_y1:
         f_react = _load_font(eb_font, 28)
-        r_lines = _wrap_title_lines(draw, f"반응: {reaction}", f_react, rw - 32, max_lines=1)
+        src_kr = format_source_label(str(deal.get("source") or ""))
+        react_prefix = f"{src_kr} 반응" if src_kr else "반응"
+        r_lines = _wrap_title_lines(draw, f"{react_prefix}: {reaction}", f_react, rw - 32, max_lines=1)
         _draw_pill(draw, rx1, cur_y + 10, r_lines[0], f_react, bg=(241, 245, 249), fg=(71, 85, 105), pad_x=18, pad_y=10, radius=12)
 
     _draw_price_box(
@@ -950,19 +986,20 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
 
     has_half = any(is_half_off_mega(d) for d in batch)
     has_vip = any(is_high_ticket_mega(d) for d in batch)
+    is_gb_batch = _is_goldbox_batch(batch)
 
     if n >= 4:
         W, H = 1800, 1980
         out_size = (900, 990)
-        hdr_title = "50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜")
+        hdr_title = "쿠팡 오늘의 골드박스" if is_gb_batch else ("50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜"))
     elif n == 3:
         W, H = 1800, 1700
         out_size = (900, 850)
-        hdr_title = "50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜")
+        hdr_title = "쿠팡 오늘의 골드박스" if is_gb_batch else ("50%+ 반값 포함 · 쿠팡 핫딜" if has_half else ("프리미엄 특가 포함 · 쿠팡 핫딜" if has_vip else "쿠팡 실시간 핫딜"))
     else:
         W, H = 1800, 1080
         out_size = (900, 540)
-        hdr_title = "50%+ 반값 포함 · 추천 핫딜" if has_half else ("프리미엄 특가 포함 · 추천 핫딜" if has_vip else "쿠팡 추천 핫딜")
+        hdr_title = "쿠팡 오늘의 골드박스" if is_gb_batch else ("50%+ 반값 포함 · 추천 핫딜" if has_half else ("프리미엄 특가 포함 · 추천 핫딜" if has_vip else "쿠팡 추천 핫딜"))
 
     header_h = 152
     canvas = Image.new("RGB", (W, H), (241, 245, 249))
@@ -978,9 +1015,16 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     draw.text((44, (header_h - (hb[3] - hb[1])) // 2 - hb[1]), hdr_title, font=f_hdr, fill=(255, 255, 255))
 
     max_rate = max(int(d.get("discount_rate", 0) or 0) for d in batch)
-    badge_txt = f"최대 {max_rate}%↓" if max_rate > 0 else "단가·반응 선별"
+    if max_rate > 0:
+        badge_txt = f"최대 {max_rate}%↓"
+        b_bg, b_fg = ((15, 23, 42), (254, 240, 138)) if has_half else ((225, 29, 72), (255, 255, 255))
+    elif is_gb_batch:
+        badge_txt = "자정 마감"
+        b_bg, b_fg = (217, 119, 6), (255, 255, 255)
+    else:
+        badge_txt = "커뮤니티 인기"
+        b_bg, b_fg = (225, 29, 72), (255, 255, 255)
     btw, _ = _text_size(draw, badge_txt, f_hdr_badge)
-    b_bg, b_fg = ((15, 23, 42), (254, 240, 138)) if has_half else ((225, 29, 72), (255, 255, 255))
     _draw_pill(draw, W - 44 - (btw + 60), 28, badge_txt, f_hdr_badge, bg=b_bg, fg=b_fg, pad_x=30, pad_y=18)
 
     margin_x = 34
@@ -1025,12 +1069,56 @@ def render_hotdeal_flyer(deals: List[Dict[str, Any]], coupang_api: Any = None) -
     return buf.getvalue()
 
 
-def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -> str:
+def _build_community_line(d: Dict[str, Any], quote_cap: int = 34) -> str:
+    """출처·추천·댓글 및 한줄 반응을 캡션용 1줄 문자열로 구성 (0건 통계는 생략)"""
+    src_kr = format_source_label(str(d.get("source") or ""))
+    votes_n = int(d.get("votes", 0) or 0)
+    comments_n = int(d.get("comments", 0) or 0)
+    quote_raw = " ".join(str(d.get("reaction_text") or "").split()).strip()
+    if quote_cap <= 0:
+        quote = ""
+    elif len(quote_raw) > quote_cap:
+        quote = quote_raw[: quote_cap - 1].rstrip() + "…"
+    else:
+        quote = quote_raw
+
+    parts: List[str] = []
+    if votes_n > 0:
+        parts.append(f"추천 {votes_n}")
+    if comments_n > 0:
+        parts.append(f"댓글 {comments_n}")
+
+    if src_kr and parts:
+        head = f"{src_kr} {' · '.join(parts)}"
+    elif parts:
+        head = " · ".join(parts)
+    elif src_kr and quote:
+        head = f"{src_kr} 반응"
+    else:
+        head = ""
+
+    if head and quote:
+        return f'💬 {html.escape(head, quote=False)} — "{html.escape(quote, quote=False)}"'
+    if head:
+        return f"💬 {html.escape(head, quote=False)}"
+    if quote:
+        return f'💬 "{html.escape(quote, quote=False)}"'
+    return ""
+
+
+def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int, max_quote_len: int = 34) -> str:
     n = len(batch)
     has_half = any(is_half_off_mega(d) for d in batch)
     has_vip = any(is_high_ticket_mega(d) for d in batch)
 
-    if n == 1:
+    if _is_goldbox_batch(batch):
+        slot_lbl = str(batch[0].get("slot_label") or "").strip()
+        header = (
+            f"🍯 <b>[쿠팡 오늘의 골드박스 · {html.escape(slot_lbl, quote=False)} 특가]</b>"
+            if slot_lbl
+            else "🍯 <b>[쿠팡 오늘의 골드박스 특가]</b>"
+        )
+    elif n == 1:
         d0 = batch[0]
         save0 = max(0, int(d0.get("orig_price", 0) or 0) - int(d0.get("sale_price", 0) or 0))
         if is_half_off_mega(d0):
@@ -1073,9 +1161,19 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
             tags.append(f"💎<b>[{_format_save_kor(save_amt)} 할인]</b>")
         tag_prefix = (" ".join(tags) + " ") if tags else ""
 
-        emo = _tier_emoji(disc_r) if disc_r >= 20 else ("🏷️" if disc_r >= 12 else "💡")
-        price_str = f"<b>{sale_p:,}원</b>" if sale_p >= 1000 else "<b>특가 확인</b>"
         ev_badge = str(d.get("evidence_badge") or "").strip()
+        if disc_r >= 20:
+            emo = _tier_emoji(disc_r)
+        elif disc_r >= 12:
+            emo = "🏷️"
+        elif _is_goldbox_deal(d):
+            emo = "🍯"
+        elif ev_badge and "30일 관측가" not in ev_badge:
+            emo = "🔥"
+        else:
+            emo = "💡"
+
+        price_str = f"<b>{sale_p:,}원</b>" if sale_p >= 1000 else "<b>특가 확인</b>"
         if orig_p > sale_p >= 1000 and disc_r >= 3:
             orig_part = f"<s>{orig_p:,}원</s> → "
             rate_part = f"{tag_prefix}{emo}<b>{disc_r}%↓</b> "
@@ -1095,7 +1193,16 @@ def _build_caption_with_limit(batch: List[Dict[str, Any]], max_title_len: int) -
 
         ship_label = resolve_shipping_label(d)
         ship_part = f" · {html.escape(ship_label, quote=False)}" if ship_label else ""
-        lines.append(f"   {rate_part}{orig_part}{price_str}{extra}{ship_part}")
+        comm_line = _build_community_line(d, quote_cap=max_quote_len)
+        src_kr = format_source_label(str(d.get("source") or ""))
+        src_tail = (
+            f" · {html.escape(src_kr, quote=False)}"
+            if (not comm_line and src_kr and src_kr not in ev_badge)
+            else ""
+        )
+        lines.append(f"   {rate_part}{orig_part}{price_str}{extra}{ship_part}{src_tail}")
+        if comm_line:
+            lines.append(f"   {comm_line}")
         lines.append("")
 
     lines.append("<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>")
@@ -1108,10 +1215,12 @@ def format_flyer_caption_and_buttons(
     """텔레그램 sendPhoto용 1,024자 안전 캡션과 번호별 초록(success) CTA 버튼 생성"""
     batch = deals[:4]
     caption = ""
-    for title_cap in (60, 42, 30, 20, 14):
-        caption = _build_caption_with_limit(batch, title_cap)
+    for title_cap, quote_cap in ((60, 34), (48, 24), (40, 0), (28, 0), (18, 0), (12, 0)):
+        caption = _build_caption_with_limit(batch, title_cap, max_quote_len=quote_cap)
         if len(caption) <= 980:
             break
+    if len(caption) > 1020:
+        caption = _build_caption_with_limit(batch, 10, max_quote_len=0)
     if len(caption) > 1020:
         caption = caption[:1016] + "…"
 

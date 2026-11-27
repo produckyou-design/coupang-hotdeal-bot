@@ -38,6 +38,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             patch.object(push_deals, "send_telegram_photo_bytes", return_value=True),
             patch.object(push_deals, "send_telegram", return_value=True),
             patch.object(push_deals.coupang_api, "search_products", return_value={"data": []}),
+            patch.object(push_deals, "register_tracked_link", side_effect=lambda url, **_kw: url),
         ]
         for p in self._net_patches:
             p.start()
@@ -60,6 +61,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         extra_shipping: str = "무료배송",
         votes: int = 5,
         comments: int = 2,
+        enable_track_b2: bool = True,
     ):
         seen = set()
         flyer_queue = []
@@ -84,10 +86,13 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             "comments": comments,
             "hits": 0,
         }
-        with patch.object(
-            push_deals.coupang_api,
-            "create_deeplink",
-            return_value={"data": [{"shortenUrl": f"https://link.coupang.com/a/{product_id}"}]},
+        with (
+            patch.object(push_deals, "ENABLE_TRACK_B2_NO_ORIG_FOOD", enable_track_b2),
+            patch.object(
+                push_deals.coupang_api,
+                "create_deeplink",
+                return_value={"data": [{"shortenUrl": f"https://link.coupang.com/a/{product_id}"}]},
+            ),
         ):
             ok = push_deals.process_deal(
                 deal,
@@ -595,9 +600,9 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         )
         self.assertEqual(price_history.classify_deal_category("오리온 미쯔 황치즈 6p, 222g, 2개"), "food")
 
-        # 호밍스 사골진곰탕 + 댓글 4개 무비추 -> Track B2 통과
-        ok_h, _sh, qh = self._run_process_deal(
-            deal_id="arca_homings_comments",
+        # 호밍스 사골진곰탕: 댓글 4개만(votes=0)으로는 강화된 Track B2 보류 확인
+        ok_h_wait, seen_hw, q_hw = self._run_process_deal(
+            deal_id="arca_homings_comments_wait",
             title="호밍스 사골진곰탕, 500g, 5개 9,900원",
             body_text="와우 무료배송",
             product_id="40014",
@@ -605,8 +610,27 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             votes=0,
             comments=4,
         )
+        self.assertFalse(ok_h_wait)
+        self.assertEqual(len(q_hw), 0)
+        self.assertNotIn("arca_homings_comments_wait", seen_hw)
+        self.assertIsNotNone(self.db.get_pending_wait("arca:arca_homings_comments_wait"))
+
+        # 호밍스 사골진곰탕 + 추천 5개 · 댓글 4개 -> Track B2 통과
+        ok_h, _sh, qh = self._run_process_deal(
+            deal_id="arca_homings_comments",
+            title="호밍스 사골진곰탕, 500g, 5개 9,900원",
+            body_text="와우 무료배송",
+            product_id="40014",
+            extra_shipping="와우 무료배송",
+            votes=5,
+            comments=4,
+        )
         self.assertTrue(ok_h)
         self.assertEqual(qh[0]["option_key"], "pid:40014:cfg:wt:500g:n5")
+        self.assertEqual(qh[0]["votes"], 5)
+        self.assertEqual(qh[0]["comments"], 4)
+        self.assertEqual(qh[0]["evidence_badge"], "아카라이브 인기")
+        self.assertIn("아카라이브 추천 5 · 댓글 4", qh[0]["evidence_note"])
         obs_h = self._fetch_observations("40014")
         self.assertEqual(len(obs_h), 1)
         self.assertEqual(obs_h[0]["shipping_type"], "wow_free")
@@ -629,6 +653,440 @@ class TrackBParsingRegressionTests(unittest.TestCase):
             db_rows = push_deals.collect_dealbada_deals()
         self.assertEqual(len(db_rows), 1)
         self.assertEqual(db_rows[0]["id"], "dealbada_573001")
+
+    def test_track_b2_strict_gate_source_and_caption_reaction(self):
+        import flyer_renderer
+        from PIL import Image
+        from unittest.mock import MagicMock
+
+        # 1) Track B2 인기 게이트 경계값 검증
+        for src, v, c, dw in (
+            ("arca", 2, 8, 0),      # 쫀떡궁합급 차단
+            ("arca", 2, 3, 0),      # 리터스포트급 차단
+            ("arca", 0, 4, 0),
+            ("arca", 4, 9, 0),      # 추천 4 + 댓글 9 차단
+            ("arca", 5, 2, 2),      # 비추 2 차단 (추천 8 미만)
+            ("dealbada", 3, 3, 0),  # 딜바다 추천 3 차단
+        ):
+            with self.subTest(reject=(src, v, c, dw)):
+                self.assertFalse(
+                    push_deals._has_track_b_food_reaction(
+                        {"votes": v, "comments": c, "downvotes": dw},
+                        src,
+                        "초콜릿 100g 2개",
+                        "무료배송",
+                    )
+                )
+
+        for src, v, c, dw in (
+            ("arca", 5, 0, 0),
+            ("arca", 3, 10, 0),
+            ("arca", 8, 5, 2),
+            ("dealbada", 4, 3, 0),
+        ):
+            with self.subTest(allow=(src, v, c, dw)):
+                self.assertTrue(
+                    push_deals._has_track_b_food_reaction(
+                        {"votes": v, "comments": c, "downvotes": dw},
+                        src,
+                        "초콜릿 100g 2개",
+                        "무료배송",
+                    )
+                )
+
+        # 2) 한줄 반응 추출 및 비속어·부정·안내문구 필터 검증
+        quote = push_deals.extract_best_reaction_quote(
+            [
+                "등록된 댓글이 없습니다.",
+                "ㅁㅊ 싸긴하네 36개에 만원이면",
+                "아 로켓아니네ㅜㅜ",
+                "비싸네 거름",
+                "이거 달달고소해서 맛있더라 가격 괜찮네",
+            ],
+            fallback_reaction="",
+        )
+        self.assertEqual(quote, "이거 달달고소해서 맛있더라 가격 괜찮네")
+
+        fb_quote = push_deals.extract_best_reaction_quote(
+            ["맛있어요", "링크 확인"],
+            fallback_reaction="역대 최저가 단가 괜찮네요",
+        )
+        self.assertEqual(fb_quote, "역대 최저가 단가 괜찮네요")
+
+        # 3) 상세 파서 comment_texts 추출 확인 (모킹 HTML, 네트워크 없음)
+        arca_html = """
+        <html><body>
+          <table class="article-info">
+            <tr><th>링크</th><td><a href="https://www.coupang.com/vp/products/50001">쿠팡</a></td></tr>
+            <tr><th>상품명</th><td>배스킨라빈스 쫀떡궁합 파이 264g 3개</td></tr>
+            <tr><th>가격</th><td>9,520원</td></tr>
+          </table>
+          <div class="article-body">총 36개 무료배송</div>
+          <div class="comment-item"><div class="message"><div class="text">ㅁㅊ 싸긴하네 펼쳐보기▼</div></div></div>
+          <div class="comment-item"><div class="message"><div class="text">이거 달달고소해서 맛있더라 가격 괜찮네 펼쳐보기▼</div></div></div>
+        </body></html>
+        """
+        ruli_html = """
+        <html><body>
+          <div class="source_url"><a href="https://www.coupang.com/vp/products/50002">쿠팡</a></div>
+          <div class="view_content">무료배송</div>
+          <div class="comment_view">
+            <div class="text_wrapper"><div class="text">이 글을 보지 않았다면 돈을 아꼈을 것인데!</div></div>
+            <div class="text_wrapper"><div class="text">2개 사니까 단가 저렴하고 괜찮네요</div></div>
+          </div>
+        </body></html>
+        """
+        dealbada_html = """
+        <html><body>
+          <div id="bo_v_title">케어웰 당뇨식 200ml 24개</div>
+          <div id="bo_v_link"><a href="https://www.coupang.com/vp/products/50003">쿠팡</a></div>
+          <div id="bo_v_con">무료배송</div>
+          <div id="bo_vc"><article><p>이 가격이면 쟁여둘만 하네요</p></article></div>
+        </body></html>
+        """
+        with patch.object(push_deals.requests, "get", return_value=MagicMock(status_code=200, text=arca_html)):
+            d_arca = push_deals.parse_arcalive_detail("https://arca.live/b/hotdeal/50001")
+        self.assertEqual(d_arca["comment_texts"], ["ㅁㅊ 싸긴하네", "이거 달달고소해서 맛있더라 가격 괜찮네"])
+
+        with patch.object(push_deals.requests, "get", return_value=MagicMock(status_code=200, text=ruli_html)):
+            d_ruli = push_deals.parse_ruliweb_detail("https://bbs.ruliweb.com/market/board/1020/read/50002")
+        self.assertEqual(d_ruli["comment_texts"], ["이 글을 보지 않았다면 돈을 아꼈을 것인데!", "2개 사니까 단가 저렴하고 괜찮네요"])
+
+        with patch.object(push_deals.requests, "get", return_value=MagicMock(status_code=200, text=dealbada_html)):
+            d_db = push_deals.parse_dealbada_detail("https://www.dealbada.com/bbs/board.php?bo_table=deal_domestic&wr_id=50003")
+        self.assertEqual(d_db["comment_texts"], ["이 가격이면 쟁여둘만 하네요"])
+
+        # 4) process_deal이 comment_texts -> reaction_text, votes, comments, 출처 배지를 적재하는지 확인
+        seen = set()
+        queue = []
+        ocr_cache = {}
+        detail_stub = lambda _u: {
+            "coupang_url": "https://www.coupang.com/vp/products/50004",
+            "body_text": "무료배송",
+            "img_url": None,
+            "ocr_img_urls": [],
+            "extracted_title": "베스킨라빈스 쫀떡궁합 파이, 264g, 3개",
+            "extracted_price": 9520,
+            "extracted_shipping": "무료배송",
+            "comment_texts": d_arca["comment_texts"],
+        }
+        deal_obj = {
+            "id": "arca_50004",
+            "title": "베스킨라빈스 쫀떡궁합 파이, 264g, 3개 9,520원",
+            "link": "https://arca.live/b/hotdeal/50004",
+            "votes": 6,
+            "downvotes": 0,
+            "comments": 12,
+            "hits": 0,
+        }
+        with (
+            patch.object(push_deals, "ENABLE_TRACK_B2_NO_ORIG_FOOD", True),
+            patch.object(
+                push_deals.coupang_api,
+                "create_deeplink",
+                return_value={"data": [{"shortenUrl": "https://link.coupang.com/a/50004"}]},
+            ),
+        ):
+            ok_p = push_deals.process_deal(deal_obj, detail_stub, "arca", seen, flyer_queue=queue, ocr_cache=ocr_cache)
+        self.assertTrue(ok_p)
+        item = queue[0]
+        self.assertEqual(item["votes"], 6)
+        self.assertEqual(item["comments"], 12)
+        self.assertEqual(item["evidence_badge"], "아카라이브 인기")
+        self.assertIn("100g당 1,202원", item["evidence_note"])
+        self.assertIn("아카라이브 추천 6 · 댓글 12", item["evidence_note"])
+        self.assertEqual(item["reaction_text"], "이거 달달고소해서 맛있더라 가격 괜찮네")
+
+        # 5) 캡션 출처·추천·댓글·반응 표기 + 0건 숨김 + 4건 길이 제한 + 전단지 렌더링 검증
+        cap_b2, _ = flyer_renderer.format_flyer_caption_and_buttons([item])
+        self.assertIn("[아카라이브 인기]", cap_b2)
+        self.assertIn("💬 아카라이브 추천 6 · 댓글 12 — \"이거 달달고소해서 맛있더라 가격 괜찮네\"", cap_b2)
+
+        track_a_zero = {
+            "clean_title": "QCY 무선 오픈형 이어폰 블루투스",
+            "short_title": "QCY 오픈형",
+            "source": "arca",
+            "orig_price": 41400,
+            "sale_price": 25900,
+            "discount_rate": 37,
+            "unit_info": "",
+            "shipping_label": "로켓 무료배송",
+            "deeplink": "https://link.coupang.com/a/50005",
+            "votes": 0,
+            "comments": 0,
+            "reaction_text": "",
+        }
+        cap_a0, _ = flyer_renderer.format_flyer_caption_and_buttons([track_a_zero])
+        self.assertIn("· 아카라이브", cap_a0)
+        self.assertNotIn("추천 0", cap_a0)
+        self.assertNotIn("댓글 0", cap_a0)
+
+        verbose_batch = [
+            {
+                **item,
+                "clean_title": f"프리미엄 유기농 생수 대용량 특가 상품 패키지 테스트 {idx}번 500ml 40개입",
+                "deeplink": f"https://link.coupang.com/a/very-long-slug-item-{idx}-abcdefghij",
+                "reaction_text": "역대 최저가 수준이라 바로 여러 세트 쟁여뒀습니다 정말 가성비 좋네요",
+            }
+            for idx in range(1, 5)
+        ]
+        cap_4, btns_4 = flyer_renderer.format_flyer_caption_and_buttons(verbose_batch)
+        self.assertLessEqual(len(cap_4), 1020)
+        self.assertEqual(len(btns_4), 4)
+        self.assertEqual(cap_4.count("<b>"), cap_4.count("</b>"))
+        self.assertEqual(cap_4.count("<a "), cap_4.count("</a>"))
+
+        white_img = Image.new("RGB", (200, 200), (255, 255, 255))
+        with patch.object(flyer_renderer, "resolve_clean_product_image", return_value=white_img):
+            png_1 = flyer_renderer.render_hotdeal_flyer([item])
+            png_2 = flyer_renderer.render_hotdeal_flyer([item, track_a_zero])
+        self.assertTrue(png_1.startswith(b"\x89PNG"))
+        self.assertTrue(png_2.startswith(b"\x89PNG"))
+
+    def test_default_min_20_percent_and_track_b2_disabled(self):
+        from datetime import datetime, timedelta
+
+        self.assertTrue(push_deals.ENABLE_GOLDBOX)
+        self.assertEqual(push_deals.GOLDBOX_PER_SLOT, 4)
+        self.assertEqual(push_deals.LOW_PRICE_BAIT_MAX_PRICE, 15_000)
+        self.assertEqual(push_deals.LOW_PRICE_BAIT_MIN_RATE, 15)
+        self.assertFalse(push_deals.ENABLE_TRACK_B2_NO_ORIG_FOOD)
+        self.assertEqual(
+            push_deals.CATEGORY_MIN_DISCOUNT_MAP,
+            {"food": 20, "living": 20, "it": 20, "general": 20},
+        )
+        self.assertEqual(push_deals.HIGH_TICKET_MIN_ORIG_PRICE, 300_000)
+
+        # 1) 기본(Track B2 비활성): 정가 없는 식품 딜은 추천이 많아도 송출 제외, 단 관측 DB에는 적재
+        ok_b2, seen_b2, q_b2 = self._run_process_deal(
+            deal_id="arca_b2_disabled_lemon",
+            title="솔리몬 스퀴즈드 레몬즙, 1L, 1개 5,400원",
+            body_text="무료배송",
+            product_id="60001",
+            extra_shipping="무료배송",
+            votes=10,
+            comments=20,
+            enable_track_b2=False,
+        )
+        self.assertFalse(ok_b2)
+        self.assertEqual(len(q_b2), 0)
+        self.assertIn("arca_b2_disabled_lemon", seen_b2)
+        self.assertEqual(len(self._fetch_observations("60001")), 1)
+
+        # 2) 저가 미끼 조건 미달 및 20% 미만 할인 차단 검증
+        for did, pid, title, body, ship in (
+            ("arca_low_food_3", "60002", "솔리몬 스퀴즈드 레몬즙, 1L, 1개", "정가 5,880원 -> 특가 5,680원 무료배송", "무료배송"),
+            ("arca_low_food_14", "60022", "국내산 생수 500ml 20병", "정가 10,000원 -> 특가 8,600원 무료배송", "무료배송"),
+            ("arca_low_food_paid_18", "60023", "국내산 생수 500ml 20병", "정가 10,000원 -> 특가 8,200원 배송비 3,000원", "배송비 3,000원"),
+            ("arca_low_food_over15k", "60003", "국내산 생수 500ml 40병", "정가 20,000원 -> 특가 16,400원 무료배송", "무료배송"),
+            ("arca_low_living_19", "60004", "고밀도 순면 세면타월 10매", "정가 20,000원 -> 특가 16,200원 무료배송", "무료배송"),
+            ("arca_low_general_18", "60024", "스마트폰 거치대 접이식", "정가 10,000원 -> 특가 8,200원 무료배송", "무료배송"),
+            ("arca_low_it_under30", "60005", "무선 기계식 키보드 텐키리스", "정가 250,000원 -> 특가 205,000원 무료배송", "무료배송"),
+        ):
+            with self.subTest(reject_low=did):
+                ok_l, _sl, q_l = self._run_process_deal(
+                    deal_id=did,
+                    title=title,
+                    body_text=body,
+                    product_id=pid,
+                    extra_shipping=ship,
+                    votes=5,
+                    comments=5,
+                    enable_track_b2=False,
+                )
+                self.assertFalse(ok_l)
+                self.assertEqual(len(q_l), 0)
+
+        # 2-b) 15,000원 이하 식품/생필품 + 무료·와우배송 + 15%+ 저가 미끼 통과 검증
+        for did, pid, title, body, ship, exp_rate in (
+            ("arca_bait_food_18", "60025", "국내산 생수 500ml 20병", "정가 10,000원 -> 특가 8,200원 무료배송", "무료배송", 18),
+            ("arca_bait_living_15", "60026", "고밀도 순면 세면타월 5매", "정가 15,000원 -> 특가 12,700원 와우 무료배송", "와우 무료배송", 15),
+        ):
+            with self.subTest(bait_allow=did):
+                ok_bt, _sbt, q_bt = self._run_process_deal(
+                    deal_id=did,
+                    title=title,
+                    body_text=body,
+                    product_id=pid,
+                    extra_shipping=ship,
+                    votes=5,
+                    comments=2,
+                    enable_track_b2=False,
+                )
+                self.assertTrue(ok_bt)
+                self.assertEqual(q_bt[0]["track"], "A")
+                self.assertEqual(q_bt[0]["discount_rate"], exp_rate)
+
+        # 3) 20% 할인(식품 포함)은 정상 통과
+        ok_f20, _sf20, q_f20 = self._run_process_deal(
+            deal_id="arca_food_20_ok",
+            title="국내산 생수 500ml 20병",
+            body_text="정가 10,000원 -> 특가 8,000원 무료배송",
+            product_id="60006",
+            extra_shipping="무료배송",
+            votes=2,
+            comments=0,
+            enable_track_b2=False,
+        )
+        self.assertTrue(ok_f20)
+        self.assertEqual(q_f20[0]["track"], "A")
+        self.assertEqual(q_f20[0]["discount_rate"], 20)
+
+        # 4) 30만 원 이상 고가 상품 예외: 12%+ 및 5만원+ 절약 시 통과, 미달 시 차단
+        for did, pid, title, body in (
+            ("arca_ht_350k_ok", "60010", "프리미엄 로봇청소기 스테이션", "정가 350,000원 -> 특가 295,000원 무료배송"),
+            ("arca_ht_1200k_ok", "60011", "삼성 갤럭시북 프로 16인치 노트북", "정가 1,200,000원 -> 특가 1,000,000원 무료배송"),
+        ):
+            with self.subTest(high_ticket_allow=did):
+                ok_ht, _sht, q_ht = self._run_process_deal(
+                    deal_id=did,
+                    title=title,
+                    body_text=body,
+                    product_id=pid,
+                    extra_shipping="무료배송",
+                    votes=0,
+                    comments=0,
+                    enable_track_b2=False,
+                )
+                self.assertTrue(ok_ht)
+                self.assertEqual(q_ht[0]["track"], "A")
+
+        for did, pid, body in (
+            ("arca_ht_11pct_reject", "60012", "정가 350,000원 -> 특가 310,000원 무료배송"),
+            ("arca_ht_45k_reject", "60013", "정가 350,000원 -> 특가 305,000원 무료배송"),
+        ):
+            with self.subTest(high_ticket_reject=did):
+                ok_hr, _shr, q_hr = self._run_process_deal(
+                    deal_id=did,
+                    title="프리미엄 무선청소기 거치대 세트",
+                    body_text=body,
+                    product_id=pid,
+                    extra_shipping="무료배송",
+                    votes=5,
+                    comments=5,
+                    enable_track_b2=False,
+                )
+                self.assertFalse(ok_hr)
+                self.assertEqual(len(q_hr), 0)
+
+        # 5) Track B1 (30일 관측 DB 중앙값 비교) 역시 20% 이상 하락만 통과
+        now_kst = datetime.now(push_deals.KST)
+        for d_ago in range(2, 7):
+            self.db.record_observation(
+                option_key="pid:60020:cfg:vol:500ml:n40",
+                product_id="60020",
+                total_price=20000,
+                sale_price=20000,
+                shipping_type="free",
+                category="food",
+                source="arca",
+                obs_date=(now_kst - timedelta(days=d_ago)).strftime("%Y-%m-%d"),
+            )
+
+        ok_b1_18, _sb18, q_b18 = self._run_process_deal(
+            deal_id="arca_b1_18_reject",
+            title="국내산 생수 500ml 40병 16,400원",
+            body_text="무료배송",
+            product_id="60020",
+            extra_shipping="무료배송",
+            votes=0,
+            comments=0,
+            enable_track_b2=False,
+        )
+        self.assertFalse(ok_b1_18)
+        self.assertEqual(len(q_b18), 0)
+
+        ok_b1_21, _sb21, q_b21 = self._run_process_deal(
+            deal_id="arca_b1_21_ok",
+            title="국내산 생수 500ml 40병 15,800원",
+            body_text="무료배송",
+            product_id="60020",
+            extra_shipping="무료배송",
+            votes=0,
+            comments=0,
+            enable_track_b2=False,
+        )
+        self.assertTrue(ok_b1_21)
+        self.assertEqual(q_b21[0]["track"], "B")
+        self.assertEqual(q_b21[0]["evidence_badge"], "30일 관측가 21%↓")
+
+    def test_goldbox_bait_selection_and_flyer_rendering(self):
+        from datetime import datetime
+        import flyer_renderer
+        from PIL import Image
+
+        raw_items = [
+            {"productId": 90001, "productName": "호텔 숙박권", "productPrice": 29000, "isRocket": False, "isFreeShipping": False, "categoryName": "국내투어", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90001", "rank": 1},
+            {"productId": 90002, "productName": "3인용 가죽 소파", "productPrice": 319000, "isRocket": True, "isFreeShipping": True, "categoryName": "가구/홈인테리어", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90002", "rank": 2},
+            {"productId": 90003, "productName": "여성 긴소매 티셔츠", "productPrice": 35100, "isRocket": True, "isFreeShipping": False, "categoryName": "패션의류", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90003", "rank": 3},
+            {"productId": 90004, "productName": "코카콜라 제로 350ml 24개", "productPrice": 18700, "isRocket": True, "isFreeShipping": True, "categoryName": "식품", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90004", "rank": 4},
+            {"productId": 90005, "productName": "포켓형 핫팩 100g 30개", "productPrice": 11130, "isRocket": True, "isFreeShipping": False, "categoryName": "생활용품", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90005", "rank": 5},
+            {"productId": 90006, "productName": "하림 닭가슴살 블랙페퍼 100g 10개", "productPrice": 16510, "isRocket": True, "isFreeShipping": False, "categoryName": "로켓프레시", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90006", "rank": 6},
+            {"productId": 90007, "productName": "알카라인 AAA건전지 40입", "productPrice": 8590, "isRocket": True, "isFreeShipping": False, "categoryName": "생활용품", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90007", "rank": 7},
+            {"productId": 90008, "productName": "닥터지 블랙 스네일 세트", "productPrice": 25700, "isRocket": True, "isFreeShipping": False, "categoryName": "뷰티", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90008", "rank": 8},
+            {"productId": 90009, "productName": "오레오 웨하스스틱 초코 10개", "productPrice": 22550, "isRocket": True, "isFreeShipping": True, "categoryName": "식품", "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=90009", "rank": 9},
+        ]
+
+        seen = set()
+        slot1_pick = push_deals.select_goldbox_bait_items(raw_items, seen, max_items=4)
+        self.assertEqual([x["productId"] for x in slot1_pick], [90004, 90005, 90006, 90007])
+        for x in slot1_pick:
+            push_deals.mark_product_seen(str(x["productId"]), seen)
+        slot2_pick = push_deals.select_goldbox_bait_items(raw_items, seen, max_items=4)
+        self.assertEqual([x["productId"] for x in slot2_pick], [90009, 90008, 90003])
+
+        # run_goldbox_staggered 오전/저녁 2타임 통합 전단지 송출 검증
+        sent_calls = []
+        registered_sources = []
+
+        def fake_send(_chat, png_bytes, caption, inline_kb):
+            sent_calls.append((png_bytes, caption, inline_kb))
+            return True
+
+        def fake_register(url, **kwargs):
+            registered_sources.append((kwargs.get("source"), kwargs.get("track"), kwargs.get("deal_id")))
+            return f"https://hotpang-click.example.workers.dev/r/{kwargs.get('product_id')}"
+
+        white_img = Image.new("RGB", (200, 200), (255, 255, 255))
+        seen_gb = set()
+        quota = {"date": "20261127", "community_sent": 0, "goldbox_sent": 0, "last_community_ts": 0}
+        morning_dt = datetime(2026, 11, 27, 8, 30, tzinfo=push_deals.KST)
+        evening_dt = datetime(2026, 11, 27, 18, 30, tzinfo=push_deals.KST)
+        idle_dt = datetime(2026, 11, 27, 14, 0, tzinfo=push_deals.KST)
+
+        with (
+            patch.object(push_deals.coupang_api, "get_goldbox_products", return_value={"data": raw_items}),
+            patch.object(push_deals, "enrich_product_spec", side_effect=lambda name, *_a: name),
+            patch.object(push_deals, "register_tracked_link", side_effect=fake_register),
+            patch.object(flyer_renderer, "resolve_clean_product_image", return_value=white_img),
+            patch.object(push_deals, "send_telegram_photo_bytes", side_effect=fake_send),
+            patch.object(push_deals.time, "sleep"),
+        ):
+            self.assertEqual(push_deals.run_goldbox_staggered(seen_gb, quota, now_dt=idle_dt), 0)
+
+            n1 = push_deals.run_goldbox_staggered(seen_gb, quota, now_dt=morning_dt)
+            self.assertEqual(n1, 4)
+            self.assertEqual(quota["goldbox_sent"], 4)
+            # 같은 오전 슬롯 재실행 시 중복 차단
+            self.assertEqual(push_deals.run_goldbox_staggered(seen_gb, quota, now_dt=morning_dt), 0)
+
+            n2 = push_deals.run_goldbox_staggered(seen_gb, quota, now_dt=evening_dt)
+            self.assertEqual(n2, 3)
+            self.assertEqual(quota["goldbox_sent"], 7)
+
+        self.assertEqual(len(sent_calls), 2)
+        png_m, cap_m, kb_m = sent_calls[0]
+        self.assertTrue(png_m.startswith(b"\x89PNG"))
+        self.assertEqual(len(kb_m), 4)
+        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 오전 특가]</b>", cap_m)
+        self.assertIn("🍯[골드박스 특가]", cap_m)
+        self.assertNotIn("· 골드박스", cap_m)
+        self.assertEqual(cap_m.count("<b>"), cap_m.count("</b>"))
+        self.assertTrue(all(src == "goldbox" and trk == "G" for src, trk, _ in registered_sources))
+
+        _png_e, cap_e, kb_e = sent_calls[1]
+        self.assertEqual(len(kb_e), 3)
+        self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 저녁 특가]</b>", cap_e)
 
 
 if __name__ == "__main__":

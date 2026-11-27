@@ -9,3 +9,5 @@ data/
 ocr_cache.json
 price_history.db
 price_history.db-*
+.wrangler/
+click_tracker_worker/.wrangler/

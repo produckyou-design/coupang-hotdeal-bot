@@ -74,6 +74,8 @@ jobs:
           TELEGRAM_PUBLIC_CHANNEL_ID: ${{ secrets.TELEGRAM_PUBLIC_CHANNEL_ID }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           TELEGRAM_REPORT_CHANNEL_ID: ${{ secrets.TELEGRAM_REPORT_CHANNEL_ID }}
+          CLICK_TRACKER_BASE_URL: ${{ secrets.CLICK_TRACKER_BASE_URL }}
+          CLICK_TRACKER_API_KEY: ${{ secrets.CLICK_TRACKER_API_KEY }}
         run: |
           python push_deals.py
 
