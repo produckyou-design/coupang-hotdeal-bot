@@ -285,6 +285,9 @@ async function handleCreateLink(request, env, origin) {
   const title = String(body?.title || "").trim().slice(0, 200);
   const salePrice = Math.max(0, Number.parseInt(String(body?.sale_price ?? 0), 10) || 0);
   const discountRate = Math.max(0, Number.parseInt(String(body?.discount_rate ?? 0), 10) || 0);
+  const unitInfo = String(body?.unit_info || "").trim().slice(0, 64);
+  const shippingLabel = String(body?.shipping_label || "").trim().slice(0, 32);
+  const optionKey = String(body?.option_key || "").trim().slice(0, 120);
 
   if (dealId) {
     const existing = await env.DB.prepare(
@@ -293,6 +296,18 @@ async function handleCreateLink(request, env, origin) {
       .bind(dealId, targetUrl)
       .first();
     if (existing && existing.code) {
+      if (unitInfo || shippingLabel || optionKey) {
+        await env.DB.prepare(
+          `UPDATE links
+           SET unit_info = CASE WHEN ? != '' THEN ? ELSE COALESCE(unit_info, '') END,
+               shipping_label = CASE WHEN ? != '' THEN ? ELSE COALESCE(shipping_label, '') END,
+               option_key = CASE WHEN ? != '' THEN ? ELSE COALESCE(option_key, '') END
+           WHERE code = ?`
+        )
+          .bind(unitInfo, unitInfo, shippingLabel, shippingLabel, optionKey, optionKey, existing.code)
+          .run()
+          .catch(() => {});
+      }
       return jsonResponse({
         ok: true,
         code: existing.code,
@@ -310,10 +325,24 @@ async function handleCreateLink(request, env, origin) {
       await env.DB.prepare(
         `INSERT INTO links (
           code, target_url, deal_id, product_id, source, track,
-          title, sale_price, discount_rate, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          title, sale_price, discount_rate, unit_info, shipping_label, option_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-        .bind(candidate, targetUrl, dealId, productId, source, track, title, salePrice, discountRate, createdAt)
+        .bind(
+          candidate,
+          targetUrl,
+          dealId,
+          productId,
+          source,
+          track,
+          title,
+          salePrice,
+          discountRate,
+          unitInfo,
+          shippingLabel,
+          optionKey,
+          createdAt
+        )
         .run();
       code = candidate;
       break;
@@ -949,6 +978,8 @@ async function queryAlertStats(env) {
      LIMIT 15`
   ).all();
 
+  const watchMetrics = await readWatchMetrics(env);
+
   return {
     ok: true,
     total_users: Number(summary?.total_users || 0),
@@ -956,6 +987,7 @@ async function queryAlertStats(env) {
     paused_users: Number(pausedRow?.paused_users || 0),
     total_hits: Number(summary?.total_hits || 0),
     top_keywords: topRes?.results || [],
+    watch_metrics: watchMetrics,
   };
 }
 
@@ -1362,6 +1394,10 @@ const dbOps = {
   updateUserAlertPrefs,
   findUserRecentMatches,
   readFlyerStatus,
+  getLinksByCodes,
+  bumpWatchMetric,
+  readWatchMetrics,
+  readSourceFunnelSummary,
 };
 
 async function handleTelegramWebhook(request, env, ctx, origin) {
@@ -1415,6 +1451,252 @@ async function writeChannelMeta(env, key, value, nowIso = new Date().toISOString
   }
 }
 
+const LINK_CODE_RE = /^[A-Za-z0-9]{4,32}$/;
+
+async function getLinksByCodes(env, codes = []) {
+  const cleanCodes = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(codes) ? codes : []) {
+    const c = String(raw || "").trim();
+    if (!LINK_CODE_RE.test(c) || seen.has(c)) continue;
+    seen.add(c);
+    cleanCodes.push(c);
+    if (cleanCodes.length >= 6) break;
+  }
+  if (cleanCodes.length === 0) return [];
+  const placeholders = cleanCodes.map(() => "?").join(", ");
+  const res = await env.DB.prepare(
+    `SELECT code, target_url, deal_id, product_id, source, track, title,
+            sale_price, discount_rate,
+            COALESCE(unit_info, '') AS unit_info,
+            COALESCE(shipping_label, '') AS shipping_label,
+            COALESCE(option_key, '') AS option_key,
+            created_at
+     FROM links
+     WHERE code IN (${placeholders})`
+  )
+    .bind(...cleanCodes)
+    .all();
+  const byCode = new Map();
+  for (const row of res?.results || []) {
+    byCode.set(String(row.code), row);
+  }
+  return cleanCodes.map((c) => byCode.get(c)).filter(Boolean);
+}
+
+async function readWatchMetrics(env) {
+  try {
+    const raw = await readChannelMeta(env, "watch_deep_link_metrics");
+    if (!raw) return { opened: 0, registered: 0, updated_at: "" };
+    const parsed = JSON.parse(raw);
+    return {
+      opened: Math.max(0, Number.parseInt(String(parsed?.opened ?? 0), 10) || 0),
+      registered: Math.max(0, Number.parseInt(String(parsed?.registered ?? 0), 10) || 0),
+      updated_at: String(parsed?.updated_at || ""),
+    };
+  } catch {
+    return { opened: 0, registered: 0, updated_at: "" };
+  }
+}
+
+async function bumpWatchMetric(env, field) {
+  if (field !== "opened" && field !== "registered") return null;
+  const cur = await readWatchMetrics(env);
+  const nowIso = new Date().toISOString();
+  const next = {
+    opened: Number(cur.opened || 0) + (field === "opened" ? 1 : 0),
+    registered: Number(cur.registered || 0) + (field === "registered" ? 1 : 0),
+    updated_at: nowIso,
+  };
+  await writeChannelMeta(env, "watch_deep_link_metrics", JSON.stringify(next), nowIso);
+  return next;
+}
+
+function sanitizeSalesState(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const hashesIn = Array.isArray(obj.notified_order_hashes) ? obj.notified_order_hashes : [];
+  const hashSet = new Set();
+  const hashes = [];
+  for (const h of hashesIn) {
+    const s = String(h || "").trim();
+    if (!/^[a-f0-9]{16,128}$/i.test(s) || hashSet.has(s)) continue;
+    hashSet.add(s);
+    hashes.push(s.toLowerCase());
+  }
+  const cappedHashes = hashes.length > 500 ? hashes.slice(-500) : hashes;
+  const dailySummary = {};
+  if (obj.daily_summary_sent && typeof obj.daily_summary_sent === "object") {
+    for (const [k, v] of Object.entries(obj.daily_summary_sent)) {
+      if (/^\d{8}$/.test(String(k))) dailySummary[String(k)] = Boolean(v);
+    }
+  }
+  const monthMilestone = {};
+  if (obj.month_milestone_sent && typeof obj.month_milestone_sent === "object") {
+    for (const [k, v] of Object.entries(obj.month_milestone_sent)) {
+      if (/^\d{6}$/.test(String(k))) {
+        monthMilestone[String(k)] = Math.max(0, Number.parseInt(String(v ?? 0), 10) || 0);
+      }
+    }
+  }
+  return {
+    notified_order_hashes: cappedHashes,
+    month: /^\d{6}$/.test(String(obj.month || "")) ? String(obj.month) : "",
+    month_milestone_step: Math.max(0, Number.parseInt(String(obj.month_milestone_step ?? 0), 10) || 0),
+    milestone_retry_pending: Boolean(obj.milestone_retry_pending),
+    daily_summary_sent: dailySummary,
+    month_milestone_sent: monthMilestone,
+    updated_at: String(obj.updated_at || new Date().toISOString()),
+  };
+}
+
+async function handleSalesStateGet(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const raw = await readChannelMeta(env, "sales_tracker_state");
+  let state = sanitizeSalesState({});
+  if (raw) {
+    try {
+      state = sanitizeSalesState(JSON.parse(raw));
+    } catch {
+      state = sanitizeSalesState({});
+    }
+  }
+  return jsonResponse({ ok: true, state });
+}
+
+async function handleSalesStatePost(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const next = sanitizeSalesState({ ...(body || {}), updated_at: new Date().toISOString() });
+  await writeChannelMeta(env, "sales_tracker_state", JSON.stringify(next), next.updated_at);
+  return jsonResponse({ ok: true, state: next });
+}
+
+function mergeSourceFunnelEntry(existingSources, incomingSources) {
+  const out = {};
+  const srcObj = existingSources && typeof existingSources === "object" ? existingSources : {};
+  for (const [src, vals] of Object.entries(srcObj)) {
+    if (!vals || typeof vals !== "object") continue;
+    out[src] = {
+      found: Number(vals.found || 0),
+      new: Number(vals.new || 0),
+      price_ok: Number(vals.price_ok || 0),
+      passed: Number(vals.passed || 0),
+      blocked: Number(vals.blocked || 0),
+      reasons: vals.reasons && typeof vals.reasons === "object" ? { ...vals.reasons } : {},
+    };
+  }
+  const incObj = incomingSources && typeof incomingSources === "object" ? incomingSources : {};
+  for (const [rawSrc, rawVals] of Object.entries(incObj)) {
+    const src = String(rawSrc || "").trim().toLowerCase().slice(0, 32);
+    if (!src || !rawVals || typeof rawVals !== "object") continue;
+    if (!out[src]) {
+      out[src] = { found: 0, new: 0, price_ok: 0, passed: 0, blocked: 0, reasons: {} };
+    }
+    out[src].found += Math.max(0, Number.parseInt(String(rawVals.found ?? 0), 10) || 0);
+    out[src].new += Math.max(0, Number.parseInt(String(rawVals.new ?? 0), 10) || 0);
+    out[src].price_ok += Math.max(0, Number.parseInt(String(rawVals.price_ok ?? 0), 10) || 0);
+    out[src].passed += Math.max(0, Number.parseInt(String(rawVals.passed ?? 0), 10) || 0);
+    out[src].blocked += Math.max(0, Number.parseInt(String(rawVals.blocked ?? 0), 10) || 0);
+    const incReasons = rawVals.reasons && typeof rawVals.reasons === "object" ? rawVals.reasons : {};
+    for (const [rk, rv] of Object.entries(incReasons)) {
+      const reasonKey = String(rk || "").trim().slice(0, 48);
+      if (!reasonKey) continue;
+      out[src].reasons[reasonKey] = Number(out[src].reasons[reasonKey] || 0) + Math.max(0, Number.parseInt(String(rv ?? 0), 10) || 0);
+    }
+  }
+  return out;
+}
+
+async function handleChannelFunnelPost(request, env) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
+  const { kstDate } = toKstParts(new Date());
+  const dateKey = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.date || "")) ? String(body.date) : kstDate;
+  const metaKey = `source_funnel_${dateKey}`;
+  let cur = { date: dateKey, runs: 0, sources: {}, updated_at: "" };
+  const raw = await readChannelMeta(env, metaKey);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        cur = {
+          date: dateKey,
+          runs: Number(parsed.runs || 0),
+          sources: parsed.sources || {},
+          updated_at: String(parsed.updated_at || ""),
+        };
+      }
+    } catch {}
+  }
+  const addRuns = Math.max(1, Number.parseInt(String(body?.runs ?? 1), 10) || 1);
+  const nowIso = new Date().toISOString();
+  const next = {
+    date: dateKey,
+    runs: cur.runs + addRuns,
+    sources: mergeSourceFunnelEntry(cur.sources, body?.sources),
+    updated_at: nowIso,
+  };
+  await writeChannelMeta(env, metaKey, JSON.stringify(next), nowIso);
+  return jsonResponse({ ok: true, funnel: next });
+}
+
+async function readSourceFunnelSummary(env, days = 1) {
+  const safeDays = clampInt(days, 1, 1, 7);
+  const nowMs = Date.now();
+  const keys = [];
+  for (let i = 0; i < safeDays; i += 1) {
+    const { kstDate } = toKstParts(new Date(nowMs - i * 86400 * 1000));
+    keys.push(`source_funnel_${kstDate}`);
+  }
+  let totalRuns = 0;
+  let mergedSources = {};
+  let latestUpdated = "";
+  for (const key of keys) {
+    const raw = await readChannelMeta(env, key);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      totalRuns += Number(parsed?.runs || 0);
+      mergedSources = mergeSourceFunnelEntry(mergedSources, parsed?.sources);
+      if (parsed?.updated_at && String(parsed.updated_at) > latestUpdated) {
+        latestUpdated = String(parsed.updated_at);
+      }
+    } catch {}
+  }
+  return {
+    days: safeDays,
+    date: toKstParts(new Date(nowMs)).kstDate,
+    runs: totalRuns,
+    sources: mergedSources,
+    updated_at: latestUpdated,
+  };
+}
+
+async function handleChannelFunnelGet(request, env, url) {
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const days = clampInt(url.searchParams.get("days"), 1, 1, 7);
+  const funnel = await readSourceFunnelSummary(env, days);
+  return jsonResponse({ ok: true, ...funnel });
+}
+
 async function sendWatchdogAlert(env, message, nowMs = Date.now(), throttleMs = 6 * 3600 * 1000) {
   const adminId = parseAdminChatId(env);
   if (adminId === null || !String(env?.TELEGRAM_BOT_TOKEN || "").trim()) return false;
@@ -1445,7 +1727,8 @@ export async function runDailyMaintenance(env, nowDate = new Date()) {
   const cutoff14d = new Date(nowMs - 14 * 86400 * 1000).toISOString();
   const cutoff365d = new Date(nowMs - 365 * 86400 * 1000).toISOString();
 
-  const pruned = { sessions: 0, posts: 0, clicks: 0, links: 0 };
+  const pruned = { sessions: 0, posts: 0, clicks: 0, links: 0, funnels: 0 };
+  const funnelCutoffKey = `source_funnel_${toKstParts(new Date(nowMs - 14 * 86400 * 1000)).kstDate}`;
   try {
     const rSess = await env.DB.prepare("DELETE FROM bot_sessions WHERE updated_at < ?").bind(cutoff30d).run();
     const rPost = await env.DB.prepare("DELETE FROM posted_messages WHERE posted_at < ?").bind(cutoff14d).run();
@@ -1455,10 +1738,17 @@ export async function runDailyMaintenance(env, nowDate = new Date()) {
     )
       .bind(cutoff365d)
       .run();
+    const rFunnels = await env.DB.prepare(
+      "DELETE FROM channel_meta WHERE key LIKE 'source_funnel_%' AND key < ?"
+    )
+      .bind(funnelCutoffKey)
+      .run()
+      .catch(() => ({ meta: { changes: 0 } }));
     pruned.sessions = Number(rSess?.meta?.changes || 0);
     pruned.posts = Number(rPost?.meta?.changes || 0);
     pruned.clicks = Number(rClicks?.meta?.changes || 0);
     pruned.links = Number(rLinks?.meta?.changes || 0);
+    pruned.funnels = Number(rFunnels?.meta?.changes || 0);
   } catch (err) {
     console.warn(JSON.stringify({ event: "d1_prune_error", message: String(err) }));
   }
@@ -1644,6 +1934,14 @@ export default {
     if (path === "/api/channel/status") {
       if (method === "GET") return handleChannelStatusGet(request, env);
       if (method === "POST") return handleChannelStatusPost(request, env);
+    }
+    if (path === "/api/channel/funnel") {
+      if (method === "GET") return handleChannelFunnelGet(request, env, url);
+      if (method === "POST") return handleChannelFunnelPost(request, env);
+    }
+    if (path === "/api/sales/state") {
+      if (method === "GET") return handleSalesStateGet(request, env);
+      if (method === "POST") return handleSalesStatePost(request, env);
     }
     if (method === "POST" && path === "/api/posts") {
       return handleCreatePost(request, env);

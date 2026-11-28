@@ -34,8 +34,13 @@ from click_tracker import (
     fetch_active_posted_messages,
     fetch_channel_member_stats,
     fetch_click_stats,
+    fetch_sales_tracker_state,
+    fetch_source_funnel,
     format_click_stats_telegram,
     format_member_stats_line,
+    format_source_funnel_block,
+    hash_order_key,
+    is_click_tracker_enabled,
     list_keyword_alerts,
     match_alerts_for_deal,
     match_alerts_for_title,
@@ -45,6 +50,8 @@ from click_tracker import (
     remove_keyword_alert,
     report_channel_member_count,
     report_flyer_status,
+    report_source_funnel,
+    save_sales_tracker_state,
     update_posted_message,
 )
 from coupang_api import (
@@ -3106,6 +3113,7 @@ def evaluate_deal_quality(
     effective_unit_display = str(unit_metrics.get("display_unit") or "")
 
     is_30d_low = False
+    observed_low_label = ""
     if (
         price_db is not None
         and not is_ambig
@@ -3120,15 +3128,26 @@ def evaluate_deal_quality(
             min_days=2,
         )
         if low_base and total_p < int(low_base["min_price"]):
-            is_30d_low = True
+            obs_days = int(low_base.get("distinct_days", 0) or 0)
+            drop_won = int(low_base["min_price"]) - total_p
+            if obs_days >= 7:
+                is_30d_low = True
+                observed_low_label = f"최근 30일 중 {obs_days}일 최저가"
+            elif obs_days >= 2 and drop_won >= 500:
+                is_30d_low = False
+                observed_low_label = f"직전 관측가보다 {drop_won:,}원↓ ({obs_days}일)"
 
     base_res: Dict[str, Any] = {
         "passed": False,
         "reason": "low_discount",
         "track": "",
         "category": category,
-        "evidence_badge": "30일 최저가" if is_30d_low else "",
-        "evidence_note": "🏆 30일 관측 최저가" if is_30d_low else "",
+        "evidence_badge": observed_low_label if is_30d_low else "",
+        "evidence_note": (
+            f"🏆 {observed_low_label}"
+            if is_30d_low
+            else (f"📉 {observed_low_label}" if observed_low_label else "")
+        ),
         "baseline_price": 0,
         "observed_disc_rate": 0,
         "effective_unit_display": effective_unit_display,
@@ -3137,6 +3156,7 @@ def evaluate_deal_quality(
         "is_ambiguous": is_ambig,
         "obs_ship_type": obs_ship_type,
         "is_30d_low": is_30d_low,
+        "observed_low_label": observed_low_label,
     }
 
     low_title = base_title.lower()
@@ -3548,7 +3568,23 @@ def process_deal(
     ocr_cache: Optional[Dict[str, Any]] = None,
     alerts_cache: Optional[List[Dict[str, Any]]] = None,
     notified_deal_ids: Optional[Set[str]] = None,
+    funnel_stats: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> bool:
+    def _funnel_bucket() -> Optional[Dict[str, Any]]:
+        if funnel_stats is None:
+            return None
+        b = funnel_stats.setdefault(
+            source_name,
+            {"found": 0, "new": 0, "price_ok": 0, "passed": 0, "blocked": 0, "reasons": {}},
+        )
+        return b
+
+    def _funnel_drop(reason_key: str) -> None:
+        b = _funnel_bucket()
+        if b is not None and reason_key:
+            rs = b.setdefault("reasons", {})
+            rs[reason_key] = int(rs.get(reason_key, 0) or 0) + 1
+
     deal_id = d["id"]
     if deal_id in seen:
         return False
@@ -3588,6 +3624,7 @@ def process_deal(
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
         price_db.delete_pending_wait(wait_key)
+        _funnel_drop("no_link")
         return False
 
     raw_url = detail["coupang_url"]
@@ -3603,6 +3640,7 @@ def process_deal(
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
         price_db.delete_pending_wait(wait_key)
+        _funnel_drop("sold_out" if is_closed_deal(base_title) else "permanent")
         return False
 
     option_key = build_option_key(product_id=product_id, url=clean_url, title=base_title, body_text=body_text)
@@ -3625,6 +3663,7 @@ def process_deal(
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
             price_db.delete_pending_wait(wait_key)
+            _funnel_drop("duplicate")
             return False
         if drop_pct > 0:
             logger.info(f"📉 [가격하락 재진입 후보] {option_key} 추가 {drop_pct}%↓: {clean_title[:35]}")
@@ -3649,6 +3688,7 @@ def process_deal(
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
             price_db.delete_pending_wait(wait_key)
+            _funnel_drop("price_fail")
             return False
         can_reenter, drop_pct = _can_reenter_recent_product(product_id, option_key, total_price, price_db)
         if not can_reenter:
@@ -3657,6 +3697,7 @@ def process_deal(
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
             price_db.delete_pending_wait(wait_key)
+            _funnel_drop("duplicate")
             return False
         if drop_pct > 0:
             logger.info(f"📉 [가격하락 재진입 확정] {option_key} 추가 {drop_pct}%↓ ({total_price:,}원)")
@@ -3670,7 +3711,12 @@ def process_deal(
         save_seen(seen)
         _drop_ocr_cache_entry(ocr_cache, deal_id)
         price_db.delete_pending_wait(wait_key)
+        _funnel_drop("price_fail")
         return False
+
+    fb = _funnel_bucket()
+    if fb is not None:
+        fb["price_ok"] = int(fb.get("price_ok", 0) or 0) + 1
 
     # 유효 가격 관측 이력 적재 (확정 옵션/구성 + 확정 배송 조건 'free'|'paid'만 1일 최저가 기록)
     eval_res = evaluate_deal_quality(
@@ -3713,6 +3759,7 @@ def process_deal(
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
             price_db.delete_pending_wait(wait_key)
+            _funnel_drop("permanent")
         elif reason == "low_discount":
             min_cat_rate = CATEGORY_MIN_DISCOUNT_MAP.get(eval_res["category"], MIN_HOTDEAL_DISCOUNT_RATE)
             if ocr_failed and ocr_imgs and (
@@ -3728,6 +3775,7 @@ def process_deal(
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
             price_db.delete_pending_wait(wait_key)
+            _funnel_drop("low_discount")
         else:
             price_db.upsert_pending_wait(
                 wait_key=wait_key,
@@ -3740,6 +3788,7 @@ def process_deal(
                 reason="wait",
                 max_wait_minutes=WAIT_EXPIRE_MINUTES,
             )
+            _funnel_drop("wait")
             logger.info(
                 f"⏳ [검증대기/{eval_res['category']}] 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
             )
@@ -3757,11 +3806,20 @@ def process_deal(
             seen.add(deal_id)
             save_seen(seen)
             _drop_ocr_cache_entry(ocr_cache, deal_id)
+            _funnel_drop("link_fail")
             return False
         deeplink = items[0].get("shortenUrl") or items[0].get("landingUrl")
     except Exception as e:
         logger.error(f"딥링크 생성 실패: {e}")
+        _funnel_drop("link_fail")
         return False
+
+    display_unit = str(p_info.get("unit_info") or "")
+    eff_unit = str(eval_res.get("effective_unit_display") or "")
+    if eval_res.get("is_ambiguous"):
+        display_unit = ""
+    elif eff_unit:
+        display_unit = f"{eff_unit} (배송포함)" if int(p_info.get("shipping_fee", 0) or 0) > 0 else eff_unit
 
     deeplink = register_tracked_link(
         deeplink,
@@ -3772,14 +3830,10 @@ def process_deal(
         title=clean_title,
         sale_price=int(p_info["final_price"]),
         discount_rate=int(p_info["discount_rate"]),
+        unit_info=display_unit,
+        shipping_label=str(p_info.get("shipping_label") or ""),
+        option_key=option_key,
     )
-
-    display_unit = str(p_info.get("unit_info") or "")
-    eff_unit = str(eval_res.get("effective_unit_display") or "")
-    if eval_res.get("is_ambiguous"):
-        display_unit = ""
-    elif eff_unit:
-        display_unit = f"{eff_unit} (배송포함)" if int(p_info.get("shipping_fee", 0) or 0) > 0 else eff_unit
 
     reaction_quote = extract_best_reaction_quote(
         detail.get("comment_texts") or [],
@@ -3801,6 +3855,7 @@ def process_deal(
             "evidence_badge": eval_res["evidence_badge"],
             "evidence_note": eval_res["evidence_note"],
             "is_30d_low": bool(eval_res.get("is_30d_low")),
+            "observed_low_label": str(eval_res.get("observed_low_label") or ""),
             "clean_title": clean_title,
             "short_title": shorten_card_title(clean_title),
             "orig_price": int(p_info["orig_price"]),
@@ -3843,6 +3898,8 @@ def process_deal(
                         save_post_quota(quota)
                     if run_stats is not None:
                         run_stats["sent"] = run_stats.get("sent", 0) + 1
+                    if fb is not None:
+                        fb["passed"] = int(fb.get("passed", 0) or 0) + 1
                     tag = _format_mega_log_tag(item)
                     logger.info(
                         f"🚨 [{source_name}] {tag} 단독 리치전단지 즉시 송출 완료: {clean_title} "
@@ -3867,6 +3924,8 @@ def process_deal(
         price_db.record_published(option_key, product_id, total_price, int(p_info["final_price"]), track=track)
         if run_stats is not None:
             run_stats["queued"] = run_stats.get("queued", 0) + 1
+        if fb is not None:
+            fb["passed"] = int(fb.get("passed", 0) or 0) + 1
         logger.info(
             f"📥 [{source_name}/Track{track}] 전단지 큐 적재 ({len(flyer_queue)}/{FLYER_BATCH_SIZE}): {clean_title} "
             f"(정가={item['orig_price']:,}원, 특가={item['sale_price']:,}원, 할인율={item['discount_rate']}%, 배송={item['shipping_label'] or '미확인'})"
@@ -4238,19 +4297,38 @@ def run_goldbox_staggered(
 
 
 def load_sales_tracker() -> Dict[str, Any]:
+    if is_click_tracker_enabled():
+        d1_state = fetch_sales_tracker_state()
+        if isinstance(d1_state, dict):
+            return d1_state
     if os.path.exists(TRACKER_FILE):
         try:
             with open(TRACKER_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
         except Exception:
             pass
     return {}
 
 
 def save_sales_tracker(data: Dict[str, Any]):
+    clean = dict(data or {})
+    legacy = clean.pop("notified_order_keys", None)
+    if legacy and "notified_order_hashes" not in clean:
+        clean["notified_order_hashes"] = [hash_order_key(str(k)) for k in legacy if k][-500:]
+    elif "notified_order_hashes" in clean:
+        clean["notified_order_hashes"] = list(clean.get("notified_order_hashes") or [])[-500:]
+
+    if is_click_tracker_enabled():
+        if save_sales_tracker_state(clean):
+            return
+        logger.warning("⚠️ D1 판매 상태 저장 실패 — 평문 노출 방지를 위해 로컬 sales_tracker.json 저장 건너뜀")
+        return
+
     try:
         with open(TRACKER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(clean, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"sales_tracker 저장 오류: {e}")
 
@@ -4269,8 +4347,20 @@ def check_and_notify_sales():
         items = res.get("data", []) or []
 
         tracker = load_sales_tracker()
-        is_first_migration = "notified_order_keys" not in tracker
         tracker_changed = False
+        if "notified_order_keys" in tracker:
+            legacy_keys = tracker.pop("notified_order_keys", []) or []
+            migrated_hashes = list(tracker.get("notified_order_hashes") or [])
+            for lk in legacy_keys:
+                kh = hash_order_key(str(lk))
+                if kh and kh not in migrated_hashes:
+                    migrated_hashes.append(kh)
+            tracker["notified_order_hashes"] = migrated_hashes[-500:]
+            tracker_changed = True
+
+        is_first_migration = "notified_order_hashes" not in tracker or (
+            not tracker.get("notified_order_hashes") and not tracker.get("month")
+        )
 
         if tracker.get("month") != month_str:
             tracker["month"] = month_str
@@ -4279,11 +4369,12 @@ def check_and_notify_sales():
             tracker_changed = True
 
         if is_first_migration:
-            seeded_keys: List[str] = []
+            seeded_hashes: List[str] = []
             for it in items:
                 k = f"{it.get('date')}_{it.get('orderId')}_{it.get('productId')}"
-                if k not in seeded_keys:
-                    seeded_keys.append(k)
+                kh = hash_order_key(k)
+                if kh and kh not in seeded_hashes:
+                    seeded_hashes.append(kh)
             try:
                 comm_res = coupang_api.get_commission_report(start_date=month_start, end_date=today_str)
                 comm_rows = comm_res.get("data", []) or []
@@ -4291,22 +4382,23 @@ def check_and_notify_sales():
                 tracker["month_milestone_step"] = m_gmv // 100000
             except Exception:
                 pass
-            tracker["notified_order_keys"] = seeded_keys[-500:]
+            tracker["notified_order_hashes"] = seeded_hashes[-500:]
             save_sales_tracker(tracker)
-            logger.info(f"📦 sales_tracker 새 스키마 마이그레이션 완료 (최근 4일 기존 주문 {len(seeded_keys)}건 시드)")
+            logger.info(f"📦 판매 추적 해시 스키마 초기화 완료 (최근 4일 기존 주문 {len(seeded_hashes)}건)")
             return
 
-        notified_list: List[str] = list(tracker.get("notified_order_keys", []))
+        notified_list: List[str] = list(tracker.get("notified_order_hashes", []))
         notified_set = set(notified_list)
 
         new_items: List[Dict[str, Any]] = []
-        new_keys: List[str] = []
+        new_hashes: List[str] = []
         for it in items:
             k = f"{it.get('date')}_{it.get('orderId')}_{it.get('productId')}"
-            if k not in notified_set:
+            kh = hash_order_key(k)
+            if kh and kh not in notified_set:
                 new_items.append(it)
-                new_keys.append(k)
-                notified_set.add(k)
+                new_hashes.append(kh)
+                notified_set.add(kh)
 
         need_milestone_check = bool(new_items) or bool(tracker.get("milestone_retry_pending"))
         if not need_milestone_check:
@@ -4362,8 +4454,8 @@ def check_and_notify_sales():
             )
             order_ok = bool(target_channel) and bool(send_telegram(chat_id=target_channel, text=msg))
             if order_ok:
-                notified_list.extend(new_keys)
-                tracker["notified_order_keys"] = notified_list[-500:]
+                notified_list.extend(new_hashes)
+                tracker["notified_order_hashes"] = notified_list[-500:]
                 tracker_changed = True
                 logger.info(f"📢 새 주문 알림 발송: +{len(new_items)}건 ({new_gmv:,}원 / 수수료 {new_comm:,}원)")
             else:
@@ -4801,6 +4893,13 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             daily_lines.append(f"• {' · '.join(live_parts)}")
         daily_bottom_block = "━━━━━━━━━━━━━━━━━━\n" + "\n".join(daily_lines)
 
+        funnel_block = ""
+        try:
+            funnel_data = fetch_source_funnel(days=1)
+            funnel_block = format_source_funnel_block(funnel_data)
+        except Exception as fn_err:
+            logger.warning(f"출처별 수집 퍼널 조회 생략: {fn_err}")
+
         report_msg = (
             f"📊 <b>[쿠팡 파트너스 일일·월간 결산]</b>\n"
             f"📅 리포트 일자: {now.strftime('%Y년 %m월 %d일')}\n\n"
@@ -4810,6 +4909,7 @@ def run_daily_report_if_night(seen: Set[str]) -> int:
             f"• 총 결제 금액: <b>{m_gmv:,}원</b>\n"
             f"• <b>총 확정 수익</b>: <b>{m_comm:,}원</b>\n\n"
             f"{channel_split_block}{click_stats_block}\n\n"
+            f"{funnel_block}"
             f"※ <i>쿠팡 파트너스 API는 D+1~D+2 지연 집계 기준입니다.</i>\n\n"
             f"{daily_bottom_block}"
         )
@@ -4871,7 +4971,7 @@ def sync_git_push():
     if os.getenv("GITHUB_ACTIONS"):
         return
     try:
-        files = [f for f in ("seen_deals.json", "sales_tracker.json", "post_quota.json", "flyer_queue.json") if os.path.exists(os.path.join(BASE_DIR, f))]
+        files = [f for f in ("seen_deals.json", "post_quota.json", "flyer_queue.json") if os.path.exists(os.path.join(BASE_DIR, f))]
         if not files:
             return
         subprocess.run(["git", "add"] + files, cwd=BASE_DIR, capture_output=True, timeout=5, **_hidden_subp_kwargs())
@@ -4918,6 +5018,7 @@ def main():
     alerts_cache = list_keyword_alerts() or []
     notified_deal_ids: Set[str] = set()
     run_stats = {"queued": 0, "sent": 0}
+    funnel_by_source: Dict[str, Dict[str, Any]] = {}
 
     def _remaining_daily_room() -> int:
         c = int(quota.get("community_sent", 0) or 0)
@@ -4941,8 +5042,13 @@ def main():
         )
         collected_by_source: List[Tuple[str, Any, List[Dict[str, Any]]]] = []
         for collector, parser, source_name in sources:
+            fb_src = funnel_by_source.setdefault(
+                source_name,
+                {"found": 0, "new": 0, "price_ok": 0, "passed": 0, "blocked": 0, "reasons": {}},
+            )
             cd = _is_source_blocked_this_run(source_name, price_db)
             if cd:
+                fb_src["blocked"] = int(fb_src.get("blocked", 0) or 0) + 1
                 logger.info(
                     f"⏸️ [{source_name}] 쿨다운 중 (HTTP {cd.get('status_code')}, ~{cd.get('cooldown_until')}) — 목록 수집 생략"
                 )
@@ -4952,6 +5058,9 @@ def main():
             except Exception as e:
                 logger.error(f"[{source_name}] 목록 수집 오류: {e}")
                 rows = []
+            fb_src["found"] = len(rows)
+            new_rows = [row for row in rows if row.get("id") not in seen]
+            fb_src["new"] = len(new_rows)
             collected_by_source.append((source_name, parser, rows))
 
         iterators = {
@@ -4999,6 +5108,7 @@ def main():
                         ocr_cache=ocr_cache,
                         alerts_cache=alerts_cache,
                         notified_deal_ids=notified_deal_ids,
+                        funnel_stats=funnel_by_source,
                     )
                     processed_one = True
                 if _is_source_blocked_this_run(src, price_db):
@@ -5063,6 +5173,12 @@ def main():
         )
     except Exception as st_err:
         logger.warning(f"전단지 현황 D1 기록 생략: {st_err}")
+
+    if funnel_by_source:
+        try:
+            report_source_funnel(funnel_by_source, date_str=datetime.now(KST).strftime("%Y-%m-%d"))
+        except Exception as fn_err:
+            logger.warning(f"출처별 수집 퍼널 D1 보고 생략: {fn_err}")
 
     # 최근 4일 주문 집계 감지 및 마일스톤 알림
     try:

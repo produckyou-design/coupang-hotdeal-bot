@@ -52,6 +52,17 @@ function createMockD1() {
       const key = m ? m[1] : String(args[0]);
       return store.channel_meta.has(key) ? { value: store.channel_meta.get(key) } : null;
     }
+    if (s.startsWith("DELETE FROM channel_meta WHERE key LIKE 'source_funnel_%'")) {
+      const cutoff = String(args[0]);
+      let changes = 0;
+      for (const k of Array.from(store.channel_meta.keys())) {
+        if (k.startsWith("source_funnel_") && k < cutoff) {
+          store.channel_meta.delete(k);
+          changes += 1;
+        }
+      }
+      return { meta: { changes } };
+    }
     if (s.startsWith("INSERT INTO channel_meta")) {
       const m = /VALUES \('([^']+)'/.exec(s);
       const key = m ? m[1] : String(args[0]);
@@ -177,6 +188,10 @@ function createMockD1() {
     if (s.startsWith("SELECT code, product_id, title, source, sale_price")) {
       return { results: store.links.filter((l) => l.created_at >= String(args[0]) && l.title !== "") };
     }
+    if (s.startsWith("SELECT code, target_url, deal_id, product_id, source, track, title, sale_price, discount_rate")) {
+      const want = new Set(args.map((a) => String(a)));
+      return { results: store.links.filter((l) => want.has(String(l.code))) };
+    }
     if (s.startsWith("INSERT INTO links")) {
       store.links.push({
         code: args[0],
@@ -188,7 +203,10 @@ function createMockD1() {
         title: args[6],
         sale_price: Number(args[7]),
         discount_rate: Number(args[8]),
-        created_at: args[9],
+        unit_info: args.length >= 13 ? String(args[9] || "") : "",
+        shipping_label: args.length >= 13 ? String(args[10] || "") : "",
+        option_key: args.length >= 13 ? String(args[11] || "") : "",
+        created_at: args.length >= 13 ? String(args[12] || "") : String(args[9] || ""),
       });
       return { meta: { changes: 1 } };
     }
@@ -594,6 +612,178 @@ test("reportCmd places daily performance summary at the very bottom", async () =
     assert.ok(idxMonth >= 0 && idxChan > idxMonth && idxOrders > idxChan && idxNote > idxOrders);
     assert.ok(idxDaily > idxNote, `expected daily section at bottom, got:\n${txt}`);
     assert.match(txt.slice(idxDaily), /구독자 <b>50명<\/b>/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("sales state, source funnel, report funnel order, and flyer watch deep link conversion", async () => {
+  const db = createMockD1();
+  const tgCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : {};
+    tgCalls.push({ u, body });
+    if (u.includes("/reports/commission") || u.includes("/reports/orders")) {
+      return new Response(JSON.stringify({ rCode: "0", data: [] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }), { status: 200 });
+  };
+
+  try {
+    const env = {
+      DB: db,
+      CLICK_TRACKER_API_KEY: "api-sec",
+      TELEGRAM_BOT_TOKEN: "123:test",
+      TELEGRAM_ADMIN_CHAT_ID: "999001",
+      TELEGRAM_WEBHOOK_SECRET: "sec",
+      COUPANG_ACCESS_KEY: "ak",
+      COUPANG_SECRET_KEY: "sk",
+    };
+
+    // 1) Private D1 sales state
+    const hashHex = "a".repeat(64);
+    let res = await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/api/sales/state", {
+        method: "POST",
+        headers: { Authorization: "Bearer api-sec", "Content-Type": "application/json" },
+        body: JSON.stringify({ month: "202611", month_milestone_step: 2, notified_order_hashes: [hashHex] }),
+      }),
+      env
+    );
+    assert.equal(res.status, 200);
+    res = await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/api/sales/state", {
+        headers: { Authorization: "Bearer api-sec" },
+      }),
+      env
+    );
+    const salesJson = await res.json();
+    assert.deepEqual(salesJson.state.notified_order_hashes, [hashHex]);
+    assert.equal(salesJson.state.month, "202611");
+    assert.equal(salesJson.state.month_milestone_step, 2);
+
+    // 2) Per-source funnel accumulation + /report placement
+    const funnelDate = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    for (let i = 0; i < 2; i += 1) {
+      const fRes = await worker.fetch(
+        new Request("https://hotpang-click.example.workers.dev/api/channel/funnel", {
+          method: "POST",
+          headers: { Authorization: "Bearer api-sec", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            date: funnelDate,
+            sources: { ruliweb: { found: 5, new: 2, price_ok: 1, passed: i, reasons: { low_discount: 1 } } },
+          }),
+        }),
+        env
+      );
+      assert.equal(fRes.status, 200);
+    }
+    const gFunnel = await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/api/channel/funnel?days=1", {
+        headers: { Authorization: "Bearer api-sec" },
+      }),
+      env
+    );
+    const gfJson = await gFunnel.json();
+    assert.equal(gfJson.runs, 2);
+    assert.equal(gfJson.sources.ruliweb.found, 10);
+    assert.equal(gfJson.sources.ruliweb.passed, 1);
+    assert.equal(gfJson.sources.ruliweb.reasons.low_discount, 2);
+
+    await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/telegram/webhook", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": "sec", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          update_id: 201,
+          message: { message_id: 2, chat: { id: 999001, type: "private" }, from: { id: 999001 }, text: "/report" },
+        }),
+      }),
+      env
+    );
+    const repEdit = tgCalls.find((c) => c.u.endsWith("/editMessageText"));
+    assert.ok(repEdit);
+    const repTxt = repEdit.body.text;
+    assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") > 0);
+    assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") < repTxt.indexOf("※"));
+
+    // 3) Flyer one-click watch card + conversion tracking
+    const linkRes = await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/api/links", {
+        method: "POST",
+        headers: { Authorization: "Bearer api-sec", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          target_url: "https://link.coupang.com/re/AFFSDP?lptag=AF123&pageKey=77777777",
+          deal_id: "ppomppu_777",
+          product_id: "77777777",
+          source: "ppomppu",
+          track: "A",
+          title: "파워에이드 마운틴블라스트 900ml 12병",
+          sale_price: 10970,
+          discount_rate: 45,
+          unit_info: "1L당 1,016원",
+          shipping_label: "무료",
+          option_key: "pid:77777777:900ml_12",
+        }),
+      }),
+      env
+    );
+    const linkJson = await linkRes.json();
+    assert.equal(linkJson.ok, true);
+
+    tgCalls.length = 0;
+    await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/telegram/webhook", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": "sec", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          update_id: 202,
+          message: {
+            message_id: 3,
+            chat: { id: 555001, type: "private" },
+            from: { id: 555001 },
+            text: `/start w_${linkJson.code}`,
+          },
+        }),
+      }),
+      env
+    );
+    const watchSend = tgCalls.find((c) => c.u.endsWith("/sendMessage"));
+    assert.ok(watchSend);
+    assert.match(watchSend.body.text, /이 구성 목표가 알림 등록/);
+    assert.match(watchSend.body.text, /1L당 1,016원/);
+    const watchBtns = (watchSend.body.reply_markup?.inline_keyboard || []).flat();
+    const watchBtn = watchBtns.find((b) => String(b.callback_data || "").startsWith("alert:watch:77777777:"));
+    assert.ok(watchBtn);
+
+    await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/telegram/webhook", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": "sec", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          update_id: 203,
+          callback_query: {
+            id: "cb-watch-1",
+            from: { id: 555001 },
+            message: { message_id: 901, chat: { id: 555001, type: "private" } },
+            data: watchBtn.callback_data,
+          },
+        }),
+      }),
+      env
+    );
+
+    const aStatsRes = await worker.fetch(
+      new Request("https://hotpang-click.example.workers.dev/api/alerts/stats", {
+        headers: { Authorization: "Bearer api-sec" },
+      }),
+      env
+    );
+    const aStatsJson = await aStatsRes.json();
+    assert.equal(aStatsJson.watch_metrics.opened, 1);
+    assert.equal(aStatsJson.watch_metrics.registered, 1);
   } finally {
     globalThis.fetch = origFetch;
   }

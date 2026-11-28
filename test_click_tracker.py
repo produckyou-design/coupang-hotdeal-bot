@@ -771,6 +771,11 @@ class TestUpgradesV2(unittest.TestCase):
              patch.object(push_deals.coupang_api, "get_order_report", return_value={"data": order_rows}), \
              patch.object(push_deals, "fetch_click_stats", return_value={"today": {"clicks": 15, "unique_links": 4}, "period_total": {"clicks": 50, "total_links": 10}, "days": 7}), \
              patch.object(push_deals, "fetch_channel_member_stats", return_value={"count": 50, "today_net": 1}), \
+             patch.object(
+                 push_deals,
+                 "fetch_source_funnel",
+                 return_value={"runs": 4, "sources": {"arca": {"found": 10, "new": 4, "price_ok": 3, "passed": 1, "reasons": {"low_discount": 2}}}},
+             ), \
              patch.object(push_deals, "save_seen"), \
              patch.object(push_deals, "ADMIN_CHAT_ID", "999001"), \
              patch.object(push_deals, "send_telegram", return_value=True) as mock_send:
@@ -780,12 +785,47 @@ class TestUpgradesV2(unittest.TestCase):
         sent = mock_send.call_args.kwargs["text"]
         idx_month = sent.index("월 누적")
         idx_chan = sent.index("채널별 분리 집계")
+        idx_funnel = sent.index("오늘 출처별 수집 퍼널")
         idx_note = sent.index("※")
         idx_daily = sent.index("최근 확정일 실적 (2026.11.27)")
         self.assertGreater(idx_daily, idx_note)
-        self.assertGreater(idx_note, idx_chan)
+        self.assertGreater(idx_note, idx_funnel)
+        self.assertGreater(idx_funnel, idx_chan)
         self.assertGreater(idx_chan, idx_month)
         self.assertIn("구독자 <b>50명</b>", sent[idx_daily:])
+
+    def test_hmac_sales_tracker_no_plaintext_order_id_and_funnel_helpers(self):
+        import json
+        import push_deals
+
+        h1 = click_tracker.hash_order_key("20261128_987654321_123456", secret="my-secret")
+        h2 = click_tracker.hash_order_key("20261128_987654321_123456", secret="other-secret")
+        self.assertEqual(len(h1), 64)
+        self.assertNotEqual(h1, h2)
+        self.assertNotIn("987654321", h1)
+
+        block = click_tracker.format_source_funnel_block({
+            "runs": 5,
+            "sources": {
+                "ruliweb": {"found": 12, "new": 3, "price_ok": 1, "passed": 0, "reasons": {"low_discount": 1}},
+            },
+        })
+        self.assertIn("루리웹", block)
+        self.assertIn("할인부족(1)", block)
+
+        saved_states = []
+        with patch.object(push_deals, "is_click_tracker_enabled", return_value=True), \
+             patch.object(push_deals, "fetch_sales_tracker_state", return_value={}), \
+             patch.object(push_deals, "save_sales_tracker_state", side_effect=lambda st: saved_states.append(st) or True), \
+             patch.object(push_deals.coupang_api, "get_order_report", return_value={"data": [{"date": "20261128", "orderId": "ORD999888", "productId": "555111"}]}), \
+             patch.object(push_deals.coupang_api, "get_commission_report", return_value={"rCode": "0", "data": []}):
+            push_deals.check_and_notify_sales()
+
+        self.assertEqual(len(saved_states), 1)
+        dumped = json.dumps(saved_states[0], ensure_ascii=False)
+        self.assertNotIn("ORD999888", dumped)
+        self.assertNotIn("notified_order_keys", saved_states[0])
+        self.assertEqual(len(saved_states[0].get("notified_order_hashes", [])), 1)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """Cloudflare Workers 기반 실시간 클릭 카운터 클라이언트."""
 
 import argparse
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -47,6 +49,9 @@ def register_tracked_link(
     title: str = "",
     sale_price: int = 0,
     discount_rate: int = 0,
+    unit_info: str = "",
+    shipping_label: str = "",
+    option_key: str = "",
     timeout: float = 4.0,
 ) -> str:
     """쿠팡 파트너스 딥링크를 클릭 트래킹 단축 URL로 등록하고 실패 시 원본 URL 반환(fail-open)."""
@@ -65,6 +70,12 @@ def register_tracked_link(
         "sale_price": int(sale_price or 0),
         "discount_rate": int(discount_rate or 0),
     }
+    if unit_info:
+        payload["unit_info"] = str(unit_info)[:64]
+    if shipping_label:
+        payload["shipping_label"] = str(shipping_label)[:32]
+    if option_key:
+        payload["option_key"] = str(option_key)[:120]
 
     try:
         res = requests.post(
@@ -992,6 +1003,160 @@ def report_flyer_status(
     except Exception as e:
         logger.warning(f"전단지 현황 기록 실패 (무시): {e}")
         return False
+
+
+def hash_order_key(order_key: str, secret: str = "") -> str:
+    """주문 식별 키(날짜_주문번호_상품번호)를 HMAC-SHA256 해시(평문 저장 방지)로 변환."""
+    raw = str(order_key or "").strip()
+    if not raw:
+        return ""
+    key = str(secret or _get_tracker_config()[1] or "").strip()
+    if key:
+        return hmac.new(key.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def fetch_sales_tracker_state(timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """비공개 D1에서 판매 알림 상태(주문 해시 목록 및 마일스톤) 조회."""
+    if not is_click_tracker_enabled():
+        return None
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.get(
+            f"{base_url}/api/sales/state",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        if res.status_code != 200:
+            logger.warning(f"D1 판매 상태 조회 HTTP {res.status_code}")
+            return None
+        data = res.json()
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("state"), dict):
+            return data["state"]
+    except Exception as e:
+        logger.warning(f"D1 판매 상태 조회 실패: {e}")
+    return None
+
+
+def save_sales_tracker_state(state: Dict[str, Any], timeout: float = 5.0) -> bool:
+    """비공개 D1에 판매 알림 상태 저장(평문 주문번호 없이 해시만 저장)."""
+    if not is_click_tracker_enabled():
+        return False
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.post(
+            f"{base_url}/api/sales/state",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=state,
+            timeout=timeout,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        logger.warning(f"D1 판매 상태 저장 실패: {e}")
+        return False
+
+
+def report_source_funnel(
+    sources: Dict[str, Any],
+    date_str: str = "",
+    runs: int = 1,
+    timeout: float = 4.0,
+) -> bool:
+    """출처별 수집 퍼널(발견→신규→가격확인→발행/탈락) 금일 누적 D1 보고(fail-open)."""
+    if not is_click_tracker_enabled() or not isinstance(sources, dict) or not sources:
+        return False
+    base_url, api_key = _get_tracker_config()
+    payload: Dict[str, Any] = {"runs": max(1, int(runs or 1)), "sources": sources}
+    if date_str:
+        payload["date"] = str(date_str).strip()
+    try:
+        res = requests.post(
+            f"{base_url}/api/channel/funnel",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        logger.warning(f"출처별 수집 퍼널 보고 실패 (무시): {e}")
+        return False
+
+
+def fetch_source_funnel(days: int = 1, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """D1에서 출처별 수집 퍼널 집계 조회."""
+    if not is_click_tracker_enabled():
+        return None
+    base_url, api_key = _get_tracker_config()
+    try:
+        res = requests.get(
+            f"{base_url}/api/channel/funnel",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params={"days": max(1, min(7, int(days)))},
+            timeout=timeout,
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        if isinstance(data, dict) and data.get("ok"):
+            return data
+    except Exception as e:
+        logger.warning(f"출처별 수집 퍼널 조회 실패: {e}")
+    return None
+
+
+_FUNNEL_REASON_KR = {
+    "low_discount": "할인부족",
+    "wait": "재확인대기",
+    "permanent": "비핫딜",
+    "price_fail": "가격추출실패",
+    "sold_out": "품절/종료",
+    "link_fail": "딥링크실패",
+    "duplicate": "중복",
+    "bad_title": "오인식",
+}
+
+
+def format_source_funnel_block(funnel: Optional[Dict[str, Any]]) -> str:
+    """운영자 리포트용 출처별 수집 퍼널 블록 포맷."""
+    if not isinstance(funnel, dict):
+        return ""
+    sources = funnel.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        return ""
+    entries = [
+        (src, vals)
+        for src, vals in sources.items()
+        if isinstance(vals, dict) and (int(vals.get("found", 0) or 0) > 0 or int(vals.get("passed", 0) or 0) > 0)
+    ]
+    if not entries:
+        return ""
+    entries.sort(key=lambda kv: int(kv[1].get("found", 0) or 0), reverse=True)
+    runs = int(funnel.get("runs", 0) or 0)
+    run_note = f" ({runs:,}회 실행)" if runs > 0 else ""
+    lines = [f"🔎 <b>오늘 출처별 수집 퍼널</b>{run_note}"]
+    for src, vals in entries:
+        src_kr = SOURCE_LABEL_MAP.get(str(src).lower(), str(src))
+        found = int(vals.get("found", 0) or 0)
+        new_cnt = int(vals.get("new", 0) or 0)
+        price_ok = int(vals.get("price_ok", 0) or 0)
+        passed = int(vals.get("passed", 0) or 0)
+        reasons = vals.get("reasons") if isinstance(vals.get("reasons"), dict) else {}
+        top_reason_str = ""
+        if reasons:
+            top_k, top_v = max(reasons.items(), key=lambda kv: int(kv[1] or 0))
+            if int(top_v or 0) > 0:
+                lbl = _FUNNEL_REASON_KR.get(str(top_k), str(top_k))
+                top_reason_str = f" · 주탈락: {html.escape(lbl, quote=False)}({int(top_v)})"
+        lines.append(
+            f"• <b>{html.escape(src_kr, quote=False)}</b>: 발견 {found} → 신규 {new_cnt} → 가격 {price_ok} → <b>발행 {passed}</b>{top_reason_str}"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def match_alerts_for_title(

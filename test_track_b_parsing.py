@@ -1450,7 +1450,7 @@ class TestUpgradesIntegration(unittest.TestCase):
             batch_mode="top_clicks",
         )
         self.assertIn("가장 많이 클릭한 쿠팡 핫딜 TOP", cap_pub)
-        self.assertIn("👆 오늘 42명 클릭", cap_pub)
+        self.assertIn("👆 오늘 42회 클릭", cap_pub)
         self.assertEqual(len(kb_pub), 2)
         footer_texts = [b["text"] for b in kb_pub[-1]]
         self.assertTrue(any("키워드 알림" in t for t in footer_texts))
@@ -1613,6 +1613,76 @@ class TestUpgradesIntegration(unittest.TestCase):
             res = push_deals.collect_ruliweb_deals(max_pages=3)
         self.assertEqual(res, [])
         self.assertEqual(mock_get.call_count, 1)
+
+    def test_honest_observed_low_badges_and_watch_deeplinks(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        import flyer_renderer
+        from price_history import PriceHistoryDB
+
+        kst = timezone(timedelta(hours=9))
+        base_dt = datetime.now(kst)
+        p_info = {
+            "orig_price": 20000,
+            "final_price": 10970,
+            "sale_price": 10970,
+            "shipping_fee": 0,
+            "shipping_type": "free",
+            "shipping_condition": "",
+            "discount_rate": 45,
+        }
+        deal_meta = {"votes": 5, "comments": 3, "url": "https://www.coupang.com/vp/products/77777777"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = PriceHistoryDB(str(Path(tmpdir) / "obs_tier.db"))
+            for i in range(2):
+                db.record_observation("pid:77777777:vid:12", "77777777", 12170, 12170, shipping_type="free", now=base_dt - timedelta(days=i + 1))
+            res_2d = push_deals.evaluate_deal_quality(
+                deal_meta, "ppomppu", p_info, "파워에이드 900ml 12병", "", option_key="pid:77777777:vid:12", price_db=db
+            )
+            self.assertFalse(res_2d["is_30d_low"])
+            self.assertEqual(res_2d["observed_low_label"], "직전 관측가보다 1,200원↓ (2일)")
+
+            for i in range(2, 7):
+                db.record_observation("pid:77777777:vid:12", "77777777", 12500, 12500, shipping_type="free", now=base_dt - timedelta(days=i + 1))
+            res_7d = push_deals.evaluate_deal_quality(
+                deal_meta, "ppomppu", p_info, "파워에이드 900ml 12병", "", option_key="pid:77777777:vid:12", price_db=db
+            )
+            self.assertTrue(res_7d["is_30d_low"])
+            self.assertEqual(res_7d["observed_low_label"], "최근 30일 중 7일 최저가")
+
+        single_short = [{
+            "clean_title": "파워에이드 900ml 12병",
+            "short_title": "파워에이드 900ml",
+            "source": "ppomppu",
+            "track": "A",
+            "sale_price": 10970,
+            "orig_price": 20000,
+            "discount_rate": 45,
+            "unit_info": "1L당 1,016원",
+            "shipping_label": "무료",
+            "deeplink": "https://hotpang-click.produckyou.workers.dev/r/pwr90012",
+            "is_30d_low": False,
+            "observed_low_label": "직전 관측가보다 1,200원↓ (2일)",
+        }]
+        cap1, kb1 = flyer_renderer.format_flyer_caption_and_buttons(single_short, include_bot_footer=True)
+        self.assertIn("📉<b>[직전 관측가보다 1,200원↓ (2일)]</b>", cap1)
+        flat_urls_1 = [b.get("url", "") for row in kb1 for b in row]
+        self.assertTrue(any(u.endswith("?start=w_pwr90012") for u in flat_urls_1))
+
+        two_short = [
+            single_short[0],
+            {**single_short[0], "clean_title": "토레타 500ml 24병", "deeplink": "https://hotpang-click.produckyou.workers.dev/r/trt50024", "is_30d_low": True, "observed_low_label": "최근 30일 중 7일 최저가"},
+        ]
+        cap2, kb2 = flyer_renderer.format_flyer_caption_and_buttons(two_short, include_bot_footer=True)
+        self.assertIn("🏆<b>[최근 30일 중 7일 최저가]</b>", cap2)
+        flat_urls_2 = [b.get("url", "") for row in kb2 for b in row]
+        self.assertTrue(any(u.endswith("?start=wf_pwr90012_trt50024") for u in flat_urls_2))
+
+        gb_item = [{**single_short[0], "source": "goldbox"}]
+        _, kb_gb = flyer_renderer.format_flyer_caption_and_buttons(gb_item, include_bot_footer=True)
+        self.assertFalse(any("?start=w" in b.get("url", "") for row in kb_gb for b in row))
 
 
 if __name__ == "__main__":

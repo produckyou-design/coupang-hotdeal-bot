@@ -1097,7 +1097,7 @@ def _build_community_line(d: Dict[str, Any], quote_cap: int = 38, batch_mode: st
     src_kr = format_source_label(str(d.get("source") or ""))
     if batch_mode == "top_clicks":
         clicks_n = int(d.get("clicks", 0) or 0)
-        parts_tc = [f"👆 오늘 {clicks_n:,}명 클릭"] if clicks_n > 0 else []
+        parts_tc = [f"👆 오늘 {clicks_n:,}회 클릭"] if clicks_n > 0 else []
         if src_kr:
             parts_tc.append(f"출처: {html.escape(src_kr, quote=False)}")
         return " · ".join(parts_tc)
@@ -1199,8 +1199,12 @@ def _build_caption_with_limit(
             lines.append(f"<b>{icon} {html.escape(full_t, quote=False)}</b>")
 
         tags: List[str] = []
+        obs_low_label = str(d.get("observed_low_label") or "").strip()
         if d.get("is_30d_low"):
-            tags.append("🏆<b>[30일 최저가]</b>")
+            badge_txt = obs_low_label or "30일 최저가"
+            tags.append(f"🏆<b>[{html.escape(badge_txt, quote=False)}]</b>")
+        elif obs_low_label:
+            tags.append(f"📉<b>[{html.escape(obs_low_label, quote=False)}]</b>")
         if is_half_off_mega(d):
             if disc_r >= 70:
                 tags.append("🚨<b>[대폭 할인]</b>")
@@ -1297,6 +1301,22 @@ def format_flyer_caption_and_buttons(
             inline_keyboard.append([{"text": btn_text, "url": url, "style": "success"}])
 
     if include_bot_footer and inline_keyboard:
+        if not any(_is_goldbox_deal(d) for d in batch):
+            watch_codes: List[str] = []
+            for d in batch:
+                m_code = re.search(r"/r/([A-Za-z0-9]{4,32})(?:[/?#]|$)", str(d.get("deeplink") or ""))
+                if m_code and m_code.group(1) not in watch_codes:
+                    watch_codes.append(m_code.group(1))
+            if len(watch_codes) == 1:
+                inline_keyboard.append([
+                    {"text": "📉 이 구성 목표가 알림", "url": f"https://t.me/coupang_deal_hub_bot?start=w_{watch_codes[0]}"},
+                ])
+            elif len(watch_codes) > 1:
+                joined = "_".join(watch_codes[:4])
+                if len(f"wf_{joined}") <= 64:
+                    inline_keyboard.append([
+                        {"text": "📉 이 전단지 가격 알림", "url": f"https://t.me/coupang_deal_hub_bot?start=wf_{joined}"},
+                    ])
         inline_keyboard.append([
             {"text": "🔔 키워드 알림", "url": "https://t.me/coupang_deal_hub_bot?start=alert"},
             {"text": "⚖️ 단가 비교", "url": "https://t.me/coupang_deal_hub_bot?start=compare"},

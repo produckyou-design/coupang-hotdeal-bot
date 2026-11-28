@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS links (
   title TEXT DEFAULT '',
   sale_price INTEGER DEFAULT 0,
   discount_rate INTEGER DEFAULT 0,
+  unit_info TEXT DEFAULT '',
+  shipping_label TEXT DEFAULT '',
+  option_key TEXT DEFAULT '',
   created_at TEXT NOT NULL
 );
 

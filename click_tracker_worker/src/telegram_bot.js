@@ -225,6 +225,15 @@ function formatAlertStatsTelegram(stats) {
     `• 구독자: <b>${Number(stats?.total_users || 0).toLocaleString("en-US")}명</b> (일시정지 ${Number(stats?.paused_users || 0).toLocaleString("en-US")}명)`,
     `• 등록 키워드: <b>${Number(stats?.total_keywords || 0).toLocaleString("en-US")}개</b> | 누적 DM 발송: <b>${Number(stats?.total_hits || 0).toLocaleString("en-US")}건</b>`,
   ];
+  const wm = stats?.watch_metrics;
+  if (wm && (Number(wm.opened || 0) > 0 || Number(wm.registered || 0) > 0)) {
+    const opened = Number(wm.opened || 0);
+    const registered = Number(wm.registered || 0);
+    const rate = opened > 0 ? Math.round((registered / opened) * 1000) / 10 : 0;
+    lines.push(
+      `• 전단지 원클릭 알림: 열람 <b>${opened.toLocaleString("en-US")}회</b> → 등록 <b>${registered.toLocaleString("en-US")}건</b> (${rate}%)`
+    );
+  }
   const topRows = (stats?.top_keywords || []).slice(0, 10);
   if (topRows.length > 0) {
     lines.push("\n🏆 <b>인기 등록 키워드 TOP</b>");
@@ -236,6 +245,164 @@ function formatAlertStatsTelegram(stats) {
     });
   }
   return lines.join("\n");
+}
+
+const FUNNEL_REASON_KR = {
+  low_discount: "할인부족",
+  wait: "재확인대기",
+  permanent: "비핫딜",
+  price_fail: "가격추출실패",
+  sold_out: "품절/종료",
+  link_fail: "딥링크실패",
+  bad_title: "오인식",
+};
+
+function formatSourceFunnelBlock(funnelData) {
+  const sources = funnelData?.sources;
+  if (!sources || typeof sources !== "object") return "";
+  const entries = Object.entries(sources)
+    .filter(([, v]) => v && (Number(v.found || 0) > 0 || Number(v.passed || 0) > 0))
+    .sort((a, b) => Number(b[1]?.found || 0) - Number(a[1]?.found || 0));
+  if (entries.length === 0) return "";
+  const runs = Number(funnelData.runs || 0);
+  const runNote = runs > 0 ? ` (${runs.toLocaleString("en-US")}회 실행)` : "";
+  const lines = [`🔎 <b>오늘 출처별 수집 퍼널</b>${runNote}`];
+  for (const [src, vals] of entries) {
+    const found = Number(vals.found || 0);
+    const isNew = Number(vals.new || 0);
+    const priceOk = Number(vals.price_ok || 0);
+    const passed = Number(vals.passed || 0);
+    let topReasonStr = "";
+    const reasons = vals.reasons && typeof vals.reasons === "object" ? Object.entries(vals.reasons) : [];
+    if (reasons.length > 0) {
+      reasons.sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+      const [topKey, topCnt] = reasons[0];
+      if (Number(topCnt || 0) > 0) {
+        const label = FUNNEL_REASON_KR[topKey] || topKey;
+        topReasonStr = ` · 주탈락: ${esc(label)}(${Number(topCnt)})`;
+      }
+    }
+    lines.push(
+      `• <b>${esc(sourceKr(src))}</b>: 발견 ${found} → 신규 ${isNew} → 가격 ${priceOk} → <b>발행 ${passed}</b>${topReasonStr}`
+    );
+  }
+  return `${lines.join("\n")}\n\n`;
+}
+
+function calcWatchTargets(salePrice) {
+  const base = Number.parseInt(String(salePrice || 0), 10) || 0;
+  if (base < 1200) return [];
+  const tiers = [5, 10, 15];
+  const out = [];
+  const seen = new Set();
+  for (const pct of tiers) {
+    const raw = Math.floor((base * (100 - pct)) / 100 / 100) * 100;
+    const price = Math.max(1000, raw);
+    if (price >= base || seen.has(price)) continue;
+    seen.add(price);
+    out.push({ pct, price });
+  }
+  return out;
+}
+
+function extractQuickAlertKeyword(title) {
+  let cleaned = String(title || "")
+    .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
+    .replace(/\d+(?:[.,]\d+)?\s*(?:ml|mL|L|g|kg|개|입|병|팩|캔|매|롤|봉|포|정|캡슐|원|%|박스|box)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tokens = cleaned.split(/\s+/).filter((t) => t.length >= 2 && !/^\d+$/.test(t));
+  if (tokens.length === 0) return "";
+  let candidate = tokens.slice(0, 2).join(" ");
+  if (candidate.length > 18) candidate = tokens[0].slice(0, 18);
+  return candidate.length >= 2 ? candidate : "";
+}
+
+async function showWatchCard(env, chat, origin, linkRow, dbOps, countOpened = true) {
+  if (!linkRow) {
+    await replyTo(env, chat.id, "해당 상품 정보를 찾지 못했어요. /alert 로 키워드 알림을 직접 등록해 보세요.", {
+      reply_markup: { inline_keyboard: [[{ text: "🔔 키워드 알림 열기", callback_data: "alert:menu" }]] },
+    });
+    return;
+  }
+  if (countOpened && typeof dbOps?.bumpWatchMetric === "function") {
+    await dbOps.bumpWatchMetric(env, "opened").catch(() => {});
+  }
+  const title = String(linkRow.title || "상품").trim();
+  const pid = String(linkRow.product_id || "").trim();
+  const salePrice = Number(linkRow.sale_price || 0);
+  const unitInfo = String(linkRow.unit_info || "").trim();
+  const shipLabel = String(linkRow.shipping_label || "").trim();
+
+  const metaParts = [];
+  if (salePrice > 0) metaParts.push(`현재가 <b>${salePrice.toLocaleString("en-US")}원</b>`);
+  if (shipLabel) metaParts.push(esc(shipLabel));
+  if (unitInfo) metaParts.push(esc(unitInfo));
+
+  const lines = [
+    "📉 <b>이 구성 목표가 알림 등록</b>",
+    `• 상품: <b>${esc(title)}</b>`,
+  ];
+  if (metaParts.length > 0) lines.push(`• 구성: ${metaParts.join(" · ")}`);
+  lines.push("", "원하는 목표가를 고르면 바로 알림으로 저장됩니다.");
+
+  const kbRows = [];
+  if (pid && salePrice >= 1200) {
+    const targets = calcWatchTargets(salePrice);
+    for (const t of targets) {
+      kbRows.push([
+        {
+          text: `📉 ${t.price.toLocaleString("en-US")}원 이하 (-${t.pct}%)`,
+          callback_data: `alert:watch:${pid}:${t.price}`,
+        },
+      ]);
+    }
+  }
+  const quickKw = extractQuickAlertKeyword(title);
+  if (quickKw) {
+    const cb = safeCbStr("alert:add:", quickKw);
+    if (cb) {
+      kbRows.push([{ text: `🔔 '${quickKw}' 키워드 알림`, callback_data: cb }]);
+    }
+  }
+  kbRows.push([{ text: "📋 내 알림 관리", callback_data: "alert:menu" }]);
+
+  await replyTo(env, chat.id, lines.join("\n"), {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: kbRows },
+  });
+}
+
+async function handleWatchDeepLink(env, chat, origin, codes, dbOps) {
+  const rows = typeof dbOps?.getLinksByCodes === "function" ? await dbOps.getLinksByCodes(env, codes) : [];
+  if (!rows || rows.length === 0) {
+    await replyTo(env, chat.id, "해당 전단지 상품 정보를 찾지 못했어요. /alert 로 키워드 알림을 등록해 보세요.", {
+      reply_markup: { inline_keyboard: [[{ text: "🔔 키워드 알림 열기", callback_data: "alert:menu" }]] },
+    });
+    return;
+  }
+  if (rows.length === 1) {
+    await showWatchCard(env, chat, origin, rows[0], dbOps, true);
+    return;
+  }
+  if (typeof dbOps?.bumpWatchMetric === "function") {
+    await dbOps.bumpWatchMetric(env, "opened").catch(() => {});
+  }
+  const lines = ["📉 <b>전단지 상품 선택</b>", "목표가 알림을 등록할 상품을 골라 주세요."];
+  const kbRows = [];
+  rows.forEach((r, idx) => {
+    let t = String(r.title || "상품").trim();
+    if (t.length > 22) t = `${t.slice(0, 21).trimEnd()}…`;
+    const p = Number(r.sale_price || 0);
+    const priceTag = p > 0 ? ` (${p.toLocaleString("en-US")}원)` : "";
+    lines.push(`${idx + 1}. <b>${esc(String(r.title || "상품"))}</b>${p > 0 ? ` · ${p.toLocaleString("en-US")}원` : ""}`);
+    kbRows.push([{ text: `${idx + 1}. ${t}${priceTag}`, callback_data: `alert:pick:${r.code}` }]);
+  });
+  kbRows.push([{ text: "📋 내 알림 관리", callback_data: "alert:menu" }]);
+  await replyTo(env, chat.id, lines.join("\n"), {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: kbRows },
+  });
 }
 
 function formatMemberStatsLine(stats) {
@@ -810,12 +977,13 @@ async function reportCmd(env, chat, user, origin, dbOps) {
     const monthStart = formatKstMonthStartYmd(now);
     const weekStart = formatKstYmd(new Date(now.getTime() - 6 * 86400 * 1000));
 
-    const [commMonthRes, commWeekRes, orderRes, clickStats, memberStats] = await Promise.all([
+    const [commMonthRes, commWeekRes, orderRes, clickStats, memberStats, funnelSummary] = await Promise.all([
       getCommissionReport(env, monthStart, todayStr),
       getCommissionReport(env, weekStart, todayStr),
       getOrderReport(env, weekStart, todayStr),
       dbOps.queryClickStats(env, origin, 7, 5).catch(() => null),
       dbOps.queryChannelMemberStats(env).catch(() => null),
+      typeof dbOps.readSourceFunnelSummary === "function" ? dbOps.readSourceFunnelSummary(env, 1).catch(() => null) : Promise.resolve(null),
     ]);
 
     const mStats = summarizePartnerStats(commMonthRes?.data || [], orderRes?.data || []);
@@ -883,6 +1051,7 @@ async function reportCmd(env, chat, user, origin, dbOps) {
     }
     const dailyBottomBlock = `━━━━━━━━━━━━━━━━━━\n${dailyLines.join("\n")}`;
 
+    const funnelBlock = formatSourceFunnelBlock(funnelSummary);
     const nowLabel = `${k.getUTCFullYear()}.${String(kMonth).padStart(2, "0")}.${String(kDay).padStart(2, "0")} ${String(
       k.getUTCHours()
     ).padStart(2, "0")}:${String(k.getUTCMinutes()).padStart(2, "0")}`;
@@ -898,6 +1067,7 @@ async function reportCmd(env, chat, user, origin, dbOps) {
       `${channelBlock}\n\n` +
       `${clickBlock}` +
       `${ordersBlock}` +
+      `${funnelBlock}` +
       `※ <i>쿠팡 API 리포트는 익일 오후(D+1~D+2) 확정 집계됩니다.</i>\n\n` +
       `${dailyBottomBlock}`;
 
@@ -1070,6 +1240,12 @@ async function handleCallbackQuery(query, env, origin, dbOps) {
       let recentMatches = null;
       if (data === "alert:menu") {
         await answerCb();
+      } else if (data.startsWith("alert:pick:")) {
+        await answerCb();
+        const code = data.slice("alert:pick:".length).trim();
+        const rows = typeof dbOps?.getLinksByCodes === "function" ? await dbOps.getLinksByCodes(env, [code]) : [];
+        await showWatchCard(env, chat, origin, rows?.[0] || null, dbOps, false);
+        return;
       } else if (data.startsWith("alert:watch:")) {
         const parts = data.split(":");
         const pid = (parts[2] || "").trim();
@@ -1081,6 +1257,9 @@ async function handleCallbackQuery(query, env, origin, dbOps) {
         const resW = await addAlertMessage(env, origin, uid, `pid:${pid}`, dbOps, false, watchP);
         await answerCb(resW.ok ? `${watchP.toLocaleString("en-US")}원 이하 하락 알림 등록 완료!` : resW.message);
         if (resW.ok) {
+          if (typeof dbOps?.bumpWatchMetric === "function") {
+            await dbOps.bumpWatchMetric(env, "registered").catch(() => {});
+          }
           await replyTo(
             env,
             chat.id,
@@ -1246,6 +1425,13 @@ async function handleMessage(msg, env, origin, dbOps) {
         }
         if (argText === "compare") {
           await compareCmd(env, chat, session);
+          await saveSession(env, chat.id, session);
+          return;
+        }
+        if (argText.startsWith("w_") || argText.startsWith("wf_")) {
+          const rawCodes = argText.startsWith("wf_") ? argText.slice(3) : argText.slice(2);
+          const codes = rawCodes.split("_").filter(Boolean);
+          await handleWatchDeepLink(env, chat, origin, codes, dbOps);
           await saveSession(env, chat.id, session);
           return;
         }

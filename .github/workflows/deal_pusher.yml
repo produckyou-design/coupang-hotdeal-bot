@@ -22,6 +22,13 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      - name: Guard against tracking sales_tracker.json
+        run: |
+          if git ls-files --error-unmatch sales_tracker.json >/dev/null 2>&1; then
+            echo "::error::sales_tracker.json must NEVER be tracked in public git!"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -87,7 +94,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          for f in seen_deals.json sales_tracker.json post_quota.json flyer_queue.json; do
+          for f in seen_deals.json post_quota.json flyer_queue.json; do
             [ -f "$f" ] && git add "$f"
           done
           if ! git diff --cached --quiet; then
