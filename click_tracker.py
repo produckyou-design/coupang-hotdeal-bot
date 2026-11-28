@@ -25,6 +25,7 @@ SOURCE_LABEL_MAP = {
     "clien": "클리앙",
     "goldbox": "골드박스",
     "catbest_shadow": "카테고리베스트(관측)",
+    "direct_tracker": "쿠팡직접추적",
 }
 
 

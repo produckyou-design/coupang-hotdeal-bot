@@ -1910,6 +1910,174 @@ class TestUpgradesIntegration(unittest.TestCase):
                 stat2 = push_deals.run_category_best_shadow_observe(seen, db, funnel_by_source=funnel, now_dt=now_dt)
                 self.assertEqual(stat2["found"], 0)
 
+    def test_direct_coupang_tracker_watchlist_and_newsroom(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from price_history import PriceHistoryDB
+
+        kst = timezone(timedelta(hours=9))
+        now_dt = datetime(2026, 11, 28, 15, 0, tzinfo=kst)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = PriceHistoryDB(str(Path(tmpdir) / "direct.db"))
+
+            # 1) Watchlist cap + priority eviction + prior price stats
+            for i in range(5):
+                db.upsert_tracked_item(
+                    f"pid:low{i}:vid:{i}",
+                    f"low{i}",
+                    f"일반 상품 {i}",
+                    f"일반상품{i}",
+                    priority=1,
+                    last_price=10000,
+                    max_items=3,
+                    now=now_dt,
+                )
+            due_all = db.list_due_tracked_items(limit=10, now=now_dt)
+            self.assertEqual(len(due_all), 3)
+
+            # 2) Hotpack 2-day 39% early drop (only exact vid matches among 4 prices under same productId)
+            opt_hotpack = "pid:9754897026:vid:888001"
+            db.record_observation(
+                opt_hotpack,
+                "9754897026",
+                15600,
+                15600,
+                shipping_type="wow_free",
+                category="living",
+                source="direct_tracker",
+                now=now_dt - timedelta(days=2),
+            )
+            db.upsert_tracked_item(
+                opt_hotpack,
+                "9754897026",
+                "하루온 포그미 붙이는핫팩",
+                "하루온 포그미 붙이는핫팩",
+                category="living",
+                shipping_type="wow_free",
+                source="catbest_shadow",
+                priority=5,
+                last_price=15600,
+                max_items=40,
+                now=now_dt - timedelta(days=2),
+            )
+
+            # High-ticket Goldbox appliance (>50,000원, 5-day median 140,000 -> 97,820원)
+            opt_bosch = "pid:555001:vid:999001"
+            for d_ago in range(1, 6):
+                db.record_observation(
+                    opt_bosch,
+                    "555001",
+                    140000,
+                    140000,
+                    shipping_type="wow_free",
+                    category="it",
+                    source="direct_tracker",
+                    now=now_dt - timedelta(days=d_ago),
+                )
+
+            gb_payload = {
+                "rCode": "0",
+                "data": [
+                    {
+                        "productId": 555001,
+                        "productName": "보쉬 전동드릴 세트",
+                        "productPrice": 97820,
+                        "isRocket": True,
+                        "isFreeShipping": False,
+                        "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=555001&itemId=1&vendorItemId=999001",
+                    }
+                ],
+            }
+            search_payload = {
+                "rCode": "0",
+                "data": [
+                    {
+                        "productId": 9754897026,
+                        "productName": "하루온 포그미 붙이는핫팩 대용량",
+                        "productPrice": 35600,
+                        "isRocket": True,
+                        "isFreeShipping": False,
+                        "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=9754897026&itemId=2&vendorItemId=888002",
+                    },
+                    {
+                        "productId": 9754897026,
+                        "productName": "하루온 포그미 붙이는핫팩",
+                        "productPrice": 9500,
+                        "isRocket": True,
+                        "isFreeShipping": False,
+                        "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=9754897026&itemId=1&vendorItemId=888001",
+                    },
+                ],
+            }
+            alerts = [
+                {
+                    "id": 91,
+                    "chat_id": "555777",
+                    "keyword": f"opt:{opt_hotpack}",
+                    "keyword_norm": f"opt:{opt_hotpack}",
+                    "max_price": 10000,
+                    "min_discount": 0,
+                    "exclude_terms": "",
+                    "paused": 0,
+                }
+            ]
+            seen = set()
+            funnel = {}
+            sent_dms = []
+
+            def fake_send_tg(**kwargs):
+                sent_dms.append(kwargs)
+                return True
+
+            with patch.object(push_deals.coupang_api, "get_goldbox_products", return_value=gb_payload), \
+                 patch.object(push_deals.coupang_api, "search_products", return_value=search_payload), \
+                 patch.object(push_deals, "send_telegram", side_effect=fake_send_tg), \
+                 patch.object(push_deals, "save_seen"), \
+                 patch.object(push_deals, "record_alert_hits"), \
+                 patch.object(push_deals, "REPORT_CHANNEL_ID", "999888"):
+                res = push_deals.run_direct_coupang_price_tracker(
+                    seen,
+                    db,
+                    alerts_cache=alerts,
+                    notified_deal_ids=set(),
+                    funnel_by_source=funnel,
+                    now_dt=now_dt,
+                )
+
+            self.assertEqual(res["price_ok"], 2)
+            self.assertEqual(res["passed"], 2)
+            self.assertEqual(res["alerts_sent"], 1)
+            self.assertEqual(funnel["direct_tracker"]["passed"], 2)
+            admin_texts = [d["text"] for d in sent_dms if str(d.get("chat_id")) == "999888"]
+            user_texts = [d["text"] for d in sent_dms if str(d.get("chat_id")) == "555777"]
+            self.assertTrue(any("직전 관측가 대비 39%↓ · 2회 관측" in t and "9,500원" in t for t in admin_texts))
+            self.assertTrue(any("검증 급락 후보" in t and "97,820원" in t for t in admin_texts))
+            self.assertEqual(len(user_texts), 1)
+            self.assertIn("9,500원", user_texts[0])
+
+            # 3) Newsroom promo radar sends promo only & filters CSR
+            rss_xml = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                "<rss><channel>"
+                "<item><title>[보도자료] 쿠팡, 임직원과 헌혈 봉사활동</title><link>https://news.coupang.com/1</link></item>"
+                "<item><title>쿠팡, 가전·디지털 블랙프라이데이 최대 할인 기획전 진행</title><link>https://news.coupang.com/2</link></item>"
+                "</channel></rss>"
+            )
+            nr_sent = []
+            with patch.object(push_deals.requests, "get", return_value=MagicMock(status_code=200, text=rss_xml)), \
+                 patch.object(push_deals, "send_telegram", side_effect=lambda **kw: nr_sent.append(kw) or True), \
+                 patch.object(push_deals, "save_seen"), \
+                 patch.object(push_deals, "REPORT_CHANNEL_ID", "999888"):
+                c1 = push_deals.check_coupang_newsroom_promos(seen, now_dt=now_dt)
+                c2 = push_deals.check_coupang_newsroom_promos(seen, now_dt=now_dt)
+            self.assertEqual(c1, 1)
+            self.assertEqual(c2, 0)
+            self.assertIn("블랙프라이데이", nr_sent[0]["text"])
+            self.assertEqual(nr_sent[0]["chat_id"], "999888")
+
 
 if __name__ == "__main__":
     unittest.main()

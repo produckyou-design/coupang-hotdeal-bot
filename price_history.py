@@ -736,6 +736,23 @@ class PriceHistoryDB:
                     reason TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS tracked_watchlist (
+                    option_key TEXT PRIMARY KEY,
+                    product_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    search_query TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT 'general',
+                    shipping_type TEXT NOT NULL DEFAULT 'wow_free',
+                    source TEXT NOT NULL DEFAULT '',
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    last_price INTEGER NOT NULL DEFAULT 0,
+                    last_checked_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_watchlist_due
+                    ON tracked_watchlist(priority DESC, last_checked_at ASC);
                 """
             )
 
@@ -847,6 +864,167 @@ class PriceHistoryDB:
             "min_price": min(prices),
             "max_price": max(prices),
         }
+
+    def get_prior_price_stats(
+        self,
+        option_key: str,
+        shipping_type: Optional[str] = None,
+        days: int = 30,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """오늘 이전(obs_date < today) 동일 옵션·배송 조건의 직전 관측가·중앙값 통계 반환."""
+        stype = (shipping_type or "").strip().lower()
+        if not is_comparable_option_key(option_key) or stype not in ("free", "paid", "wow_free"):
+            return None
+        dt = _now_kst(now)
+        today_date = dt.strftime("%Y-%m-%d")
+        since_date = (dt - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT obs_date, MIN(total_price) AS day_low
+                FROM price_observations
+                WHERE option_key = ? AND obs_date >= ? AND obs_date < ? AND shipping_type = ?
+                GROUP BY obs_date
+                ORDER BY obs_date DESC
+                """,
+                (option_key, since_date, today_date, stype),
+            ).fetchall()
+
+        valid_rows = [(str(r["obs_date"]), int(r["day_low"])) for r in rows if int(r["day_low"]) > 0]
+        if not valid_rows:
+            return None
+        prices = [p for _, p in valid_rows]
+        return {
+            "prev_date": valid_rows[0][0],
+            "prev_price": valid_rows[0][1],
+            "median_price": int(round(statistics.median(prices))),
+            "min_price": min(prices),
+            "distinct_days": len(prices),
+        }
+
+    def upsert_tracked_item(
+        self,
+        option_key: str,
+        product_id: str,
+        title: str,
+        search_query: str,
+        *,
+        category: str = "general",
+        shipping_type: str = "wow_free",
+        source: str = "",
+        priority: int = 0,
+        last_price: int = 0,
+        ttl_days: int = 14,
+        max_items: int = 40,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """랭킹 밖 재조회 대상 옵션(최대 max_items개, TTL 14일)을 추적 목록에 등록/갱신."""
+        ok_key = str(option_key or "").strip()
+        q = " ".join(str(search_query or "").split()).strip()
+        if not is_comparable_option_key(ok_key) or not q:
+            return False
+        dt = _now_kst(now)
+        exp_iso = (dt + timedelta(days=max(1, int(ttl_days or 14)))).isoformat()
+        now_iso = dt.isoformat()
+        stype = (shipping_type or "wow_free").strip().lower()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_watchlist (
+                    option_key, product_id, title, search_query, category,
+                    shipping_type, source, priority, last_price, last_checked_at,
+                    expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                ON CONFLICT(option_key) DO UPDATE SET
+                    product_id = CASE WHEN excluded.product_id != '' THEN excluded.product_id ELSE tracked_watchlist.product_id END,
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE tracked_watchlist.title END,
+                    search_query = excluded.search_query,
+                    category = excluded.category,
+                    shipping_type = excluded.shipping_type,
+                    source = CASE WHEN excluded.source != '' THEN excluded.source ELSE tracked_watchlist.source END,
+                    priority = MAX(tracked_watchlist.priority, excluded.priority),
+                    last_price = CASE WHEN excluded.last_price > 0 THEN excluded.last_price ELSE tracked_watchlist.last_price END,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    ok_key,
+                    str(product_id or ""),
+                    str(title or "")[:120],
+                    q[:60],
+                    str(category or "general"),
+                    stype,
+                    str(source or ""),
+                    int(priority or 0),
+                    max(0, int(last_price or 0)),
+                    exp_iso,
+                    now_iso,
+                ),
+            )
+            conn.execute("DELETE FROM tracked_watchlist WHERE expires_at <= ?", (now_iso,))
+            cap = max(1, int(max_items or 40))
+            cnt_row = conn.execute("SELECT COUNT(*) AS c FROM tracked_watchlist").fetchone()
+            total = int(cnt_row["c"] if cnt_row else 0)
+            if total > cap:
+                excess = total - cap
+                conn.execute(
+                    """
+                    DELETE FROM tracked_watchlist
+                    WHERE option_key IN (
+                        SELECT option_key FROM tracked_watchlist
+                        ORDER BY priority ASC, created_at ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (excess,),
+                )
+        return True
+
+    def list_due_tracked_items(
+        self,
+        limit: int = 6,
+        min_recheck_hours: int = 3,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """재조회 주기가 지난 활성 추적 항목을 우선순위 순으로 반환."""
+        dt = _now_kst(now)
+        now_iso = dt.isoformat()
+        stale_iso = (dt - timedelta(hours=max(1, int(min_recheck_hours or 3)))).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM tracked_watchlist
+                WHERE expires_at > ?
+                  AND (last_checked_at = '' OR last_checked_at <= ?)
+                ORDER BY priority DESC, last_checked_at ASC
+                LIMIT ?
+                """,
+                (now_iso, stale_iso, max(1, int(limit or 6))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_tracked_item(
+        self,
+        option_key: str,
+        last_price: int = 0,
+        now: Optional[datetime] = None,
+    ) -> None:
+        if not option_key:
+            return
+        dt = _now_kst(now)
+        now_iso = dt.isoformat()
+        with self._connect() as conn:
+            if int(last_price or 0) > 0:
+                conn.execute(
+                    "UPDATE tracked_watchlist SET last_checked_at = ?, last_price = ? WHERE option_key = ?",
+                    (now_iso, int(last_price), option_key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tracked_watchlist SET last_checked_at = ? WHERE option_key = ?",
+                    (now_iso, option_key),
+                )
 
     def record_published(
         self,
@@ -1096,8 +1274,10 @@ class PriceHistoryDB:
             c1 = conn.execute("DELETE FROM price_observations WHERE obs_date < ?", (cutoff_date,)).rowcount
             c2 = conn.execute("DELETE FROM published_prices WHERE published_at < ?", (cutoff_iso,)).rowcount
             c3 = conn.execute("DELETE FROM source_cooldowns WHERE cooldown_until <= ?", (dt.isoformat(),)).rowcount
+            c4 = conn.execute("DELETE FROM tracked_watchlist WHERE expires_at <= ?", (dt.isoformat(),)).rowcount
         return {
             "observations": max(0, int(c1 or 0)),
             "published": max(0, int(c2 or 0)),
             "cooldowns": max(0, int(c3 or 0)),
+            "watchlist": max(0, int(c4 or 0)),
         }

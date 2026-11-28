@@ -123,6 +123,11 @@ ENABLE_TOP_CLICKS_RECAP = False
 ENABLE_CATEGORY_BEST_SHADOW = True
 CATEGORY_BEST_SHADOW_IDS = (1012, 1013, 1014, 1015, 1016)
 CATEGORY_BEST_SHADOW_LIMIT = 15
+ENABLE_DIRECT_PRICE_TRACKER = True
+DIRECT_TRACKER_PUBLISH_MODE = "admin_review"  # 초기 오탐 방지: 검수 채널/DM만 발송
+DIRECT_TRACKER_WATCHLIST_MAX = 40
+DIRECT_TRACKER_RECHECK_PER_SLOT = 6
+ENABLE_NEWSROOM_PROMO_ALERT = True
 ENABLE_QUIET_HOURS = False
 DAILY_MAX_COMMUNITY_DEALS = 200
 GOLDBOX_PER_SLOT = 4
@@ -4546,6 +4551,22 @@ def run_category_best_shadow_observe(
                     now=cur_dt,
                 )
                 summary["price_ok"] += 1
+                if ENABLE_DIRECT_PRICE_TRACKER:
+                    q_best = _build_watchlist_search_query(clean_title)
+                    prio_best = 3 if (p_price >= 50_000 or category in ("food", "living")) else 1
+                    price_db.upsert_tracked_item(
+                        opt_key,
+                        prod_id,
+                        clean_title,
+                        q_best,
+                        category=category,
+                        shipping_type=obs_ship_type,
+                        source="catbest_shadow",
+                        priority=prio_best,
+                        last_price=p_price,
+                        max_items=DIRECT_TRACKER_WATCHLIST_MAX,
+                        now=cur_dt,
+                    )
 
                 baseline = price_db.get_observed_baseline(
                     opt_key,
@@ -4589,6 +4610,401 @@ def run_category_best_shadow_observe(
         f"👀 [카테고리베스트 관측(무발행)] 슬롯={slot_key} · 발견={summary['found']} · 신규(미중복)={summary['new']} · 이력저장={summary['price_ok']} · 하락후보={summary['passed']}"
     )
     return summary
+
+
+def _build_watchlist_search_query(title: str) -> str:
+    """상품명에서 괄호·수량/용량 단위를 걷어낸 2~4단어 검색 키워드 생성."""
+    cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", str(title or ""))
+    cleaned = re.sub(
+        r"\d+(?:[.,]\d+)?\s*(?:ml|mL|L|g|kg|구|개입|개|봉|팩|캔|병|포|박스|롤|매|정|캡슐|원|%)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[,/|+·]+", " ", cleaned)
+    tokens = [t for t in cleaned.split() if len(t) >= 2 and not re.fullmatch(r"\d+", t)]
+    if not tokens:
+        return " ".join(str(title or "").split())[:32].strip()
+    out = " ".join(tokens[:4])
+    return out[:32].strip()
+
+
+def _evaluate_direct_price_drop(
+    price_db: PriceHistoryDB,
+    option_key: str,
+    shipping_type: str,
+    current_price: int,
+    category: str,
+    now_dt: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """당일 관측 기록 전에 직전 관측가(1~4일)·중앙값(5일+) 대비 급락 여부 판정."""
+    if not option_key or current_price < 1000:
+        return None
+    prior = price_db.get_prior_price_stats(
+        option_key,
+        shipping_type=shipping_type,
+        days=30,
+        now=now_dt,
+    )
+    if not prior:
+        return None
+    distinct_days = int(prior.get("distinct_days", 0) or 0)
+    if distinct_days >= 5:
+        base_price = int(prior.get("median_price", 0) or 0)
+        if base_price <= current_price:
+            return None
+        save_won = base_price - current_price
+        drop_pct = save_won * 100 // base_price
+        high_ticket = base_price >= HIGH_TICKET_MIN_ORIG_PRICE and (
+            (save_won >= IT_HIGH_SAVINGS_MIN_WON and drop_pct >= IT_HIGH_SAVINGS_MIN_RATE)
+            or (save_won >= HIGH_TICKET_LARGE_SAVE_MIN_WON and drop_pct >= HIGH_TICKET_LARGE_SAVE_MIN_RATE)
+        )
+        req_rate = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
+        if not high_ticket and not (drop_pct >= req_rate and save_won >= 1000):
+            return None
+        return {
+            "tier": "verified_5d",
+            "base_price": base_price,
+            "save_won": save_won,
+            "drop_pct": drop_pct,
+            "distinct_days": distinct_days,
+            "obs_count": distinct_days + 1,
+            "label": f"30일 중앙값({distinct_days}일 관측) 대비 {drop_pct}%↓ (-{save_won:,}원)",
+        }
+
+    prev_price = int(prior.get("prev_price", 0) or 0)
+    if prev_price <= current_price:
+        return None
+    save_won = prev_price - current_price
+    drop_pct = save_won * 100 // prev_price
+    high_ticket = (
+        prev_price >= HIGH_TICKET_MIN_ORIG_PRICE
+        and drop_pct >= IT_HIGH_SAVINGS_MIN_RATE
+        and save_won >= IT_HIGH_SAVINGS_MIN_WON
+    )
+    if not high_ticket and not (drop_pct >= 20 and save_won >= 1500):
+        return None
+    return {
+        "tier": "early_drop",
+        "base_price": prev_price,
+        "save_won": save_won,
+        "drop_pct": drop_pct,
+        "distinct_days": distinct_days,
+        "obs_count": distinct_days + 1,
+        "label": f"직전 관측가 대비 {drop_pct}%↓ · {distinct_days + 1}회 관측 (-{save_won:,}원)",
+    }
+
+
+def _notify_direct_drop_review(
+    item_meta: Dict[str, Any],
+    drop_info: Dict[str, Any],
+    seen: Set[str],
+    now_dt: Optional[datetime] = None,
+) -> bool:
+    """쿠팡 직접 추적 급락 후보를 운영자 검수 DM/채널로 발송(동일 일자·옵션 중복 차단)."""
+    cur_dt = now_dt or datetime.now(KST)
+    opt_key = str(item_meta.get("option_key") or "").strip()
+    if not opt_key:
+        return False
+    drop_key = f"direct_drop_{cur_dt.strftime('%Y%m%d')}_{opt_key}"
+    if drop_key in seen:
+        return False
+
+    target_chat = str(REPORT_CHANNEL_ID or ADMIN_CHAT_ID or "").strip()
+    if not target_chat:
+        return False
+
+    tier_badge = "📉 [쿠팡 직접추적 · 검증 급락 후보]" if drop_info.get("tier") == "verified_5d" else "🧪 [쿠팡 직접추적 · 초기 급락 검수]"
+    title = str(item_meta.get("clean_title") or "쿠팡 상품")
+    cur_p = int(item_meta.get("sale_price", 0) or 0)
+    base_p = int(drop_info.get("base_price", 0) or 0)
+    unit_info = str(item_meta.get("unit_info") or "").strip()
+    ship_lbl = str(item_meta.get("shipping_label") or "").strip()
+    url = str(item_meta.get("deeplink") or "").strip()
+
+    extra_parts = [p for p in (unit_info, ship_lbl) if p]
+    extra_str = f"\n• 조건: {esc(' · '.join(extra_parts))}" if extra_parts else ""
+    link_line = f'\n• 링크: <a href="{html.escape(url, quote=True)}">쿠팡 상품 확인 ↗</a>' if url else ""
+    msg = (
+        f"<b>{esc(tier_badge)}</b>\n"
+        f"📌 <b>{esc(title)}</b>\n"
+        f"• 가격: <s>{base_p:,}원</s> → <b>{cur_p:,}원</b>\n"
+        f"• 근거: <b>{esc(str(drop_info.get('label') or ''))}</b>"
+        f"{extra_str}\n"
+        f"• 옵션키: <code>{esc(opt_key)}</code>"
+        f"{link_line}"
+    )
+    if send_telegram(chat_id=target_chat, text=msg):
+        seen.add(drop_key)
+        save_seen(seen)
+        return True
+    return False
+
+
+def run_direct_coupang_price_tracker(
+    seen: Set[str],
+    price_db: Optional[PriceHistoryDB],
+    *,
+    alerts_cache: Optional[List[Dict[str, Any]]] = None,
+    notified_deal_ids: Optional[Set[str]] = None,
+    funnel_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
+    now_dt: Optional[datetime] = None,
+) -> Dict[str, int]:
+    """
+    커뮤니티 미경유 쿠팡 가격 급락 직접 추적:
+    1) 골드박스 전 품목(5만원 상한 없이 고가 가전 포함) 동일 옵션 가격 기록 + 급락 검사
+    2) 추적 목록(tracked_watchlist) 랭킹 밖 항목 회차당 소량 재조회 + 옵션 일치 급락 검사
+    """
+    summary = {"found": 0, "new": 0, "price_ok": 0, "passed": 0, "alerts_sent": 0}
+    if not ENABLE_DIRECT_PRICE_TRACKER or price_db is None:
+        return summary
+
+    cur_dt = now_dt or datetime.now(KST)
+    if is_quiet_hours(cur_dt) and "--force-direct-tracker" not in sys.argv:
+        return summary
+
+    slot_key = f"direct_trk_{cur_dt.strftime('%Y%m%d')}_s{cur_dt.hour // 3}"
+    if "--force-direct-tracker" not in sys.argv and slot_key in seen:
+        return summary
+
+    # 구독자 opt: 알림 대상 옵션이 watchlist에 있으면 우선순위를 높여 우선 재조회
+    alert_opt_norms = {
+        str(a.get("keyword_norm") or "").strip().lower()[4:]
+        for a in (alerts_cache or [])
+        if str(a.get("keyword_norm") or "").strip().lower().startswith("opt:") and int(a.get("paused", 0) or 0) != 1
+    }
+
+    seen_opt_keys: Set[str] = set()
+    no_baseline_cnt = 0
+    no_drop_cnt = 0
+
+    def _process_direct_row(row: Dict[str, Any], origin_tag: str, expected_opt_key: str = "") -> bool:
+        nonlocal no_baseline_cnt, no_drop_cnt
+        prod_id = str(row.get("productId") or "").strip()
+        p_url = str(row.get("productUrl") or "").strip()
+        p_price = int(round(float(row.get("productPrice", 0) or 0)))
+        is_rocket = row.get("isRocket") is True
+        is_free_ship = row.get("isFreeShipping") is True
+        if not prod_id or p_price < 1000 or not (is_rocket or is_free_ship):
+            return False
+
+        raw_name = str(row.get("productName") or "").strip()
+        clean_title = clean_display_title(raw_name) or raw_name
+        if not clean_title:
+            return False
+        opt_key = build_option_key(product_id=prod_id, url=p_url, title=clean_title)
+        if not is_comparable_option_key(opt_key):
+            return False
+        if expected_opt_key and opt_key != expected_opt_key:
+            return False
+        if opt_key in seen_opt_keys:
+            return False
+        seen_opt_keys.add(opt_key)
+
+        summary["found"] += 1
+        if not is_product_recently_seen(prod_id, seen):
+            summary["new"] += 1
+
+        obs_ship_type = "free" if is_free_ship else "wow_free"
+        ship_lbl = "로켓 무료배송" if is_free_ship else "와우 무료배송"
+        category = classify_deal_category(clean_title, "")
+        unit_metrics = compute_effective_unit_metrics(clean_title, p_price)
+        unit_info = str(unit_metrics.get("display_unit") or "")
+
+        # 1) 오늘 기록 전 과거 대비 급락 판정
+        drop_info = _evaluate_direct_price_drop(
+            price_db,
+            opt_key,
+            obs_ship_type,
+            p_price,
+            category,
+            now_dt=cur_dt,
+        )
+
+        # 2) 오늘 가격 관측 DB 저장 및 추적 목록 등록
+        price_db.record_observation(
+            option_key=opt_key,
+            product_id=prod_id,
+            total_price=p_price,
+            sale_price=p_price,
+            shipping_fee=0,
+            orig_price=0,
+            shipping_type=obs_ship_type,
+            category=category,
+            source="direct_tracker",
+            metric_type=str(unit_metrics.get("metric_type") or ""),
+            metric_value=unit_metrics.get("metric_value"),
+            now=cur_dt,
+        )
+        summary["price_ok"] += 1
+
+        prio = 5 if opt_key.lower() in alert_opt_norms else (4 if p_price >= 50_000 else (2 if category in ("food", "living") else 1))
+        price_db.upsert_tracked_item(
+            opt_key,
+            prod_id,
+            clean_title,
+            _build_watchlist_search_query(clean_title),
+            category=category,
+            shipping_type=obs_ship_type,
+            source=origin_tag,
+            priority=prio,
+            last_price=p_price,
+            max_items=DIRECT_TRACKER_WATCHLIST_MAX,
+            now=cur_dt,
+        )
+
+        # 3) 구독자 맞춤 알림 매칭 (목표가 도달 시 DM)
+        item_meta = {
+            "deal_id": f"direct_{cur_dt.strftime('%Y%m%d')}_{opt_key}",
+            "product_id": prod_id,
+            "option_key": opt_key,
+            "source": "direct_tracker",
+            "clean_title": clean_title,
+            "orig_price": int((drop_info or {}).get("base_price") or 0),
+            "sale_price": p_price,
+            "discount_rate": int((drop_info or {}).get("drop_pct") or 0),
+            "unit_info": unit_info,
+            "shipping_fee": 0,
+            "shipping_label": ship_lbl,
+            "deeplink": p_url,
+            "img_url": row.get("productImage"),
+        }
+        if alerts_cache:
+            summary["alerts_sent"] += notify_keyword_subscribers(
+                item_meta,
+                alerts=alerts_cache,
+                notified_deal_ids=notified_deal_ids,
+            )
+
+        if drop_info:
+            summary["passed"] += 1
+            if DIRECT_TRACKER_PUBLISH_MODE == "admin_review":
+                _notify_direct_drop_review(item_meta, drop_info, seen, now_dt=cur_dt)
+        else:
+            prior = price_db.get_prior_price_stats(opt_key, obs_ship_type, days=30, now=cur_dt)
+            if prior and int(prior.get("distinct_days", 0) or 0) >= 2:
+                no_drop_cnt += 1
+            else:
+                no_baseline_cnt += 1
+        return True
+
+    # A) 골드박스 전 품목 관측 (5만원 초과 고가 가전 포함)
+    try:
+        gb_res = coupang_api.get_goldbox_products(sub_id="tggoldbox")
+        for it in (gb_res or {}).get("data") or []:
+            if isinstance(it, dict):
+                _process_direct_row(it, "goldbox_all")
+    except Exception as e:
+        logger.warning(f"⏳ [쿠팡직접추적] 골드박스 조회 실패: {e}")
+
+    # B) 추적 목록(tracked_watchlist) 랭킹 밖 재조회
+    due_items = price_db.list_due_tracked_items(limit=DIRECT_TRACKER_RECHECK_PER_SLOT, min_recheck_hours=3, now=cur_dt)
+    for wl in due_items:
+        q = str(wl.get("search_query") or "").strip()
+        exp_opt = str(wl.get("option_key") or "").strip()
+        if not q or not exp_opt:
+            continue
+        try:
+            s_res = coupang_api.search_products(q, limit=10)
+            matched_row = None
+            for cand in (s_res or {}).get("data") or []:
+                if not isinstance(cand, dict):
+                    continue
+                c_pid = str(cand.get("productId") or "").strip()
+                c_url = str(cand.get("productUrl") or "").strip()
+                c_name = clean_display_title(str(cand.get("productName") or "")) or str(cand.get("productName") or "")
+                c_opt = build_option_key(product_id=c_pid, url=c_url, title=c_name)
+                if c_opt == exp_opt:
+                    matched_row = cand
+                    break
+            if matched_row:
+                _process_direct_row(matched_row, "watchlist_recheck", expected_opt_key=exp_opt)
+                p_val = int(round(float(matched_row.get("productPrice", 0) or 0)))
+                price_db.touch_tracked_item(exp_opt, last_price=p_val, now=cur_dt)
+            else:
+                price_db.touch_tracked_item(exp_opt, now=cur_dt)
+        except Exception as e:
+            logger.warning(f"⏳ [쿠팡직접추적] 재조회 실패 ({q}): {e}")
+            price_db.touch_tracked_item(exp_opt, now=cur_dt)
+
+    seen.add(slot_key)
+    save_seen(seen)
+
+    if funnel_by_source is not None and summary["found"] > 0:
+        reasons: Dict[str, int] = {}
+        if no_baseline_cnt > 0:
+            reasons["no_baseline_yet"] = no_baseline_cnt
+        if no_drop_cnt > 0:
+            reasons["no_drop"] = no_drop_cnt
+        funnel_by_source["direct_tracker"] = {
+            "found": summary["found"],
+            "new": summary["new"],
+            "price_ok": summary["price_ok"],
+            "passed": summary["passed"],
+            "blocked": 0,
+            "reasons": reasons,
+        }
+
+    logger.info(
+        f"🛰️ [쿠팡직접추적] 슬롯={slot_key} · 관측={summary['price_ok']} · 재조회={len(due_items)} · 급락후보={summary['passed']} · 알림DM={summary['alerts_sent']}"
+    )
+    return summary
+
+
+_NEWSROOM_PROMO_INCL = ("블랙프라이데이", "기획전", "빅세일", "할인전", "특가전", "페스타", "세일", "프로모션", "위크")
+_NEWSROOM_PROMO_EXCL = ("봉사", "헌혈", "쿠팡플레이", "쿠팡이츠", "업무협약", "화보", "채용", "나눔")
+
+
+def check_coupang_newsroom_promos(seen: Set[str], now_dt: Optional[datetime] = None) -> int:
+    """쿠팡 공식 뉴스룸 RSS에서 새 기획전·프로모션 소식을 감지해 관리자 DM으로만 1줄 알림."""
+    if not ENABLE_NEWSROOM_PROMO_ALERT:
+        return 0
+    cur_dt = now_dt or datetime.now(KST)
+    if is_quiet_hours(cur_dt) and "--force-newsroom" not in sys.argv:
+        return 0
+    slot_key = f"newsroom_{cur_dt.strftime('%Y%m%d')}_s{cur_dt.hour // 3}"
+    if "--force-newsroom" not in sys.argv and slot_key in seen:
+        return 0
+
+    target_chat = str(REPORT_CHANNEL_ID or ADMIN_CHAT_ID or "").strip()
+    sent_cnt = 0
+    try:
+        res = requests.get("https://news.coupang.com/feed/", headers=HEADERS, timeout=8)
+        if res.status_code == 200 and res.text.strip():
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(res.text)
+            for item in root.findall(".//item")[:20]:
+                t_el = item.find("title")
+                l_el = item.find("link")
+                title = " ".join(str(t_el.text or "").split()) if t_el is not None else ""
+                link = str(l_el.text or "").strip() if l_el is not None else ""
+                if not title or not link:
+                    continue
+                if not any(kw in title for kw in _NEWSROOM_PROMO_INCL):
+                    continue
+                if any(ex in title for ex in _NEWSROOM_PROMO_EXCL):
+                    continue
+                item_hash = hashlib.sha1(link.encode("utf-8")).hexdigest()[:16]
+                item_key = f"newsroom_item_{item_hash}"
+                if item_key in seen:
+                    continue
+                if target_chat:
+                    msg = (
+                        f"📰 <b>[쿠팡 공식 기획전 감지]</b>\n"
+                        f"• {esc(title)}\n"
+                        f"• <a href=\"{html.escape(link, quote=True)}\">공식 안내 보기 ↗</a>"
+                    )
+                    if send_telegram(chat_id=target_chat, text=msg):
+                        sent_cnt += 1
+                        seen.add(item_key)
+                if sent_cnt >= 3:
+                    break
+    except Exception as e:
+        logger.debug(f"쿠팡 뉴스룸 RSS 확인 생략: {e}")
+
+    seen.add(slot_key)
+    save_seen(seen)
+    return sent_cnt
 
 
 def load_sales_tracker() -> Dict[str, Any]:
@@ -5487,6 +5903,23 @@ def main():
         run_category_best_shadow_observe(seen, price_db, funnel_by_source=funnel_by_source)
     except Exception as cb_err:
         logger.warning(f"카테고리 베스트 관측 생략: {cb_err}")
+
+    # 쿠팡 직접 가격 추적(골드박스 전품목 + 추적목록 재조회) 및 공식 기획전 감지
+    try:
+        run_direct_coupang_price_tracker(
+            seen,
+            price_db,
+            alerts_cache=alerts_cache,
+            notified_deal_ids=notified_deal_ids,
+            funnel_by_source=funnel_by_source,
+        )
+    except Exception as dt_err:
+        logger.warning(f"쿠팡 직접 가격 추적 생략: {dt_err}")
+
+    try:
+        check_coupang_newsroom_promos(seen)
+    except Exception as nr_err:
+        logger.debug(f"쿠팡 뉴스룸 기획전 감지 생략: {nr_err}")
 
     if funnel_by_source:
         try:
