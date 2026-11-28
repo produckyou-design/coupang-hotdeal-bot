@@ -254,6 +254,7 @@ const FUNNEL_REASON_KR = {
   price_fail: "가격추출실패",
   sold_out: "품절/종료",
   link_fail: "딥링크실패",
+  duplicate: "중복",
   bad_title: "오인식",
 };
 
@@ -261,8 +262,8 @@ function formatSourceFunnelBlock(funnelData) {
   const sources = funnelData?.sources;
   if (!sources || typeof sources !== "object") return "";
   const entries = Object.entries(sources)
-    .filter(([, v]) => v && (Number(v.found || 0) > 0 || Number(v.passed || 0) > 0))
-    .sort((a, b) => Number(b[1]?.found || 0) - Number(a[1]?.found || 0));
+    .filter(([, v]) => v && (Number(v.found || 0) > 0 || Number(v.passed || 0) > 0 || Number(v.blocked || 0) > 0))
+    .sort((a, b) => Number(b[1]?.found || 0) - Number(a[1]?.found || 0) || Number(b[1]?.blocked || 0) - Number(a[1]?.blocked || 0));
   if (entries.length === 0) return "";
   const runs = Number(funnelData.runs || 0);
   const runNote = runs > 0 ? ` (${runs.toLocaleString("en-US")}회 실행)` : "";
@@ -272,6 +273,7 @@ function formatSourceFunnelBlock(funnelData) {
     const isNew = Number(vals.new || 0);
     const priceOk = Number(vals.price_ok || 0);
     const passed = Number(vals.passed || 0);
+    const blocked = Number(vals.blocked || 0);
     let topReasonStr = "";
     const reasons = vals.reasons && typeof vals.reasons === "object" ? Object.entries(vals.reasons) : [];
     if (reasons.length > 0) {
@@ -282,8 +284,9 @@ function formatSourceFunnelBlock(funnelData) {
         topReasonStr = ` · 주탈락: ${esc(label)}(${Number(topCnt)})`;
       }
     }
+    const blockedStr = blocked > 0 ? ` · 차단 ${blocked}회` : "";
     lines.push(
-      `• <b>${esc(sourceKr(src))}</b>: 발견 ${found} → 신규 ${isNew} → 가격 ${priceOk} → <b>발행 ${passed}</b>${topReasonStr}`
+      `• <b>${esc(sourceKr(src))}</b>: 발견 ${found} → 신규 ${isNew} → 가격 ${priceOk} → <b>발행 ${passed}</b>${blockedStr}${topReasonStr}`
     );
   }
   return `${lines.join("\n")}\n\n`;

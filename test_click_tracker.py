@@ -808,10 +808,13 @@ class TestUpgradesV2(unittest.TestCase):
             "runs": 5,
             "sources": {
                 "ruliweb": {"found": 12, "new": 3, "price_ok": 1, "passed": 0, "reasons": {"low_discount": 1}},
+                "ppomppu": {"found": 0, "new": 0, "price_ok": 0, "passed": 0, "blocked": 5, "reasons": {}},
             },
         })
         self.assertIn("루리웹", block)
         self.assertIn("할인부족(1)", block)
+        self.assertIn("뽐뿌", block)
+        self.assertIn("차단 5회", block)
 
         saved_states = []
         with patch.object(push_deals, "is_click_tracker_enabled", return_value=True), \

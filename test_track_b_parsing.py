@@ -865,7 +865,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
     def test_default_min_20_percent_and_track_b2_disabled(self):
         from datetime import datetime, timedelta
 
-        self.assertFalse(push_deals.ENABLE_GOLDBOX)
+        self.assertTrue(push_deals.ENABLE_GOLDBOX)
         self.assertEqual(push_deals.GOLDBOX_PER_SLOT, 4)
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MAX_PRICE, 15_000)
         self.assertEqual(push_deals.LOW_PRICE_BAIT_MIN_RATE, 15)
@@ -1100,6 +1100,7 @@ class TrackBParsingRegressionTests(unittest.TestCase):
         self.assertTrue(png_m.startswith(b"\x89PNG"))
         self.assertEqual(len(kb_m), 4)
         self.assertIn("🍯 <b>[쿠팡 오늘의 골드박스 · 오전]</b>", cap_m)
+        self.assertIn("일일 할인 품목 중 생필품·식품 위주", cap_m)
         self.assertNotIn("[골드박스 특가]", cap_m)
         self.assertNotIn("특가", cap_m)
         self.assertNotIn("· 골드박스", cap_m)
@@ -1683,6 +1684,122 @@ class TestUpgradesIntegration(unittest.TestCase):
         gb_item = [{**single_short[0], "source": "goldbox"}]
         _, kb_gb = flyer_renderer.format_flyer_caption_and_buttons(gb_item, include_bot_footer=True)
         self.assertFalse(any("?start=w" in b.get("url", "") for row in kb_gb for b in row))
+
+    def test_track_b3_consumable_and_ppomppu_mobile_rss_fallbacks(self):
+        from unittest.mock import MagicMock, patch
+
+        p0_free = {
+            "orig_price": 0,
+            "final_price": 18900,
+            "discount_rate": 0,
+            "shipping_fee": 0,
+            "shipping_type": "free",
+            "shipping_condition": "",
+        }
+        # 1) Unit-priced consumables like Coca-Cola (v=1, c=6) and Quaker cereal (v=0, c=7) pass Track B3
+        r_coke = push_deals.evaluate_deal_quality(
+            {"votes": 1, "downvotes": 0, "comments": 6},
+            "arca",
+            p0_free,
+            "코카콜라 제로 레몬라임, 190ml, 60개",
+            "무료배송",
+        )
+        self.assertTrue(r_coke["passed"])
+        self.assertEqual(r_coke["track"], "B")
+
+        r_oat = push_deals.evaluate_deal_quality(
+            {"votes": 0, "downvotes": 0, "comments": 7},
+            "arca",
+            {**p0_free, "final_price": 4900},
+            "퀘이커 오트 그래놀라 시리얼 골든넛츠 350g",
+            "무료배송",
+        )
+        self.assertTrue(r_oat["passed"])
+        self.assertEqual(r_oat["track"], "B")
+
+        # 2) Non-unit generic item with votes=0 still rejected
+        r_gen = push_deals.evaluate_deal_quality(
+            {"votes": 0, "downvotes": 0, "comments": 20},
+            "ppomppu",
+            {**p0_free, "final_price": 12000},
+            "논란 중인 상품 12,000원",
+            "가성비 좋고 저렴함 무료배송",
+        )
+        self.assertFalse(r_gen["passed"])
+
+        # 3) collect_ppomppu_deals falls back to mobile + RSS when desktop returns 403
+        mobile_html = (
+            '<a href="/new/bbs_view.php?id=ppomppu&no=752601">[쿠팡] 코멧 생수 2L 12병 (6,900원/무료)</a>'
+        )
+        rss_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            "<rss><channel><item>"
+            "<title>[쿠팡] 곰곰 백미 10kg (24,900원/무배)</title>"
+            "<link>https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&amp;no=752602</link>"
+            "</item></channel></rss>"
+        )
+        seen_urls = []
+
+        def fake_get(url, **_kw):
+            seen_urls.append(url)
+            resp = MagicMock()
+            resp.headers = {"content-type": "text/html; charset=utf-8"}
+            if "zboard.php" in url:
+                resp.status_code = 403
+                resp.text = "Forbidden"
+            elif "m.ppomppu.co.kr/new/bbs_list.php" in url:
+                resp.status_code = 200
+                resp.text = mobile_html
+            elif "rss.php" in url:
+                resp.status_code = 200
+                resp.text = rss_xml
+            else:
+                resp.status_code = 404
+                resp.text = ""
+            return resp
+
+        with patch.object(push_deals.requests, "get", side_effect=fake_get), \
+             patch.object(push_deals.time, "sleep"):
+            got = push_deals.collect_ppomppu_deals(max_pages=2)
+        got_ids = {d["id"] for d in got}
+        self.assertEqual(got_ids, {"ppomppu_752601", "ppomppu_752602"})
+
+        # 4) parse_ppomppu_detail falls back to mobile view when desktop returns 403
+        def fake_detail_get(url, **_kw):
+            resp = MagicMock()
+            resp.headers = {"content-type": "text/html; charset=utf-8"}
+            if "zboard/view.php" in url:
+                resp.status_code = 403
+                resp.text = "Forbidden"
+            elif "m.ppomppu.co.kr/new/bbs_view.php" in url:
+                resp.status_code = 200
+                resp.text = '<div class="cont">무료배송 https://www.coupang.com/vp/products/888999</div>'
+            else:
+                resp.status_code = 200
+                resp.text = "[]"
+            return resp
+
+        try:
+            with patch.object(push_deals.requests, "get", side_effect=fake_detail_get), \
+                 patch.object(push_deals.time, "sleep"):
+                detail = push_deals.parse_ppomppu_detail("https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no=752601")
+            self.assertIsNotNone(detail)
+            self.assertIn("888999", detail["coupang_url"])
+        finally:
+            push_deals._RUN_BLOCKED_SOURCES.clear()
+
+        # 5) collect_ruliweb_deals requests plain board page before search URL
+        ruli_urls = []
+
+        def fake_ruli_get(url, **_kw):
+            ruli_urls.append(url)
+            resp = MagicMock(status_code=200, text="<html></html>")
+            return resp
+
+        with patch.object(push_deals.requests, "get", side_effect=fake_ruli_get):
+            push_deals.collect_ruliweb_deals(max_pages=2)
+        self.assertTrue(ruli_urls[0].endswith("?page=1"))
+        self.assertIn("search_type=subject", ruli_urls[-1])
 
 
 if __name__ == "__main__":

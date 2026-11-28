@@ -1179,7 +1179,10 @@ def _build_caption_with_limit(
         header = "🔥 <b>[쿠팡 실시간 핫딜 모아보기]</b>"
     else:
         header = "🔥 <b>[쿠팡 추천 핫딜]</b>"
-    lines = [header, ""]
+    lines = [header]
+    if _is_goldbox_batch(batch):
+        lines.append("<i>쿠팡에서 매일 오전 7시 갱신하는 일일 할인 품목 중 생필품·식품 위주로 정리했습니다.</i>")
+    lines.append("")
 
     for i, d in enumerate(batch):
         full_t = str(d.get("clean_title") or "쿠팡 핫딜").strip()

@@ -673,7 +673,10 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
           headers: { Authorization: "Bearer api-sec", "Content-Type": "application/json" },
           body: JSON.stringify({
             date: funnelDate,
-            sources: { ruliweb: { found: 5, new: 2, price_ok: 1, passed: i, reasons: { low_discount: 1 } } },
+            sources: {
+              ruliweb: { found: 5, new: 2, price_ok: 1, passed: i, reasons: { low_discount: 1 } },
+              ppomppu: { found: 0, new: 0, price_ok: 0, passed: 0, blocked: 1, reasons: {} },
+            },
           }),
         }),
         env
@@ -708,6 +711,7 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
     const repTxt = repEdit.body.text;
     assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") > 0);
     assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") < repTxt.indexOf("※"));
+    assert.match(repTxt, /차단 2회/);
 
     // 3) Flyer one-click watch card + conversion tracking
     const linkRes = await worker.fetch(

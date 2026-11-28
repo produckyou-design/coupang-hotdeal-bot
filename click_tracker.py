@@ -1132,11 +1132,16 @@ def format_source_funnel_block(funnel: Optional[Dict[str, Any]]) -> str:
     entries = [
         (src, vals)
         for src, vals in sources.items()
-        if isinstance(vals, dict) and (int(vals.get("found", 0) or 0) > 0 or int(vals.get("passed", 0) or 0) > 0)
+        if isinstance(vals, dict)
+        and (
+            int(vals.get("found", 0) or 0) > 0
+            or int(vals.get("passed", 0) or 0) > 0
+            or int(vals.get("blocked", 0) or 0) > 0
+        )
     ]
     if not entries:
         return ""
-    entries.sort(key=lambda kv: int(kv[1].get("found", 0) or 0), reverse=True)
+    entries.sort(key=lambda kv: (int(kv[1].get("found", 0) or 0), int(kv[1].get("blocked", 0) or 0)), reverse=True)
     runs = int(funnel.get("runs", 0) or 0)
     run_note = f" ({runs:,}회 실행)" if runs > 0 else ""
     lines = [f"🔎 <b>오늘 출처별 수집 퍼널</b>{run_note}"]
@@ -1146,6 +1151,7 @@ def format_source_funnel_block(funnel: Optional[Dict[str, Any]]) -> str:
         new_cnt = int(vals.get("new", 0) or 0)
         price_ok = int(vals.get("price_ok", 0) or 0)
         passed = int(vals.get("passed", 0) or 0)
+        blocked = int(vals.get("blocked", 0) or 0)
         reasons = vals.get("reasons") if isinstance(vals.get("reasons"), dict) else {}
         top_reason_str = ""
         if reasons:
@@ -1153,8 +1159,9 @@ def format_source_funnel_block(funnel: Optional[Dict[str, Any]]) -> str:
             if int(top_v or 0) > 0:
                 lbl = _FUNNEL_REASON_KR.get(str(top_k), str(top_k))
                 top_reason_str = f" · 주탈락: {html.escape(lbl, quote=False)}({int(top_v)})"
+        blocked_str = f" · 차단 {blocked}회" if blocked > 0 else ""
         lines.append(
-            f"• <b>{html.escape(src_kr, quote=False)}</b>: 발견 {found} → 신규 {new_cnt} → 가격 {price_ok} → <b>발행 {passed}</b>{top_reason_str}"
+            f"• <b>{html.escape(src_kr, quote=False)}</b>: 발견 {found} → 신규 {new_cnt} → 가격 {price_ok} → <b>발행 {passed}</b>{blocked_str}{top_reason_str}"
         )
     return "\n".join(lines) + "\n\n"
 

@@ -118,7 +118,7 @@ LOCK_FILE_PATH = os.path.join(BASE_DIR, "deal_pusher.lock")
 _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한, 전단지 배치 및 24시간 전단지 송출 설정 (KST)
-ENABLE_GOLDBOX = False
+ENABLE_GOLDBOX = True
 ENABLE_QUIET_HOURS = False
 DAILY_MAX_COMMUNITY_DEALS = 200
 GOLDBOX_PER_SLOT = 4
@@ -1969,17 +1969,19 @@ def _register_posted_batch(
 # 1. 루리웹 핫딜 수집기
 # ==========================================
 def collect_ruliweb_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
-    """루리웹 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집"""
+    """루리웹 핫딜 게시판 일반 스캔(우선) 및 '쿠팡' 검색 결과 듀얼 수집"""
     deals = []
     urls = [
-        "https://bbs.ruliweb.com/market/board/1020?search_type=subject&search_key=%EC%BF%A0%ED%8C%A1",
+        f"https://bbs.ruliweb.com/market/board/1020?page={page}"
+        for page in range(1, max_pages + 1)
     ]
-    for page in range(1, max_pages + 1):
-        urls.append(f"https://bbs.ruliweb.com/market/board/1020?page={page}")
+    urls.append(
+        "https://bbs.ruliweb.com/market/board/1020?search_type=subject&search_key=%EC%BF%A0%ED%8C%A1"
+    )
 
     for url in urls:
         try:
-            res = requests.get(url, headers=HEADERS, timeout=5)
+            res = requests.get(url, headers=HEADERS, timeout=8)
             if res.status_code != 200:
                 _record_source_http_block("ruliweb", res)
                 if res.status_code in (403, 429):
@@ -2107,25 +2109,120 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 # 2. 뽐뿌 핫딜 수집기
 # ==========================================
+def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, Any]], bool, Any]:
+    """데스크톱 403/차단 시 뽐뿌 모바일 게시판 및 공개 RSS 피드로 폴백 수집."""
+    deals: List[Dict[str, Any]] = []
+    got_200 = False
+    last_block_resp = None
+
+    for page in range(1, max_pages + 1):
+        m_url = f"https://m.ppomppu.co.kr/new/bbs_list.php?id=ppomppu&page={page}"
+        try:
+            r = requests.get(m_url, headers=HEADERS, timeout=7)
+            if r.status_code != 200:
+                if r.status_code in (403, 429):
+                    last_block_resp = r
+                    break
+                continue
+            got_200 = True
+            ctype = str(r.headers.get("content-type") or "").lower()
+            r.encoding = "utf-8" if "utf-8" in ctype else (r.apparent_encoding or "euc-kr")
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a[href*='bbs_view.php']"):
+                href = str(a.get("href") or "")
+                if "id=ppomppu" not in href:
+                    continue
+                if a.select_one("strike, del, span[style*='line-through']"):
+                    continue
+                m_no = re.search(r"no=(\d+)", href)
+                if not m_no:
+                    continue
+                title = " ".join(a.get_text(" ", strip=True).split())
+                if not title or is_closed_deal(title):
+                    continue
+                if "쿠팡" not in title and "coupang" not in title.lower():
+                    continue
+                post_no = m_no.group(1)
+                deal_id = f"ppomppu_{post_no}"
+                full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={post_no}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({
+                        "id": deal_id,
+                        "title": title,
+                        "link": full_url,
+                        "votes": 0,
+                        "downvotes": 0,
+                        "comments": 0,
+                        "hits": 0,
+                    })
+            time.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"뽐뿌 모바일 폴백 오류 ({m_url}): {e}")
+
+    rss_url = "https://www.ppomppu.co.kr/rss.php?id=ppomppu"
+    try:
+        r_rss = requests.get(rss_url, headers=HEADERS, timeout=7)
+        if r_rss.status_code == 200:
+            got_200 = True
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r_rss.text)
+            for item in root.findall(".//item"):
+                t_el = item.find("title")
+                l_el = item.find("link")
+                title = " ".join(str(t_el.text or "").split()) if t_el is not None else ""
+                link_raw = str(l_el.text or "").strip() if l_el is not None else ""
+                if not title or is_closed_deal(title):
+                    continue
+                if "쿠팡" not in title and "coupang" not in title.lower():
+                    continue
+                m_no = re.search(r"no=(\d+)", link_raw)
+                if not m_no:
+                    continue
+                post_no = m_no.group(1)
+                deal_id = f"ppomppu_{post_no}"
+                full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={post_no}"
+                if not any(d["id"] == deal_id for d in deals):
+                    deals.append({
+                        "id": deal_id,
+                        "title": title,
+                        "link": full_url,
+                        "votes": 0,
+                        "downvotes": 0,
+                        "comments": 0,
+                        "hits": 0,
+                    })
+        elif r_rss.status_code in (403, 429):
+            last_block_resp = r_rss
+    except Exception as e:
+        logger.debug(f"뽐뿌 RSS 폴백 오류: {e}")
+
+    return deals, got_200, last_block_resp
+
+
 def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
-    """뽐뿌 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집"""
+    """뽐뿌 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집 (+모바일·RSS 폴백)"""
     deals = []
     import urllib.parse
     kw = urllib.parse.quote("쿠팡", encoding="euc-kr")
     urls = [
-        f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&keyword={kw}&page=1",
+        f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page={page}"
+        for page in range(1, max_pages + 1)
     ]
-    for page in range(1, max_pages + 1):
-        urls.append(f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&page={page}")
+    urls.append(
+        f"https://www.ppomppu.co.kr/zboard/zboard.php?id=ppomppu&keyword={kw}&page=1"
+    )
 
+    desktop_got_200 = False
+    desktop_blocked_resp = None
     for url in urls:
         try:
             r = requests.get(url, headers=HEADERS, timeout=6)
             if r.status_code != 200:
-                _record_source_http_block("ppomppu", r)
                 if r.status_code in (403, 429):
+                    desktop_blocked_resp = r
                     break
                 continue
+            desktop_got_200 = True
             r.encoding = "euc-kr"
             soup = BeautifulSoup(r.text, "html.parser")
             rows = soup.select("tr.baseList")
@@ -2192,6 +2289,14 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
             time.sleep(0.2)
         except Exception as e:
             logger.error(f"뽐뿌 수집 오류 ({url}): {e}")
+
+    if not desktop_got_200:
+        fb_deals, fb_ok, fb_block = _collect_ppomppu_mobile_and_rss(max_pages=2)
+        for fd in fb_deals:
+            if not any(d["id"] == fd["id"] for d in deals):
+                deals.append(fd)
+        if not fb_ok and (desktop_blocked_resp is not None or fb_block is not None):
+            _record_source_http_block("ppomppu", desktop_blocked_resp or fb_block)
     return deals
 
 
@@ -2245,17 +2350,34 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
     try:
         time.sleep(0.25)
         res = requests.get(url, headers=HEADERS, timeout=7)
-        if res.status_code != 200:
+        m_no_url = re.search(r"no=(\d+)", url)
+        is_mobile_fallback = False
+        if res.status_code in (403, 429) and m_no_url:
+            m_view_url = f"https://m.ppomppu.co.kr/new/bbs_view.php?id=ppomppu&no={m_no_url.group(1)}"
+            m_res = requests.get(m_view_url, headers=HEADERS, timeout=7)
+            if m_res.status_code == 200:
+                res = m_res
+                is_mobile_fallback = True
+            else:
+                _record_source_http_block("ppomppu", res)
+                return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
+        elif res.status_code != 200:
             _record_source_http_block("ppomppu", res)
             if _is_transient_http_status(res.status_code):
                 logger.warning(f"⏳ 뽐뿌 상세 일시 오류 (HTTP {res.status_code}): {url}")
                 return {"transient_error": True, "error_reason": f"http_{res.status_code}"}
             return None
-        res.encoding = "euc-kr"
+        ctype = str(res.headers.get("content-type") or "").lower()
+        if "utf-8" in ctype:
+            res.encoding = "utf-8"
+        elif is_mobile_fallback:
+            res.encoding = res.apparent_encoding or "euc-kr"
+        else:
+            res.encoding = "euc-kr"
         soup = BeautifulSoup(res.text, "html.parser")
 
         # 상단 제목 종료 여부 확인
-        top_box = soup.select_one("div.sub-top-text-box")
+        top_box = soup.select_one("div.sub-top-text-box, div.info_bg, h4")
         if top_box and is_closed_deal(top_box.text[:200]):
             return None
 
@@ -2273,7 +2395,7 @@ def parse_ppomppu_detail(url: str) -> Optional[Dict[str, Any]]:
                 cp_url = clean_cp
 
         body_text = ""
-        content_el = soup.select_one("td.board-contents, td.han")
+        content_el = soup.select_one("td.board-contents, td.han, div.cont, div.view_content")
         if content_el:
             body_text = content_el.get_text("\n", strip=True)
 
@@ -2510,6 +2632,13 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
                 tbl.decompose()
             body_text = body_el.get_text("\n", strip=True)
 
+        extracted_votes = 0
+        vote_el = soup.select_one("#ratingUp, .rate-up, .vote-up .num")
+        if vote_el:
+            m_ev = re.search(r"-?\d+", vote_el.get_text(" ", strip=True))
+            if m_ev:
+                extracted_votes = int(m_ev.group(0))
+
         return {
             "coupang_url": cp_url,
             "body_text": body_text,
@@ -2518,6 +2647,7 @@ def parse_arcalive_detail(url: str) -> Optional[Dict[str, Any]]:
             "extracted_title": extracted_title,
             "extracted_price": extracted_price,
             "extracted_shipping": extracted_shipping,
+            "extracted_votes": extracted_votes,
             "comment_texts": _collect_comment_texts(
                 soup, ".comment-item .message .text", limit=15
             ),
@@ -3065,6 +3195,8 @@ def _has_community_hot_reaction(
         return False
     if votes >= 5:
         return True
+    if downvotes == 0 and votes >= 1 and comments >= 5:
+        return True
     if downvotes == 0 and votes >= 3 and comments >= 6:
         return True
     if source_name == "dealbada" and downvotes == 0 and votes >= 4 and comments >= 3:
@@ -3282,7 +3414,13 @@ def evaluate_deal_quality(
         votes_n = int(d.get("votes", 0) or 0)
         downvotes_n = int(d.get("downvotes", 0) or 0)
         comments_n = int(d.get("comments", 0) or 0)
-        if _has_community_hot_reaction(d, source_name):
+        unit_consumable_hot = (
+            category in ("food", "living")
+            and bool(effective_unit_display)
+            and downvotes_n == 0
+            and comments_n >= 6
+        )
+        if _has_community_hot_reaction(d, source_name) or unit_consumable_hot:
             has_value_signal = bool(effective_unit_display) or bool(
                 extract_best_reaction_quote(comment_texts or [], body_text=body_text)
             )
@@ -3718,9 +3856,15 @@ def process_deal(
     if fb is not None:
         fb["price_ok"] = int(fb.get("price_ok", 0) or 0) + 1
 
+    eval_deal = dict(d)
+    eval_deal["votes"] = max(
+        int(d.get("votes", 0) or 0),
+        int(detail.get("extracted_votes", 0) or 0),
+    )
+
     # 유효 가격 관측 이력 적재 (확정 옵션/구성 + 확정 배송 조건 'free'|'paid'만 1일 최저가 기록)
     eval_res = evaluate_deal_quality(
-        d,
+        eval_deal,
         source_name,
         p_info,
         base_title,
@@ -3790,7 +3934,7 @@ def process_deal(
             )
             _funnel_drop("wait")
             logger.info(
-                f"⏳ [검증대기/{eval_res['category']}] 기준 미달(추천={d.get('votes',0)}, 댓글={d.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
+                f"⏳ [검증대기/{eval_res['category']}] 기준 미달(추천={eval_deal.get('votes',0)}, 댓글={eval_deal.get('comments',0)}, 할인={p_info['discount_rate']}%): {clean_title}"
             )
         return False
 
@@ -3862,7 +4006,7 @@ def process_deal(
             "sale_price": int(p_info["final_price"]),
             "discount_rate": int(p_info["discount_rate"]),
             "unit_info": display_unit,
-            "votes": int(d.get("votes", 0) or 0),
+            "votes": int(eval_deal.get("votes", 0) or 0),
             "comments": int(d.get("comments", 0) or 0),
             "reaction_text": reaction_quote,
             "shipping_fee": int(p_info.get("shipping_fee", 0) or 0),
@@ -4238,6 +4382,8 @@ def run_goldbox_staggered(
             title=clean_title,
             sale_price=p_price,
             discount_rate=0,
+            unit_info=unit_info,
+            shipping_label=shipping_label,
         )
         evidence_note = f"{unit_short} · 오늘 자정 마감" if unit_short else "오늘 자정 마감"
 
@@ -5058,6 +5204,8 @@ def main():
             except Exception as e:
                 logger.error(f"[{source_name}] 목록 수집 오류: {e}")
                 rows = []
+            if not rows and _is_source_blocked_this_run(source_name, price_db):
+                fb_src["blocked"] = int(fb_src.get("blocked", 0) or 0) + 1
             fb_src["found"] = len(rows)
             new_rows = [row for row in rows if row.get("id") not in seen]
             fb_src["new"] = len(new_rows)
