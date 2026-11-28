@@ -1574,6 +1574,38 @@ class TestUpgradesIntegration(unittest.TestCase):
             self.assertIsNotNone(db.get_source_cooldown("clien", now=now_dt))
             self.assertIsNone(db.get_source_cooldown("arca", now=now_dt))
 
+    def test_ci_403_ephemeral_run_block_and_ruliweb_timeout_break(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        import requests
+        from price_history import PriceHistoryDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = PriceHistoryDB(str(Path(tmpdir) / "test_ci_cd.db"))
+            # 1) Pre-existing cached 403 cooldown is auto-cleared under GITHUB_ACTIONS
+            db.set_source_cooldown("ppomppu", 403, 120, reason="http_403")
+            push_deals._RUN_BLOCKED_SOURCES.clear()
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+                self.assertIsNone(push_deals._is_source_blocked_this_run("ppomppu", db))
+                self.assertIsNone(db.get_source_cooldown("ppomppu"))
+
+                # 2) New 403 under GITHUB_ACTIONS blocks only current run, NOT DB
+                resp_403 = MagicMock(status_code=403)
+                with patch.object(push_deals, "get_price_db", return_value=db):
+                    push_deals._record_source_http_block("arca", resp_403)
+                self.assertIsNotNone(push_deals._is_source_blocked_this_run("arca", db))
+                self.assertIsNone(db.get_source_cooldown("arca"))
+                push_deals._RUN_BLOCKED_SOURCES.clear()
+                self.assertIsNone(push_deals._is_source_blocked_this_run("arca", db))
+
+        # 3) Ruliweb ConnectTimeout breaks immediately on 1st URL instead of waiting all 4
+        with patch.object(push_deals.requests, "get", side_effect=requests.exceptions.ConnectTimeout("timeout")) as mock_get:
+            res = push_deals.collect_ruliweb_deals(max_pages=3)
+        self.assertEqual(res, [])
+        self.assertEqual(mock_get.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

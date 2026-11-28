@@ -121,7 +121,7 @@ MAX_PER_SOURCE_PER_RUN = 6
 MIN_COMMUNITY_INTERVAL_MINUTES = 0
 FLYER_BATCH_SIZE = 4
 FLYER_MAX_WAIT_MINUTES = 20
-FLYER_SOLO_WAIT_MINUTES = 60
+FLYER_SOLO_WAIT_MINUTES = 30
 FLYER_URGENT_DISCOUNT_RATE = 50
 FLYER_URGENT_WAIT_MINUTES = 10
 FLYER_ITEM_TTL_HOURS = 6
@@ -133,6 +133,7 @@ WAIT_RECHECK_MIN_MINUTES = 8
 SOURCE_429_DEFAULT_COOLDOWN_MINUTES = 30
 SOURCE_403_COOLDOWN_MINUTES = 120
 PRICE_DROP_REENTRY_PCT = 5.0
+_RUN_BLOCKED_SOURCES: Set[str] = set()
 
 ENABLE_TRACK_B2_NO_ORIG_FOOD = False  # 정가 미확인(할인율 0%) 식품 단가·반응 단독 송출 비활성화
 ENABLE_COMMUNITY_HOT_NO_ORIG = True  # 정가 미표기라도 커뮤니티 추천·댓글 검증 + 가치신호 확인 시 인기딜 송출
@@ -1971,7 +1972,7 @@ def collect_ruliweb_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
 
     for url in urls:
         try:
-            res = requests.get(url, headers=HEADERS, timeout=8)
+            res = requests.get(url, headers=HEADERS, timeout=5)
             if res.status_code != 200:
                 _record_source_http_block("ruliweb", res)
                 if res.status_code in (403, 429):
@@ -2022,6 +2023,9 @@ def collect_ruliweb_deals(max_pages: int = 3) -> List[Dict[str, Any]]:
                         "id": pid, "title": title, "link": link,
                         "votes": votes, "hits": hits, "comments": comments, "downvotes": 0,
                     })
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏳ 루리웹 접속 타임아웃 ({url}) — 금회 남은 페이지 중단")
+            break
         except Exception as e:
             logger.error(f"루리웹 수집 오류 ({url}): {e}")
 
@@ -2551,15 +2555,32 @@ def _parse_retry_after_minutes(res: Any, default_minutes: int = SOURCE_429_DEFAU
     return default_minutes
 
 
+def _is_source_blocked_this_run(source_name: str, price_db: PriceHistoryDB) -> Optional[Dict[str, Any]]:
+    """현재 실행 회차 차단 또는 유효한 출처 쿨다운 조회 (CI 환경의 이전 403 쿨다운은 자동 해제)."""
+    if source_name in _RUN_BLOCKED_SOURCES:
+        return {"status_code": 403, "reason": "run_block"}
+    cd = price_db.get_source_cooldown(source_name)
+    if cd and os.getenv("GITHUB_ACTIONS") and int(cd.get("status_code", 0) or 0) == 403:
+        price_db.clear_source_cooldown(source_name)
+        logger.info(f"🔓 [{source_name}] 이전 임시 IP HTTP 403 쿨다운 자동 해제")
+        return None
+    return cd
+
+
 def _record_source_http_block(source_name: str, res: Any) -> None:
     status = int(getattr(res, "status_code", 0) or 0)
     if status == 429:
         mins = _parse_retry_after_minutes(res)
+        _RUN_BLOCKED_SOURCES.add(source_name)
         get_price_db().set_source_cooldown(source_name, 429, mins, reason="http_429")
         logger.warning(f"⏸️ [{source_name}] HTTP 429 수신 — {mins}분 쿨다운 설정")
     elif status == 403:
-        get_price_db().set_source_cooldown(source_name, 403, SOURCE_403_COOLDOWN_MINUTES, reason="http_403")
-        logger.warning(f"🛑 [{source_name}] HTTP 403 차단 감지 — {SOURCE_403_COOLDOWN_MINUTES}분 쿨다운 설정")
+        _RUN_BLOCKED_SOURCES.add(source_name)
+        if os.getenv("GITHUB_ACTIONS"):
+            logger.warning(f"🛑 [{source_name}] HTTP 403 감지(임시 CI IP) — 금회만 중단, 다음 회차 새 IP에서 재시도")
+        else:
+            get_price_db().set_source_cooldown(source_name, 403, SOURCE_403_COOLDOWN_MINUTES, reason="http_403")
+            logger.warning(f"🛑 [{source_name}] HTTP 403 차단 감지 — {SOURCE_403_COOLDOWN_MINUTES}분 쿨다운 설정")
 
 
 def _extract_coupang_url_from_href_or_text(raw: str) -> Optional[str]:
@@ -3531,7 +3552,7 @@ def process_deal(
         return False
 
     price_db = get_price_db()
-    if price_db.get_source_cooldown(source_name):
+    if _is_source_blocked_this_run(source_name, price_db):
         return False
     wait_key = f"{source_name}:{deal_id}"
     skip_wait, skip_reason = price_db.should_skip_wait_recheck(wait_key, WAIT_RECHECK_MIN_MINUTES)
@@ -4873,6 +4894,7 @@ def main():
         logger.info("⏳ 이미 다른 deal_pusher 프로세스가 실행 중이므로 중복 실행을 건너뜁니다.")
         return
 
+    _RUN_BLOCKED_SOURCES.clear()
     update_pc_heartbeat()
     sync_git_state()
 
@@ -4917,7 +4939,7 @@ def main():
         )
         collected_by_source: List[Tuple[str, Any, List[Dict[str, Any]]]] = []
         for collector, parser, source_name in sources:
-            cd = price_db.get_source_cooldown(source_name)
+            cd = _is_source_blocked_this_run(source_name, price_db)
             if cd:
                 logger.info(
                     f"⏸️ [{source_name}] 쿨다운 중 (HTTP {cd.get('status_code')}, ~{cd.get('cooldown_until')}) — 목록 수집 생략"
@@ -4945,8 +4967,8 @@ def main():
             for src in active_sources:
                 if (run_stats["queued"] + run_stats["sent"]) >= MAX_COMMUNITY_PER_RUN or len(flyer_queue) >= _remaining_daily_room():
                     break
-                if price_db.get_source_cooldown(src):
-                    logger.info(f"⏸️ [{src}] 회차 중 쿨다운 진입 — 추가 후보 조회 중단")
+                if _is_source_blocked_this_run(src, price_db):
+                    logger.info(f"⏸️ [{src}] 회차 중 차단/쿨다운 진입 — 추가 후보 조회 중단")
                     continue
                 if attempts_by_source[src] >= MAX_PER_SOURCE_PER_RUN:
                     continue
@@ -4977,7 +4999,7 @@ def main():
                         notified_deal_ids=notified_deal_ids,
                     )
                     processed_one = True
-                if price_db.get_source_cooldown(src):
+                if _is_source_blocked_this_run(src, price_db):
                     logger.info(f"⏸️ [{src}] 상세 조회 중 차단/429 감지 — 동일 회차 남은 후보 중단")
                     continue
                 if q_rows and attempts_by_source[src] < MAX_PER_SOURCE_PER_RUN:
