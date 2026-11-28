@@ -1584,21 +1584,29 @@ class TestUpgradesIntegration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = PriceHistoryDB(str(Path(tmpdir) / "test_ci_cd.db"))
-            # 1) Pre-existing cached 403 cooldown is auto-cleared under GITHUB_ACTIONS
+            # 1) Pre-existing cached 403/429 cooldowns are auto-cleared under GITHUB_ACTIONS
             db.set_source_cooldown("ppomppu", 403, 120, reason="http_403")
+            db.set_source_cooldown("clien", 429, 30, reason="http_429")
             push_deals._RUN_BLOCKED_SOURCES.clear()
             with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
                 self.assertIsNone(push_deals._is_source_blocked_this_run("ppomppu", db))
                 self.assertIsNone(db.get_source_cooldown("ppomppu"))
+                self.assertIsNone(push_deals._is_source_blocked_this_run("clien", db))
+                self.assertIsNone(db.get_source_cooldown("clien"))
 
-                # 2) New 403 under GITHUB_ACTIONS blocks only current run, NOT DB
+                # 2) New 403 & 429 under GITHUB_ACTIONS block only current run, NOT DB
                 resp_403 = MagicMock(status_code=403)
+                resp_429 = MagicMock(status_code=429)
                 with patch.object(push_deals, "get_price_db", return_value=db):
                     push_deals._record_source_http_block("arca", resp_403)
+                    push_deals._record_source_http_block("dealbada", resp_429)
                 self.assertIsNotNone(push_deals._is_source_blocked_this_run("arca", db))
+                self.assertIsNotNone(push_deals._is_source_blocked_this_run("dealbada", db))
                 self.assertIsNone(db.get_source_cooldown("arca"))
+                self.assertIsNone(db.get_source_cooldown("dealbada"))
                 push_deals._RUN_BLOCKED_SOURCES.clear()
                 self.assertIsNone(push_deals._is_source_blocked_this_run("arca", db))
+                self.assertIsNone(push_deals._is_source_blocked_this_run("dealbada", db))
 
         # 3) Ruliweb ConnectTimeout breaks immediately on 1st URL instead of waiting all 4
         with patch.object(push_deals.requests, "get", side_effect=requests.exceptions.ConnectTimeout("timeout")) as mock_get:

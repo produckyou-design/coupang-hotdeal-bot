@@ -2556,31 +2556,33 @@ def _parse_retry_after_minutes(res: Any, default_minutes: int = SOURCE_429_DEFAU
 
 
 def _is_source_blocked_this_run(source_name: str, price_db: PriceHistoryDB) -> Optional[Dict[str, Any]]:
-    """현재 실행 회차 차단 또는 유효한 출처 쿨다운 조회 (CI 환경의 이전 403 쿨다운은 자동 해제)."""
+    """현재 실행 회차 차단 또는 유효한 출처 쿨다운 조회 (CI 환경의 이전 403/429 쿨다운은 자동 해제)."""
     if source_name in _RUN_BLOCKED_SOURCES:
         return {"status_code": 403, "reason": "run_block"}
     cd = price_db.get_source_cooldown(source_name)
-    if cd and os.getenv("GITHUB_ACTIONS") and int(cd.get("status_code", 0) or 0) == 403:
+    if cd and os.getenv("GITHUB_ACTIONS") and int(cd.get("status_code", 0) or 0) in (403, 429):
+        st_code = int(cd.get("status_code", 0) or 0)
         price_db.clear_source_cooldown(source_name)
-        logger.info(f"🔓 [{source_name}] 이전 임시 IP HTTP 403 쿨다운 자동 해제")
+        logger.info(f"🔓 [{source_name}] 이전 임시 IP HTTP {st_code} 쿨다운 자동 해제")
         return None
     return cd
 
 
 def _record_source_http_block(source_name: str, res: Any) -> None:
     status = int(getattr(res, "status_code", 0) or 0)
+    if status not in (403, 429):
+        return
+    _RUN_BLOCKED_SOURCES.add(source_name)
+    if os.getenv("GITHUB_ACTIONS"):
+        logger.warning(f"🛑 [{source_name}] HTTP {status} 감지(임시 CI IP) — 금회만 중단, 다음 회차 새 IP에서 재시도")
+        return
     if status == 429:
         mins = _parse_retry_after_minutes(res)
-        _RUN_BLOCKED_SOURCES.add(source_name)
         get_price_db().set_source_cooldown(source_name, 429, mins, reason="http_429")
         logger.warning(f"⏸️ [{source_name}] HTTP 429 수신 — {mins}분 쿨다운 설정")
-    elif status == 403:
-        _RUN_BLOCKED_SOURCES.add(source_name)
-        if os.getenv("GITHUB_ACTIONS"):
-            logger.warning(f"🛑 [{source_name}] HTTP 403 감지(임시 CI IP) — 금회만 중단, 다음 회차 새 IP에서 재시도")
-        else:
-            get_price_db().set_source_cooldown(source_name, 403, SOURCE_403_COOLDOWN_MINUTES, reason="http_403")
-            logger.warning(f"🛑 [{source_name}] HTTP 403 차단 감지 — {SOURCE_403_COOLDOWN_MINUTES}분 쿨다운 설정")
+    else:
+        get_price_db().set_source_cooldown(source_name, 403, SOURCE_403_COOLDOWN_MINUTES, reason="http_403")
+        logger.warning(f"🛑 [{source_name}] HTTP 403 차단 감지 — {SOURCE_403_COOLDOWN_MINUTES}분 쿨다운 설정")
 
 
 def _extract_coupang_url_from_href_or_text(raw: str) -> Optional[str]:
