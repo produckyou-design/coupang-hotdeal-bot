@@ -119,6 +119,9 @@ _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한, 전단지 배치 및 24시간 전단지 송출 설정 (KST)
 ENABLE_GOLDBOX = True
+ENABLE_CATEGORY_BEST_SHADOW = True
+CATEGORY_BEST_SHADOW_IDS = (1012, 1013, 1014, 1015, 1016)
+CATEGORY_BEST_SHADOW_LIMIT = 15
 ENABLE_QUIET_HOURS = False
 DAILY_MAX_COMMUNITY_DEALS = 200
 GOLDBOX_PER_SLOT = 4
@@ -2109,9 +2112,14 @@ def parse_ruliweb_detail(url: str) -> Optional[Dict[str, Any]]:
 # ==========================================
 # 2. 뽐뿌 핫딜 수집기
 # ==========================================
-def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, Any]], bool, Any]:
-    """데스크톱 403/차단 시 뽐뿌 모바일 게시판 및 공개 RSS 피드로 폴백 수집."""
+_LAST_PPOMPPU_ROUTE_IDS: Dict[str, List[str]] = {"pc": [], "mobile": [], "rss": []}
+
+
+def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, Any]], bool, Any, List[str], List[str]]:
+    """데스크톱 403/차단 또는 빈 응답 시 뽐뿌 모바일 게시판 및 공개 RSS 피드로 폴백 수집."""
     deals: List[Dict[str, Any]] = []
+    mobile_ids: List[str] = []
+    rss_ids: List[str] = []
     got_200 = False
     last_block_resp = None
 
@@ -2144,6 +2152,8 @@ def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, 
                     continue
                 post_no = m_no.group(1)
                 deal_id = f"ppomppu_{post_no}"
+                if deal_id not in mobile_ids:
+                    mobile_ids.append(deal_id)
                 full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={post_no}"
                 if not any(d["id"] == deal_id for d in deals):
                     deals.append({
@@ -2180,6 +2190,8 @@ def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, 
                     continue
                 post_no = m_no.group(1)
                 deal_id = f"ppomppu_{post_no}"
+                if deal_id not in rss_ids:
+                    rss_ids.append(deal_id)
                 full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={post_no}"
                 if not any(d["id"] == deal_id for d in deals):
                     deals.append({
@@ -2196,12 +2208,15 @@ def _collect_ppomppu_mobile_and_rss(max_pages: int = 2) -> Tuple[List[Dict[str, 
     except Exception as e:
         logger.debug(f"뽐뿌 RSS 폴백 오류: {e}")
 
-    return deals, got_200, last_block_resp
+    return deals, got_200, last_block_resp, mobile_ids, rss_ids
 
 
 def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
     """뽐뿌 핫딜 게시판 일반 스캔 및 '쿠팡' 검색 결과 듀얼 수집 (+모바일·RSS 폴백)"""
+    global _LAST_PPOMPPU_ROUTE_IDS
+    _LAST_PPOMPPU_ROUTE_IDS = {"pc": [], "mobile": [], "rss": []}
     deals = []
+    pc_ids: List[str] = []
     import urllib.parse
     kw = urllib.parse.quote("쿠팡", encoding="euc-kr")
     urls = [
@@ -2245,6 +2260,8 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
                     if not m:
                         continue
                     deal_id = f"ppomppu_{m.group(1)}"
+                    if deal_id not in pc_ids:
+                        pc_ids.append(deal_id)
                     full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
 
                     votes = 0
@@ -2283,6 +2300,8 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
                             if not m:
                                 continue
                             deal_id = f"ppomppu_{m.group(1)}"
+                            if deal_id not in pc_ids:
+                                pc_ids.append(deal_id)
                             full_url = f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}"
                             if not any(d["id"] == deal_id for d in deals):
                                 deals.append({"id": deal_id, "title": title, "link": full_url, "votes": 0, "downvotes": 0, "comments": 0, "hits": 0})
@@ -2290,12 +2309,15 @@ def collect_ppomppu_deals(max_pages: int = 4) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"뽐뿌 수집 오류 ({url}): {e}")
 
-    if not desktop_got_200:
-        fb_deals, fb_ok, fb_block = _collect_ppomppu_mobile_and_rss(max_pages=2)
+    _LAST_PPOMPPU_ROUTE_IDS["pc"] = pc_ids
+    if not desktop_got_200 or not deals:
+        fb_deals, fb_ok, fb_block, mobile_ids, rss_ids = _collect_ppomppu_mobile_and_rss(max_pages=2)
+        _LAST_PPOMPPU_ROUTE_IDS["mobile"] = mobile_ids
+        _LAST_PPOMPPU_ROUTE_IDS["rss"] = rss_ids
         for fd in fb_deals:
             if not any(d["id"] == fd["id"] for d in deals):
                 deals.append(fd)
-        if not fb_ok and (desktop_blocked_resp is not None or fb_block is not None):
+        if not desktop_got_200 and not fb_ok and (desktop_blocked_resp is not None or fb_block is not None):
             _record_source_http_block("ppomppu", desktop_blocked_resp or fb_block)
     return deals
 
@@ -3551,6 +3573,8 @@ def notify_keyword_subscribers(
         sale_price=sale_p,
         discount_rate=disc_r,
         product_id=prod_id,
+        option_key=str(item.get("option_key") or ""),
+        shipping_fee=int(item.get("shipping_fee", 0) or 0),
     )
     if not matched:
         return 0
@@ -3602,7 +3626,7 @@ def notify_keyword_subscribers(
             f"<i>※ 쿠팡 파트너스 활동으로 일정액의 수수료를 제공받습니다.</i>"
         )
         ctrl_row = [{"text": f"🔕 '{first_kw_short}' 끄기", "callback_data": mute_cb}]
-        is_pid_match = any(kn.startswith("pid:") for kn in kw_norms)
+        is_pid_match = any(kn.startswith(("pid:", "opt:")) for kn in kw_norms)
         if prod_id and sale_p >= 2000 and not is_pid_match:
             watch_p = max(1000, int(round(sale_p * 0.95 / 100.0) * 100))
             watch_cb = f"alert:watch:{prod_id}:{watch_p}"
@@ -4442,6 +4466,130 @@ def run_goldbox_staggered(
     return len(flyer_items)
 
 
+def run_category_best_shadow_observe(
+    seen: Set[str],
+    price_db: Optional[PriceHistoryDB],
+    funnel_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
+    now_dt: Optional[datetime] = None,
+) -> Dict[str, int]:
+    """
+    쿠팡 파트너스 카테고리 베스트 1주일 무발행 관측(Shadow) 실행:
+    - 채널 송출·대기큐 적재 없이 price_history.db에 가격 이력만 축적
+    - 기존 5곳과 겹치지 않으면서 30일 중앙값 대비 20%+ 하락 기준 통과 건수를 퍼널에 집계
+    """
+    summary = {"found": 0, "new": 0, "price_ok": 0, "passed": 0}
+    if not ENABLE_CATEGORY_BEST_SHADOW or price_db is None:
+        return summary
+
+    cur_dt = now_dt or datetime.now(KST)
+    if is_quiet_hours(cur_dt) and "--force-shadow-best" not in sys.argv:
+        return summary
+
+    slot_key = f"shadow_cb_{cur_dt.strftime('%Y%m%d')}_s{cur_dt.hour // 3}"
+    if "--force-shadow-best" not in sys.argv and slot_key in seen:
+        return summary
+
+    seen_opt_keys: Set[str] = set()
+    no_baseline_cnt = 0
+    no_drop_cnt = 0
+
+    for cid in CATEGORY_BEST_SHADOW_IDS:
+        try:
+            res = coupang_api.get_best_category_products(cid, limit=CATEGORY_BEST_SHADOW_LIMIT)
+        except Exception as e:
+            logger.warning(f"⏳ [카테고리베스트 관측] cat={cid} API 조회 실패: {e}")
+            continue
+        rows = (res or {}).get("data") or []
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            prod_id = str(it.get("productId") or "").strip()
+            p_url = str(it.get("productUrl") or "").strip()
+            p_price = int(round(float(it.get("productPrice", 0) or 0)))
+            is_rocket = it.get("isRocket") is True
+            is_free_ship = it.get("isFreeShipping") is True
+            if not prod_id or p_price < 1000 or not (is_rocket or is_free_ship):
+                continue
+
+            raw_name = str(it.get("productName") or "").strip()
+            clean_title = clean_display_title(raw_name) or raw_name
+            if not clean_title:
+                continue
+
+            opt_key = build_option_key(product_id=prod_id, url=p_url, title=clean_title)
+            if not opt_key or opt_key in seen_opt_keys:
+                continue
+            seen_opt_keys.add(opt_key)
+
+            summary["found"] += 1
+            if not is_product_recently_seen(prod_id, seen):
+                summary["new"] += 1
+
+            obs_ship_type = "free" if is_free_ship else "wow_free"
+            category = classify_deal_category(clean_title, "")
+            unit_metrics = compute_effective_unit_metrics(clean_title, p_price)
+
+            if is_comparable_option_key(opt_key):
+                price_db.record_observation(
+                    option_key=opt_key,
+                    product_id=prod_id,
+                    total_price=p_price,
+                    sale_price=p_price,
+                    shipping_fee=0,
+                    orig_price=0,
+                    shipping_type=obs_ship_type,
+                    category=category,
+                    source="catbest_shadow",
+                    metric_type=str(unit_metrics.get("metric_type") or ""),
+                    metric_value=unit_metrics.get("metric_value"),
+                    now=cur_dt,
+                )
+                summary["price_ok"] += 1
+
+                baseline = price_db.get_observed_baseline(
+                    opt_key,
+                    shipping_type=obs_ship_type,
+                    days=30,
+                    min_days=5,
+                    now=cur_dt,
+                )
+                if baseline and int(baseline.get("median_price", 0) or 0) > p_price:
+                    med_p = int(baseline["median_price"])
+                    obs_disc = (med_p - p_price) * 100 // med_p
+                    req_disc = CATEGORY_MIN_DISCOUNT_MAP.get(category, MIN_HOTDEAL_DISCOUNT_RATE)
+                    if obs_disc >= req_disc:
+                        summary["passed"] += 1
+                    else:
+                        no_drop_cnt += 1
+                elif baseline:
+                    no_drop_cnt += 1
+                else:
+                    no_baseline_cnt += 1
+
+    seen.add(slot_key)
+    save_seen(seen)
+
+    if funnel_by_source is not None and summary["found"] > 0:
+        reasons: Dict[str, int] = {}
+        if no_baseline_cnt > 0:
+            reasons["no_baseline_yet"] = no_baseline_cnt
+        if no_drop_cnt > 0:
+            reasons["no_drop"] = no_drop_cnt
+        funnel_by_source["catbest_shadow"] = {
+            "found": summary["found"],
+            "new": summary["new"],
+            "price_ok": summary["price_ok"],
+            "passed": summary["passed"],
+            "blocked": 0,
+            "reasons": reasons,
+        }
+
+    logger.info(
+        f"👀 [카테고리베스트 관측(무발행)] 슬롯={slot_key} · 발견={summary['found']} · 신규(미중복)={summary['new']} · 이력저장={summary['price_ok']} · 하락후보={summary['passed']}"
+    )
+    return summary
+
+
 def load_sales_tracker() -> Dict[str, Any]:
     if is_click_tracker_enabled():
         d1_state = fetch_sales_tracker_state()
@@ -5206,6 +5354,14 @@ def main():
                 rows = []
             if not rows and _is_source_blocked_this_run(source_name, price_db):
                 fb_src["blocked"] = int(fb_src.get("blocked", 0) or 0) + 1
+            if source_name == "ppomppu":
+                fb_src["routes"] = {
+                    rk: {
+                        "found": len(r_ids),
+                        "new": sum(1 for rid in r_ids if rid not in seen),
+                    }
+                    for rk, r_ids in _LAST_PPOMPPU_ROUTE_IDS.items()
+                }
             fb_src["found"] = len(rows)
             new_rows = [row for row in rows if row.get("id") not in seen]
             fb_src["new"] = len(new_rows)
@@ -5321,6 +5477,12 @@ def main():
         )
     except Exception as st_err:
         logger.warning(f"전단지 현황 D1 기록 생략: {st_err}")
+
+    # 쿠팡 카테고리 베스트 1주일 무발행 관측(Shadow): price_history 축적 + 신규/하락 후보 집계만 수행
+    try:
+        run_category_best_shadow_observe(seen, price_db, funnel_by_source=funnel_by_source)
+    except Exception as cb_err:
+        logger.warning(f"카테고리 베스트 관측 생략: {cb_err}")
 
     if funnel_by_source:
         try:

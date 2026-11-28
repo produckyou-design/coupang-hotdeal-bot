@@ -30,6 +30,7 @@ const SOURCE_KR_MAP = {
   dealbada: "딜바다",
   clien: "클리앙",
   goldbox: "골드박스",
+  catbest_shadow: "카테고리베스트(관측)",
 };
 const JOINED_STATUSES = new Set(["member", "administrator", "creator"]);
 const LEFT_STATUSES = new Set(["left", "kicked"]);
@@ -124,6 +125,36 @@ function formatWonCompact(price) {
   return `${price.toLocaleString("en-US")}원↓`;
 }
 
+function formatScopedAlertLabel(kw) {
+  const raw = String(kw || "").trim();
+  const low = raw.toLowerCase();
+  if (low.startsWith("opt:")) {
+    const rest = low.slice(4);
+    const mPid = /^pid:([^:]+)/.exec(rest);
+    const pidPart = mPid ? `#${mPid[1]}` : "";
+    const mVol = /:vol:([^:]+)/.exec(rest);
+    const mW = /:w:([^:]+)/.exec(rest);
+    const mCnt = /:n(\d+)/.exec(rest);
+    const spec = [mVol?.[1] || mW?.[1], mCnt ? `${mCnt[1]}개` : ""].filter(Boolean).join("×");
+    if (pidPart && spec) return `📉 구성추적 ${pidPart} (${spec})`;
+    if (pidPart) return `📉 옵션추적 ${pidPart}`;
+    return "📉 구성추적";
+  }
+  if (low.startsWith("pid:")) return `📉 상품추적 #${raw.slice(4)}`;
+  return raw;
+}
+
+function formatScopedDeleteLabel(kw) {
+  const raw = String(kw || "").trim();
+  const low = raw.toLowerCase();
+  if (low.startsWith("opt:")) {
+    const mPid = /^opt:pid:([^:]+)/.exec(low);
+    return mPid ? `#${mPid[1].slice(0, 8)} 구성` : "구성추적";
+  }
+  if (low.startsWith("pid:")) return `#${raw.slice(4, 12)}`;
+  return raw.length > 10 ? `${raw.slice(0, 9)}…` : raw;
+}
+
 export function formatAlertConditionBadge(row) {
   const kw = String(row?.keyword || "").trim();
   const parts = [];
@@ -134,7 +165,7 @@ export function formatAlertConditionBadge(row) {
   if (minD > 0) parts.push(`${minD}%↑`);
   for (const ex of excl.slice(0, 2)) parts.push(`-${ex}`);
   if (excl.length > 2) parts.push(`외 ${excl.length - 2}제외`);
-  const dispKw = kw.toLowerCase().startsWith("pid:") ? `📉 상품추적 #${kw.slice(4)}` : kw;
+  const dispKw = formatScopedAlertLabel(kw);
   return parts.length > 0 ? `${dispKw} (${parts.join(" · ")})` : dispKw;
 }
 
@@ -256,6 +287,14 @@ const FUNNEL_REASON_KR = {
   link_fail: "딥링크실패",
   duplicate: "중복",
   bad_title: "오인식",
+  no_baseline_yet: "이력축적중",
+  no_drop: "하락미달",
+};
+
+const ROUTE_KR_MAP = {
+  pc: "PC",
+  mobile: "모바일",
+  rss: "RSS",
 };
 
 function formatSourceFunnelBlock(funnelData) {
@@ -285,8 +324,21 @@ function formatSourceFunnelBlock(funnelData) {
       }
     }
     const blockedStr = blocked > 0 ? ` · 차단 ${blocked}회` : "";
+    let routeStr = "";
+    if (vals.routes && typeof vals.routes === "object") {
+      const rParts = [];
+      for (const [rk, rv] of Object.entries(vals.routes)) {
+        if (!rv || typeof rv !== "object") continue;
+        const rf = Number(rv.found || 0);
+        const rn = Number(rv.new || 0);
+        if (rf > 0 || rn > 0) {
+          rParts.push(`${ROUTE_KR_MAP[rk] || rk} ${rf}/${rn}`);
+        }
+      }
+      if (rParts.length > 0) routeStr = ` (경로: ${rParts.join(" · ")})`;
+    }
     lines.push(
-      `• <b>${esc(sourceKr(src))}</b>: 발견 ${found} → 신규 ${isNew} → 가격 ${priceOk} → <b>발행 ${passed}</b>${blockedStr}${topReasonStr}`
+      `• <b>${esc(sourceKr(src))}</b>: 발견 ${found} → 신규 ${isNew} → 가격 ${priceOk} → <b>발행 ${passed}</b>${blockedStr}${topReasonStr}${routeStr}`
     );
   }
   return `${lines.join("\n")}\n\n`;
@@ -321,6 +373,20 @@ function extractQuickAlertKeyword(title) {
   return candidate.length >= 2 ? candidate : "";
 }
 
+function isComparableOptionKey(optKey) {
+  const k = String(optKey || "");
+  return /:vid:|:iid:|:cfg:/i.test(k);
+}
+
+function parseShipFeeFromLabel(label) {
+  const s = String(label || "").trim();
+  if (!s || /무료|무배|와우/.test(s)) return 0;
+  const m = /([\d,]+)\s*원/.exec(s);
+  if (!m) return 0;
+  const fee = Number.parseInt(m[1].replaceAll(",", ""), 10) || 0;
+  return fee > 0 && fee < 100000 ? fee : 0;
+}
+
 async function showWatchCard(env, chat, origin, linkRow, dbOps, countOpened = true) {
   if (!linkRow) {
     await replyTo(env, chat.id, "해당 상품 정보를 찾지 못했어요. /alert 로 키워드 알림을 직접 등록해 보세요.", {
@@ -331,32 +397,49 @@ async function showWatchCard(env, chat, origin, linkRow, dbOps, countOpened = tr
   if (countOpened && typeof dbOps?.bumpWatchMetric === "function") {
     await dbOps.bumpWatchMetric(env, "opened").catch(() => {});
   }
+  const code = String(linkRow.code || "").trim();
   const title = String(linkRow.title || "상품").trim();
   const pid = String(linkRow.product_id || "").trim();
+  const optKey = String(linkRow.option_key || "").trim();
   const salePrice = Number(linkRow.sale_price || 0);
   const unitInfo = String(linkRow.unit_info || "").trim();
   const shipLabel = String(linkRow.shipping_label || "").trim();
+  const shipFee = parseShipFeeFromLabel(shipLabel);
+  const totalPrice = salePrice > 0 ? salePrice + shipFee : 0;
 
   const metaParts = [];
-  if (salePrice > 0) metaParts.push(`현재가 <b>${salePrice.toLocaleString("en-US")}원</b>`);
-  if (shipLabel) metaParts.push(esc(shipLabel));
+  if (totalPrice > 0) {
+    if (shipFee > 0) {
+      metaParts.push(`현재 총액 <b>${totalPrice.toLocaleString("en-US")}원</b> (${salePrice.toLocaleString("en-US")}원+배송비)`);
+    } else {
+      metaParts.push(`현재가 <b>${totalPrice.toLocaleString("en-US")}원</b>`);
+    }
+  }
+  if (shipLabel && shipFee === 0) metaParts.push(esc(shipLabel));
   if (unitInfo) metaParts.push(esc(unitInfo));
 
+  const exactScoped = isComparableOptionKey(optKey);
   const lines = [
     "📉 <b>이 구성 목표가 알림 등록</b>",
     `• 상품: <b>${esc(title)}</b>`,
   ];
   if (metaParts.length > 0) lines.push(`• 구성: ${metaParts.join(" · ")}`);
-  lines.push("", "원하는 목표가를 고르면 바로 알림으로 저장됩니다.");
+  lines.push(
+    "",
+    exactScoped
+      ? "원하는 목표가(배송비 포함 총액 기준)를 고르면 <b>이 구성 그대로</b> 알림으로 저장됩니다."
+      : "원하는 목표가(배송비 포함 총액 기준)를 고르면 바로 알림으로 저장됩니다."
+  );
 
   const kbRows = [];
-  if (pid && salePrice >= 1200) {
-    const targets = calcWatchTargets(salePrice);
+  if ((pid || exactScoped) && totalPrice >= 1200) {
+    const targets = calcWatchTargets(totalPrice);
     for (const t of targets) {
+      const cb = code ? `alert:watchc:${code}:${t.price}` : `alert:watch:${pid}:${t.price}`;
       kbRows.push([
         {
           text: `📉 ${t.price.toLocaleString("en-US")}원 이하 (-${t.pct}%)`,
-          callback_data: `alert:watch:${pid}:${t.price}`,
+          callback_data: cb,
         },
       ]);
     }
@@ -690,7 +773,7 @@ async function alertMenu(env, chat, uid, session, dbOps, { notice = "", recentMa
     const kw = String(r.keyword || "").trim();
     if (!kw) continue;
     const rid = Number(r.id || 0);
-    const shortLbl = kw.length > 10 ? `${kw.slice(0, 9)}…` : kw;
+    const shortLbl = formatScopedDeleteLabel(kw);
     const cb = rid > 0 ? `alert:delid:${rid}` : safeCbStr("alert:del:", kw);
     delBtns.push({ text: `❌ ${shortLbl}`, callback_data: cb });
   }
@@ -1248,6 +1331,47 @@ async function handleCallbackQuery(query, env, origin, dbOps) {
         const code = data.slice("alert:pick:".length).trim();
         const rows = typeof dbOps?.getLinksByCodes === "function" ? await dbOps.getLinksByCodes(env, [code]) : [];
         await showWatchCard(env, chat, origin, rows?.[0] || null, dbOps, false);
+        return;
+      } else if (data.startsWith("alert:watchc:")) {
+        const parts = data.split(":");
+        const code = (parts[2] || "").trim();
+        const watchP = Number.parseInt(parts[3] || "0", 10) || 0;
+        if (!code || watchP < 1000) {
+          await answerCb("상품 구성 정보가 올바르지 않습니다.");
+          return;
+        }
+        const rows = typeof dbOps?.getLinksByCodes === "function" ? await dbOps.getLinksByCodes(env, [code]) : [];
+        const linkRow = rows?.[0];
+        if (!linkRow) {
+          await answerCb("상품 정보를 찾지 못했습니다.");
+          return;
+        }
+        const optKey = String(linkRow.option_key || "").trim();
+        const pid = String(linkRow.product_id || "").trim();
+        const useOpt = isComparableOptionKey(optKey);
+        const alertKw = useOpt ? `opt:${optKey}` : pid ? `pid:${pid}` : "";
+        if (!alertKw) {
+          await answerCb("추적 가능한 상품 식별자가 없습니다.");
+          return;
+        }
+        const resW = await addAlertMessage(env, origin, uid, alertKw, dbOps, false, watchP);
+        await answerCb(resW.ok ? `배송비 포함 ${watchP.toLocaleString("en-US")}원 이하 알림 등록 완료!` : resW.message);
+        if (resW.ok) {
+          if (typeof dbOps?.bumpWatchMetric === "function") {
+            await dbOps.bumpWatchMetric(env, "registered").catch(() => {});
+          }
+          const specParts = [linkRow.unit_info, linkRow.shipping_label].map((x) => String(x || "").trim()).filter(Boolean);
+          const specLine = specParts.length > 0 ? `\n• 구성: ${esc(specParts.join(" · "))}` : "";
+          await replyTo(
+            env,
+            chat.id,
+            `📉 <b>${useOpt ? "이 구성 목표가 알림 등록 완료!" : "상품 추가 하락 알림 등록 완료!"}</b>\n` +
+              `• 상품: <b>${esc(String(linkRow.title || "상품"))}</b>${specLine}\n` +
+              `• 배송비 포함 <b>${watchP.toLocaleString("en-US")}원 이하</b>로 내려가면 DM으로 바로 알려드릴게요.\n` +
+              `• 관리 및 삭제는 /alert 에서 할 수 있습니다.`,
+            { parse_mode: "HTML" }
+          );
+        }
         return;
       } else if (data.startsWith("alert:watch:")) {
         const parts = data.split(":");

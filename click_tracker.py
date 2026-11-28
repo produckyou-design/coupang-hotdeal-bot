@@ -24,6 +24,7 @@ SOURCE_LABEL_MAP = {
     "dealbada": "딜바다",
     "clien": "클리앙",
     "goldbox": "골드박스",
+    "catbest_shadow": "카테고리베스트(관측)",
 }
 
 
@@ -738,6 +739,31 @@ def record_alert_hits(
         return False
 
 
+def _extract_cfg_sig_from_title(title: str) -> str:
+    """제목에서 규격/수량 시그니처(예: cfg:vol:900ml:n12) 추출."""
+    try:
+        from price_history import build_config_signature
+        return str(build_config_signature(title, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _format_opt_alert_label(kw_norm: str) -> str:
+    rest = str(kw_norm or "")[4:]
+    m_pid = re.match(r"^pid:([^:]+)", rest)
+    pid_part = f"#{m_pid.group(1)}" if m_pid else ""
+    m_vol = re.search(r":vol:([^:]+)", rest)
+    m_w = re.search(r":w:([^:]+)", rest)
+    m_cnt = re.search(r":n(\d+)", rest)
+    spec_parts = [x for x in ((m_vol.group(1) if m_vol else (m_w.group(1) if m_w else "")), (f"{m_cnt.group(1)}개" if m_cnt else "")) if x]
+    spec = "×".join(spec_parts)
+    if pid_part and spec:
+        return f"구성가격하락({pid_part} · {spec})"
+    if pid_part:
+        return f"옵션가격하락({pid_part})"
+    return "구성가격하락"
+
+
 def match_alerts_for_deal(
     title: str,
     alerts: Optional[List[Dict[str, Any]]],
@@ -745,12 +771,18 @@ def match_alerts_for_deal(
     sale_price: int = 0,
     discount_rate: int = 0,
     product_id: str = "",
+    option_key: str = "",
+    shipping_fee: int = 0,
 ) -> Dict[str, Dict[str, Any]]:
-    """상품 제목+상품ID+가격+할인율 기준으로 매칭되는 구독자별 상세 결과 반환."""
+    """상품 제목+상품ID+구성(option_key)+배송비 포함 총액+할인율 기준으로 매칭되는 구독자별 상세 결과 반환."""
     title_norm = normalize_alert_keyword(title)
     pid_norm = str(product_id or "").strip().lower()
-    if (not title_norm and not pid_norm) or not alerts:
+    opt_norm = str(option_key or "").strip().lower()
+    if (not title_norm and not pid_norm and not opt_norm) or not alerts:
         return {}
+
+    raw_sale = int(sale_price or 0)
+    eff_price = (raw_sale + max(0, int(shipping_fee or 0))) if raw_sale > 0 else 0
 
     matched: Dict[str, Dict[str, Any]] = {}
     for row in alerts:
@@ -762,7 +794,21 @@ def match_alerts_for_deal(
         if not cid or not kw_norm or len(kw_norm) < 2:
             continue
 
-        if kw_norm.startswith("pid:"):
+        if kw_norm.startswith("opt:"):
+            target_opt = kw_norm[4:].strip()
+            if not target_opt:
+                continue
+            if opt_norm:
+                if opt_norm != target_opt:
+                    continue
+            else:
+                m_tpid = re.match(r"^pid:([^:]+):cfg:(.+)$", target_opt)
+                if not m_tpid or not pid_norm or m_tpid.group(1) != pid_norm:
+                    continue
+                sig = _extract_cfg_sig_from_title(title).lower()
+                if not sig or sig != m_tpid.group(2):
+                    continue
+        elif kw_norm.startswith("pid:"):
             target_pid = kw_norm[4:].strip()
             if not pid_norm or not target_pid or pid_norm != target_pid:
                 continue
@@ -788,7 +834,7 @@ def match_alerts_for_deal(
                 continue
 
         max_p = int(row.get("max_price", 0) or 0)
-        if max_p > 0 and (int(sale_price or 0) <= 0 or int(sale_price or 0) > max_p):
+        if max_p > 0 and (eff_price <= 0 or eff_price > max_p):
             continue
 
         min_d = int(row.get("min_discount", 0) or 0)
@@ -805,7 +851,12 @@ def match_alerts_for_deal(
                 "quiet_night": quiet_night,
             },
         )
-        disp_kw = f"상품가격하락(#{kw_norm[4:]})" if kw_norm.startswith("pid:") else (kw or kw_norm)
+        if kw_norm.startswith("opt:"):
+            disp_kw = _format_opt_alert_label(kw_norm)
+        elif kw_norm.startswith("pid:"):
+            disp_kw = f"상품가격하락(#{kw_norm[4:]})"
+        else:
+            disp_kw = kw or kw_norm
         if disp_kw not in bucket["keywords"]:
             bucket["keywords"].append(disp_kw)
         if kw_norm not in bucket["keyword_norms"]:
@@ -1119,6 +1170,14 @@ _FUNNEL_REASON_KR = {
     "link_fail": "딥링크실패",
     "duplicate": "중복",
     "bad_title": "오인식",
+    "no_baseline_yet": "이력축적중",
+    "no_drop": "하락미달",
+}
+
+_ROUTE_LABEL_MAP = {
+    "pc": "PC",
+    "mobile": "모바일",
+    "rss": "RSS",
 }
 
 
@@ -1160,8 +1219,21 @@ def format_source_funnel_block(funnel: Optional[Dict[str, Any]]) -> str:
                 lbl = _FUNNEL_REASON_KR.get(str(top_k), str(top_k))
                 top_reason_str = f" · 주탈락: {html.escape(lbl, quote=False)}({int(top_v)})"
         blocked_str = f" · 차단 {blocked}회" if blocked > 0 else ""
+        route_str = ""
+        routes = vals.get("routes") if isinstance(vals.get("routes"), dict) else None
+        if routes:
+            r_parts: List[str] = []
+            for rk, rv in routes.items():
+                if not isinstance(rv, dict):
+                    continue
+                rf = int(rv.get("found", 0) or 0)
+                rn = int(rv.get("new", 0) or 0)
+                if rf > 0 or rn > 0:
+                    r_parts.append(f"{_ROUTE_LABEL_MAP.get(str(rk), str(rk))} {rf}/{rn}")
+            if r_parts:
+                route_str = f" (경로: {' · '.join(r_parts)})"
         lines.append(
-            f"• <b>{html.escape(src_kr, quote=False)}</b>: 발견 {found} → 신규 {new_cnt} → 가격 {price_ok} → <b>발행 {passed}</b>{blocked_str}{top_reason_str}"
+            f"• <b>{html.escape(src_kr, quote=False)}</b>: 발견 {found} → 신규 {new_cnt} → 가격 {price_ok} → <b>발행 {passed}</b>{blocked_str}{top_reason_str}{route_str}"
         )
     return "\n".join(lines) + "\n\n"
 

@@ -1801,6 +1801,104 @@ class TestUpgradesIntegration(unittest.TestCase):
         self.assertTrue(ruli_urls[0].endswith("?page=1"))
         self.assertIn("search_type=subject", ruli_urls[-1])
 
+    def test_ppomppu_empty_200_fallback_routes_and_category_best_shadow(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from price_history import PriceHistoryDB
+
+        # 1) PC returns HTTP 200 with 0 coupang items -> still falls back to mobile + RSS & records routes
+        mobile_html = '<a href="/new/bbs_view.php?id=ppomppu&no=752701">[쿠팡] 삼다수 2L 12병 (10,800원/무료)</a>'
+        rss_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            "<rss><channel><item>"
+            "<title>[쿠팡] 농심 신라면 20봉 (14,900원/무배)</title>"
+            "<link>https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&amp;no=752702</link>"
+            "</item></channel></rss>"
+        )
+
+        def fake_pc200_get(url, **_kw):
+            resp = MagicMock()
+            resp.headers = {"content-type": "text/html; charset=utf-8"}
+            if "zboard.php" in url:
+                resp.status_code = 200
+                resp.text = "<html><body><table></table></body></html>"
+            elif "m.ppomppu.co.kr" in url:
+                resp.status_code = 200
+                resp.text = mobile_html
+            elif "rss.php" in url:
+                resp.status_code = 200
+                resp.text = rss_xml
+            else:
+                resp.status_code = 404
+                resp.text = ""
+            return resp
+
+        with patch.object(push_deals.requests, "get", side_effect=fake_pc200_get), \
+             patch.object(push_deals.time, "sleep"):
+            got = push_deals.collect_ppomppu_deals(max_pages=1)
+        self.assertEqual({d["id"] for d in got}, {"ppomppu_752701", "ppomppu_752702"})
+        self.assertEqual(push_deals._LAST_PPOMPPU_ROUTE_IDS["pc"], [])
+        self.assertEqual(push_deals._LAST_PPOMPPU_ROUTE_IDS["mobile"], ["ppomppu_752701"])
+        self.assertEqual(push_deals._LAST_PPOMPPU_ROUTE_IDS["rss"], ["ppomppu_752702"])
+
+        # 2) Category Best Shadow observes prices silently without calling Telegram send
+        kst = timezone(timedelta(hours=9))
+        now_dt = datetime(2026, 11, 28, 17, 15, tzinfo=kst)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = PriceHistoryDB(str(Path(tmpdir) / "shadow.db"))
+            opt_drop = "pid:9001:vid:8001"
+            for d_ago in range(1, 6):
+                db.record_observation(
+                    opt_drop,
+                    "9001",
+                    20000,
+                    20000,
+                    shipping_type="wow_free",
+                    category="food",
+                    source="catbest_shadow",
+                    now=now_dt - timedelta(days=d_ago),
+                )
+
+            api_payload = {
+                "rCode": "0",
+                "data": [
+                    {
+                        "productId": 9001,
+                        "productName": "신선한 대란 30구",
+                        "productPrice": 15000,
+                        "isRocket": True,
+                        "isFreeShipping": False,
+                        "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=9001&itemId=7001&vendorItemId=8001",
+                    },
+                    {
+                        "productId": 9002,
+                        "productName": "코멧 키친타월 150매 6롤",
+                        "productPrice": 6990,
+                        "isRocket": True,
+                        "isFreeShipping": True,
+                        "productUrl": "https://link.coupang.com/re/AFFSDP?pageKey=9002&itemId=7002&vendorItemId=8002",
+                    },
+                ],
+            }
+            seen = set()
+            funnel = {}
+            with patch.object(push_deals.coupang_api, "get_best_category_products", return_value=api_payload), \
+                 patch.object(push_deals, "CATEGORY_BEST_SHADOW_IDS", (1012,)), \
+                 patch.object(push_deals, "save_seen"), \
+                 patch.object(push_deals, "send_telegram_photo_bytes") as mock_tg:
+                stat = push_deals.run_category_best_shadow_observe(seen, db, funnel_by_source=funnel, now_dt=now_dt)
+                self.assertEqual(stat["found"], 2)
+                self.assertEqual(stat["price_ok"], 2)
+                self.assertEqual(stat["passed"], 1)
+                self.assertEqual(funnel["catbest_shadow"]["reasons"]["no_baseline_yet"], 1)
+                mock_tg.assert_not_called()
+
+                # Re-running in same 3h slot skips automatically
+                stat2 = push_deals.run_category_best_shadow_observe(seen, db, funnel_by_source=funnel, now_dt=now_dt)
+                self.assertEqual(stat2["found"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

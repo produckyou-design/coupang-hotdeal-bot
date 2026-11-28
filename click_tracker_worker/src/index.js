@@ -23,6 +23,7 @@ const SOURCE_KR_MAP = {
   dealbada: "딜바다",
   clien: "클리앙",
   goldbox: "골드박스",
+  catbest_shadow: "카테고리베스트(관측)",
 };
 
 function publicCorsHeaders(cacheControl = "public, max-age=120") {
@@ -118,15 +119,28 @@ function sanitizeExcludeTerms(raw) {
   return clean.join(", ").slice(0, 120);
 }
 
+function parseShippingFeeFromLabel(label) {
+  const s = String(label || "").trim();
+  if (!s || /무료|무배|와우/.test(s)) return 0;
+  const m = /([\d,]+)\s*원/.exec(s);
+  if (!m) return 0;
+  const fee = Number.parseInt(m[1].replaceAll(",", ""), 10) || 0;
+  return fee > 0 && fee < 100000 ? fee : 0;
+}
+
 export function matchLinkAgainstRule(linkRow, rule) {
   if (Number(rule?.paused || 0) === 1) return false;
   const titleNorm = normalizeAlertKeyword(linkRow?.title || "");
   const pidNorm = String(linkRow?.product_id || "").trim().toLowerCase();
+  const optNorm = normalizeAlertKeyword(linkRow?.option_key || "");
   const rawKw = String(rule?.keyword || "").trim();
   const kwNorm = normalizeAlertKeyword(rule?.keyword_norm || rawKw);
   if (!kwNorm) return false;
 
-  if (kwNorm.startsWith("pid:")) {
+  if (kwNorm.startsWith("opt:")) {
+    const targetOpt = kwNorm.slice(4).trim();
+    if (!optNorm || !targetOpt || optNorm !== targetOpt) return false;
+  } else if (kwNorm.startsWith("pid:")) {
     const targetPid = kwNorm.slice(4).trim();
     if (!pidNorm || !targetPid || pidNorm !== targetPid) return false;
   } else {
@@ -154,7 +168,8 @@ export function matchLinkAgainstRule(linkRow, rule) {
 
   const maxPrice = Number(rule?.max_price || 0);
   const salePrice = Number(linkRow?.sale_price || 0);
-  if (maxPrice > 0 && (salePrice <= 0 || salePrice > maxPrice)) {
+  const effPrice = salePrice > 0 ? salePrice + parseShippingFeeFromLabel(linkRow?.shipping_label) : 0;
+  if (maxPrice > 0 && (effPrice <= 0 || effPrice > maxPrice)) {
     return false;
   }
 
@@ -539,7 +554,10 @@ async function findRecentMatches(env, origin, rules, days = 14, limit = 5) {
   if (!Array.isArray(rules) || rules.length === 0) return [];
   const startIso = new Date(Date.now() - days * 86400 * 1000).toISOString();
   const res = await env.DB.prepare(
-    `SELECT code, product_id, title, source, sale_price, discount_rate, created_at
+    `SELECT code, product_id, title, source, sale_price, discount_rate,
+            COALESCE(shipping_label, '') AS shipping_label,
+            COALESCE(option_key, '') AS option_key,
+            created_at
      FROM links
      WHERE created_at >= ? AND title != ''
      ORDER BY created_at DESC
@@ -556,7 +574,13 @@ async function findRecentMatches(env, origin, rules, days = 14, limit = 5) {
     for (const rule of rules) {
       if (matchLinkAgainstRule(row, rule)) {
         const kn = normalizeKeywordSafe(rule.keyword_norm || rule.keyword);
-        const kwLabel = kn.startsWith("pid:") ? `상품가격하락(#${kn.slice(4)})` : String(rule.keyword || "").trim();
+        let kwLabel = String(rule.keyword || "").trim();
+        if (kn.startsWith("opt:")) {
+          const mPid = /^opt:pid:([^:]+)/.exec(kn);
+          kwLabel = mPid ? `구성가격하락(#${mPid[1]})` : "구성가격하락";
+        } else if (kn.startsWith("pid:")) {
+          kwLabel = `상품가격하락(#${kn.slice(4)})`;
+        }
         if (kwLabel && !matchedKws.includes(kwLabel)) matchedKws.push(kwLabel);
       }
     }
@@ -638,7 +662,8 @@ async function handleGetAlerts(request, env, url) {
 async function createOrUpdateAlert(env, origin, chatId, rawKeyword, rawMaxPrice = 0, rawMinDiscount = 0, rawExcludeTerms = "") {
   const keyword = String(rawKeyword || "").trim().replace(/\s+/g, " ");
   const keywordNorm = normalizeAlertKeyword(keyword);
-  if (keyword.length < 2 || keyword.length > 24 || keywordNorm.length < 2) {
+  const isScopedRule = keywordNorm.startsWith("opt:") || keywordNorm.startsWith("pid:");
+  if (keyword.length < 2 || keyword.length > (isScopedRule ? 120 : 24) || keywordNorm.length < 2) {
     return { ok: false, error: "invalid_keyword" };
   }
 
@@ -1585,6 +1610,13 @@ function mergeSourceFunnelEntry(existingSources, incomingSources) {
   const srcObj = existingSources && typeof existingSources === "object" ? existingSources : {};
   for (const [src, vals] of Object.entries(srcObj)) {
     if (!vals || typeof vals !== "object") continue;
+    const copiedRoutes = {};
+    if (vals.routes && typeof vals.routes === "object") {
+      for (const [rk, rv] of Object.entries(vals.routes)) {
+        if (!rv || typeof rv !== "object") continue;
+        copiedRoutes[rk] = { found: Number(rv.found || 0), new: Number(rv.new || 0) };
+      }
+    }
     out[src] = {
       found: Number(vals.found || 0),
       new: Number(vals.new || 0),
@@ -1592,6 +1624,7 @@ function mergeSourceFunnelEntry(existingSources, incomingSources) {
       passed: Number(vals.passed || 0),
       blocked: Number(vals.blocked || 0),
       reasons: vals.reasons && typeof vals.reasons === "object" ? { ...vals.reasons } : {},
+      ...(Object.keys(copiedRoutes).length > 0 ? { routes: copiedRoutes } : {}),
     };
   }
   const incObj = incomingSources && typeof incomingSources === "object" ? incomingSources : {};
@@ -1611,6 +1644,17 @@ function mergeSourceFunnelEntry(existingSources, incomingSources) {
       const reasonKey = String(rk || "").trim().slice(0, 48);
       if (!reasonKey) continue;
       out[src].reasons[reasonKey] = Number(out[src].reasons[reasonKey] || 0) + Math.max(0, Number.parseInt(String(rv ?? 0), 10) || 0);
+    }
+    const incRoutes = rawVals.routes && typeof rawVals.routes === "object" ? rawVals.routes : null;
+    if (incRoutes) {
+      if (!out[src].routes) out[src].routes = {};
+      for (const [rtName, rtVals] of Object.entries(incRoutes)) {
+        const rKey = String(rtName || "").trim().toLowerCase().slice(0, 16);
+        if (!rKey || !rtVals || typeof rtVals !== "object") continue;
+        if (!out[src].routes[rKey]) out[src].routes[rKey] = { found: 0, new: 0 };
+        out[src].routes[rKey].found += Math.max(0, Number.parseInt(String(rtVals.found ?? 0), 10) || 0);
+        out[src].routes[rKey].new += Math.max(0, Number.parseInt(String(rtVals.new ?? 0), 10) || 0);
+      }
     }
   }
   return out;

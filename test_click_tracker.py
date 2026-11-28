@@ -808,13 +808,25 @@ class TestUpgradesV2(unittest.TestCase):
             "runs": 5,
             "sources": {
                 "ruliweb": {"found": 12, "new": 3, "price_ok": 1, "passed": 0, "reasons": {"low_discount": 1}},
-                "ppomppu": {"found": 0, "new": 0, "price_ok": 0, "passed": 0, "blocked": 5, "reasons": {}},
+                "ppomppu": {
+                    "found": 3,
+                    "new": 1,
+                    "price_ok": 0,
+                    "passed": 0,
+                    "blocked": 2,
+                    "reasons": {},
+                    "routes": {"pc": {"found": 0, "new": 0}, "mobile": {"found": 2, "new": 1}, "rss": {"found": 1, "new": 0}},
+                },
+                "catbest_shadow": {"found": 20, "new": 18, "price_ok": 20, "passed": 1, "reasons": {"no_baseline_yet": 19}},
             },
         })
         self.assertIn("루리웹", block)
         self.assertIn("할인부족(1)", block)
         self.assertIn("뽐뿌", block)
-        self.assertIn("차단 5회", block)
+        self.assertIn("차단 2회", block)
+        self.assertIn("모바일 2/1", block)
+        self.assertIn("카테고리베스트(관측)", block)
+        self.assertIn("이력축적중(19)", block)
 
         saved_states = []
         with patch.object(push_deals, "is_click_tracker_enabled", return_value=True), \
@@ -829,6 +841,61 @@ class TestUpgradesV2(unittest.TestCase):
         self.assertNotIn("ORD999888", dumped)
         self.assertNotIn("notified_order_keys", saved_states[0])
         self.assertEqual(len(saved_states[0].get("notified_order_hashes", [])), 1)
+
+    def test_option_exact_and_shipping_included_alert_matching(self):
+        alerts = [
+            {
+                "id": 10,
+                "chat_id": "1001",
+                "keyword": "opt:pid:777:cfg:vol:900ml:n12",
+                "keyword_norm": "opt:pid:777:cfg:vol:900ml:n12",
+                "max_price": 10800,
+                "min_discount": 0,
+                "exclude_terms": "",
+                "paused": 0,
+            }
+        ]
+        # 1) Same pack (900ml x 12) + free shipping <= 10,800 matches
+        m_ok = click_tracker.match_alerts_for_deal(
+            "파워에이드 900ml 12병",
+            alerts,
+            sale_price=10500,
+            product_id="777",
+            option_key="pid:777:cfg:vol:900ml:n12",
+            shipping_fee=0,
+        )
+        self.assertIn("1001", m_ok)
+
+        # 2) Different pack (900ml x 6) of SAME productId does NOT match!
+        m_diff_pack = click_tracker.match_alerts_for_deal(
+            "파워에이드 900ml 6병",
+            alerts,
+            sale_price=6500,
+            product_id="777",
+            option_key="pid:777:cfg:vol:900ml:n6",
+            shipping_fee=0,
+        )
+        self.assertEqual(m_diff_pack, {})
+
+        # 3) Even without option_key passed, fallback config sig rejects 6병
+        m_diff_fallback = click_tracker.match_alerts_for_deal(
+            "파워에이드 900ml 6병",
+            alerts,
+            sale_price=6500,
+            product_id="777",
+        )
+        self.assertEqual(m_diff_fallback, {})
+
+        # 4) Shipping fee pushes total (9,000 + 3,000 = 12,000 > 10,800) over target -> NO match
+        m_ship_over = click_tracker.match_alerts_for_deal(
+            "파워에이드 900ml 12병",
+            alerts,
+            sale_price=9000,
+            product_id="777",
+            option_key="pid:777:cfg:vol:900ml:n12",
+            shipping_fee=3000,
+        )
+        self.assertEqual(m_ship_over, {})
 
 
 if __name__ == "__main__":

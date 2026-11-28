@@ -20,7 +20,7 @@ import {
   parseOffer,
   waterRankings,
 } from "../src/unit_compare.js";
-import worker, { runDailyMaintenance, runScheduledDispatch } from "../src/index.js";
+import worker, { matchLinkAgainstRule, runDailyMaintenance, runScheduledDispatch } from "../src/index.js";
 
 function createMockD1() {
   const store = {
@@ -675,7 +675,15 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
             date: funnelDate,
             sources: {
               ruliweb: { found: 5, new: 2, price_ok: 1, passed: i, reasons: { low_discount: 1 } },
-              ppomppu: { found: 0, new: 0, price_ok: 0, passed: 0, blocked: 1, reasons: {} },
+              ppomppu: {
+                found: 2,
+                new: 1,
+                price_ok: 0,
+                passed: 0,
+                blocked: 1,
+                reasons: {},
+                routes: { pc: { found: 0, new: 0 }, mobile: { found: 1, new: 1 } },
+              },
             },
           }),
         }),
@@ -712,6 +720,7 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
     assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") > 0);
     assert.ok(repTxt.indexOf("오늘 출처별 수집 퍼널") < repTxt.indexOf("※"));
     assert.match(repTxt, /차단 2회/);
+    assert.match(repTxt, /모바일 2\/2/);
 
     // 3) Flyer one-click watch card + conversion tracking
     const linkRes = await worker.fetch(
@@ -728,8 +737,8 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
           sale_price: 10970,
           discount_rate: 45,
           unit_info: "1L당 1,016원",
-          shipping_label: "무료",
-          option_key: "pid:77777777:900ml_12",
+          shipping_label: "배송비 3,000원",
+          option_key: "pid:77777777:cfg:vol:900ml:n12",
         }),
       }),
       env
@@ -757,9 +766,10 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
     const watchSend = tgCalls.find((c) => c.u.endsWith("/sendMessage"));
     assert.ok(watchSend);
     assert.match(watchSend.body.text, /이 구성 목표가 알림 등록/);
-    assert.match(watchSend.body.text, /1L당 1,016원/);
+    assert.match(watchSend.body.text, /배송비 포함 총액 기준/);
+    assert.match(watchSend.body.text, /13,970원/);
     const watchBtns = (watchSend.body.reply_markup?.inline_keyboard || []).flat();
-    const watchBtn = watchBtns.find((b) => String(b.callback_data || "").startsWith("alert:watch:77777777:"));
+    const watchBtn = watchBtns.find((b) => String(b.callback_data || "").startsWith(`alert:watchc:${linkJson.code}:`));
     assert.ok(watchBtn);
 
     await worker.fetch(
@@ -777,6 +787,49 @@ test("sales state, source funnel, report funnel order, and flyer watch deep link
         }),
       }),
       env
+    );
+
+    const savedRule = db.store.keyword_alerts.find((a) => a.chat_id === "555001");
+    assert.ok(savedRule);
+    assert.equal(savedRule.keyword_norm, "opt:pid:77777777:cfg:vol:900ml:n12");
+    assert.equal(
+      matchLinkAgainstRule(
+        {
+          product_id: "77777777",
+          title: "파워에이드 900ml 12병",
+          sale_price: 10000,
+          shipping_label: "무료",
+          option_key: "pid:77777777:cfg:vol:900ml:n12",
+        },
+        savedRule
+      ),
+      true
+    );
+    assert.equal(
+      matchLinkAgainstRule(
+        {
+          product_id: "77777777",
+          title: "파워에이드 900ml 6병",
+          sale_price: 6000,
+          shipping_label: "무료",
+          option_key: "pid:77777777:cfg:vol:900ml:n6",
+        },
+        savedRule
+      ),
+      false
+    );
+    assert.equal(
+      matchLinkAgainstRule(
+        {
+          product_id: "77777777",
+          title: "파워에이드 900ml 12병",
+          sale_price: 12000,
+          shipping_label: "배송비 3,000원",
+          option_key: "pid:77777777:cfg:vol:900ml:n12",
+        },
+        savedRule
+      ),
+      false
     );
 
     const aStatsRes = await worker.fetch(
