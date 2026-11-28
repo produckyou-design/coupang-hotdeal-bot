@@ -119,6 +119,7 @@ _LOCK_HANDLE = None
 
 # 일일/회차별 송출 수량 제한, 전단지 배치 및 24시간 전단지 송출 설정 (KST)
 ENABLE_GOLDBOX = True
+ENABLE_TOP_CLICKS_RECAP = False
 ENABLE_CATEGORY_BEST_SHADOW = True
 CATEGORY_BEST_SHADOW_IDS = (1012, 1013, 1014, 1015, 1016)
 CATEGORY_BEST_SHADOW_LIMIT = 15
@@ -4965,6 +4966,8 @@ def run_top_clicks_recap_if_evening(
     now_dt: Optional[datetime] = None,
 ) -> int:
     """매일 저녁 20시 당일 실시간 클릭 TOP 4 앵콜 요약 전단지 1회 송출."""
+    if not ENABLE_TOP_CLICKS_RECAP and "--force-top-clicks" not in sys.argv:
+        return 0
     now = now_dt or datetime.now(KST)
     today_str = now.strftime("%Y%m%d")
     recap_key = f"top_clicks_{today_str}"
@@ -5438,11 +5441,12 @@ def main():
         except Exception as cm_err:
             logger.warning(f"품절 감시 생략: {cm_err}")
 
-    # 매일 20시 당일 실시간 클릭 TOP 4 앵콜 전단지 송출
-    try:
-        total_sent += run_top_clicks_recap_if_evening(seen, quota)
-    except Exception as tc_err:
-        logger.warning(f"20시 클릭 TOP 앵콜 생략: {tc_err}")
+    # 매일 20시 당일 실시간 클릭 TOP 4 앵콜 전단지 송출 (비활성화됨)
+    if ENABLE_TOP_CLICKS_RECAP or "--force-top-clicks" in sys.argv:
+        try:
+            total_sent += run_top_clicks_recap_if_evening(seen, quota)
+        except Exception as tc_err:
+            logger.warning(f"20시 클릭 TOP 앵콜 생략: {tc_err}")
 
     # 채널 구독자 증가 체크 (로컬 봇 백업)
     try:

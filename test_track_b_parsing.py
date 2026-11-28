@@ -1515,38 +1515,49 @@ class TestUpgradesIntegration(unittest.TestCase):
         seen = set()
         quota = {}
 
-        # 19시는 스킵
-        with patch.object(push_deals, "fetch_click_stats") as mock_stats:
-            res_skip = push_deals.run_top_clicks_recap_if_evening(
-                seen, quota, now_dt=datetime(2026, 11, 28, 19, 10, tzinfo=kst)
-            )
-        self.assertEqual(res_skip, 0)
-        mock_stats.assert_not_called()
+        self.assertFalse(push_deals.ENABLE_TOP_CLICKS_RECAP)
 
-        fake_stats = {
-            "closed_deal_ids": ["closed_1"],
-            "top_today": [
-                {"deal_id": "g1", "code": "p0", "source": "goldbox", "title": "골드박스 제외", "clicks": 50, "short_url": "https://s/0"},
-                {"deal_id": "closed_1", "code": "p1", "source": "arca", "title": "종료딜 제외", "clicks": 30, "short_url": "https://s/1"},
-                {"deal_id": "d2", "code": "1001", "source": "arca", "title": "인기 상품 A", "clicks": 12, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2"},
-                {"deal_id": "d2_dup", "code": "1001", "source": "ruliweb", "title": "인기 상품 A 중복", "clicks": 9, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2d"},
-                {"deal_id": "d3", "code": "1002", "source": "clien", "title": "인기 상품 B", "clicks": 8, "sale_price": 22000, "discount_rate": 25, "short_url": "https://s/3"},
-            ],
-        }
-        with patch.object(push_deals, "fetch_click_stats", return_value=fake_stats), \
-             patch.object(push_deals, "render_hotdeal_flyer", return_value=b"PNG"), \
-             patch.object(push_deals, "send_telegram_photo_bytes", return_value=True) as mock_send, \
-             patch.object(push_deals, "save_seen"), \
-             patch.object(push_deals.time, "sleep"):
-            res_ok = push_deals.run_top_clicks_recap_if_evening(
+        # 기본값 비활성화 시 20시여도 송출하지 않음
+        with patch.object(push_deals, "fetch_click_stats") as mock_stats:
+            res_disabled = push_deals.run_top_clicks_recap_if_evening(
                 seen, quota, now_dt=datetime(2026, 11, 28, 20, 5, tzinfo=kst)
             )
-        self.assertEqual(res_ok, 1)
-        self.assertIn("top_clicks_20261128", seen)
-        sent_caption = mock_send.call_args[0][2]
-        self.assertIn("가장 많이 클릭한 쿠팡 핫딜 TOP", sent_caption)
-        self.assertNotIn("골드박스 제외", sent_caption)
-        self.assertNotIn("종료딜 제외", sent_caption)
+        self.assertEqual(res_disabled, 0)
+        mock_stats.assert_not_called()
+
+        with patch.object(push_deals, "ENABLE_TOP_CLICKS_RECAP", True):
+            # 19시는 스킵
+            with patch.object(push_deals, "fetch_click_stats") as mock_stats:
+                res_skip = push_deals.run_top_clicks_recap_if_evening(
+                    seen, quota, now_dt=datetime(2026, 11, 28, 19, 10, tzinfo=kst)
+                )
+            self.assertEqual(res_skip, 0)
+            mock_stats.assert_not_called()
+
+            fake_stats = {
+                "closed_deal_ids": ["closed_1"],
+                "top_today": [
+                    {"deal_id": "g1", "code": "p0", "source": "goldbox", "title": "골드박스 제외", "clicks": 50, "short_url": "https://s/0"},
+                    {"deal_id": "closed_1", "code": "p1", "source": "arca", "title": "종료딜 제외", "clicks": 30, "short_url": "https://s/1"},
+                    {"deal_id": "d2", "code": "1001", "source": "arca", "title": "인기 상품 A", "clicks": 12, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2"},
+                    {"deal_id": "d2_dup", "code": "1001", "source": "ruliweb", "title": "인기 상품 A 중복", "clicks": 9, "sale_price": 15000, "discount_rate": 35, "short_url": "https://s/2d"},
+                    {"deal_id": "d3", "code": "1002", "source": "clien", "title": "인기 상품 B", "clicks": 8, "sale_price": 22000, "discount_rate": 25, "short_url": "https://s/3"},
+                ],
+            }
+            with patch.object(push_deals, "fetch_click_stats", return_value=fake_stats), \
+                 patch.object(push_deals, "render_hotdeal_flyer", return_value=b"PNG"), \
+                 patch.object(push_deals, "send_telegram_photo_bytes", return_value=True) as mock_send, \
+                 patch.object(push_deals, "save_seen"), \
+                 patch.object(push_deals.time, "sleep"):
+                res_ok = push_deals.run_top_clicks_recap_if_evening(
+                    seen, quota, now_dt=datetime(2026, 11, 28, 20, 5, tzinfo=kst)
+                )
+            self.assertEqual(res_ok, 1)
+            self.assertIn("top_clicks_20261128", seen)
+            sent_caption = mock_send.call_args[0][2]
+            self.assertIn("가장 많이 클릭한 쿠팡 핫딜 TOP", sent_caption)
+            self.assertNotIn("골드박스 제외", sent_caption)
+            self.assertNotIn("종료딜 제외", sent_caption)
 
     def test_price_history_prune_old_records(self):
         import tempfile
